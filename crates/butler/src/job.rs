@@ -381,9 +381,11 @@ impl AnyJob {
 /// What [`Queue::fail`](crate::Queue::fail) turned a failed job into.
 #[derive(Debug, Clone)]
 pub enum Failed {
-    /// Back on its queue for another attempt.
+    /// Back on its queue for another attempt, at once.
     Retry(Job<state::Pending>),
-    /// Out of retries.
+    /// Waiting for its next attempt, at [`Job::run_at`].
+    Scheduled(Job<state::Scheduled>),
+    /// Out of retries, or its error said never to retry.
     Dead(Job<state::Dead>),
 }
 
@@ -391,6 +393,7 @@ impl Failed {
     pub fn state(&self) -> JobState {
         match self {
             Self::Retry(_) => JobState::Pending,
+            Self::Scheduled(_) => JobState::Scheduled,
             Self::Dead(_) => JobState::Dead,
         }
     }

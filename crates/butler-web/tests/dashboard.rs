@@ -384,3 +384,30 @@ async fn scheduled_actions_keep_the_base_path() {
     );
     assert_eq!(f.queue.state(&f.scheduled), Some(JobState::Pending));
 }
+
+#[tokio::test]
+async fn a_retry_waiting_its_turn_shows_its_error_and_next_attempt() {
+    let f = fixture("");
+    // The fixture's pending job fails, with ten minutes before its retry.
+    let job = f
+        .queue
+        .claim("w1", &["default"], Duration::ZERO)
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.id(), f.pending);
+    let policy = butler::RetryPolicy::new(3, butler::Backoff::Fixed(Duration::from_secs(600)));
+    f.queue
+        .fail("w1", job, "503 from the CRM".into(), policy)
+        .unwrap();
+    assert_eq!(f.queue.state(&f.pending), Some(JobState::Scheduled));
+
+    let (_, html) = get(&f.app, "/jobs?state=scheduled").await;
+    assert!(html.contains("503 from the CRM"), "the error, in the list");
+    let (_, html) = get(&f.app, &format!("/jobs/{}", f.pending)).await;
+    assert!(html.contains("Next attempt"));
+    assert!(
+        html.contains("in 10m") || html.contains("in 11m"),
+        "when it runs"
+    );
+    assert!(html.contains("503 from the CRM"));
+}

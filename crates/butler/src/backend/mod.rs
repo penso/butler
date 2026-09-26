@@ -25,8 +25,8 @@ pub use self::redis::RedisQueue;
 pub use self::sqlite::{SqliteQueue, WATCH_TICK as SQLITE_WATCH_TICK};
 pub use self::{file::FileQueue, memory::MemoryQueue};
 use crate::{
-    AnyJob, Error, Failed, Job, JobId, JobRecord, JobState, Result, Signal,
-    job::millis,
+    AnyJob, Error, Failed, Job, JobId, JobRecord, JobState, Result, Retry, RetryPolicy, Signal,
+    job::{after, millis},
     monitor::{JobMetric, ListFilter, MetricBucket, Stats},
     state::{Done, Pending, Processing},
 };
@@ -239,15 +239,28 @@ fn is_due(at: SystemTime) -> bool {
     millis(at) <= millis(SystemTime::now())
 }
 
-/// Records a failure on `job` and returns the state it should move to.
-pub(crate) fn record_failure(job: &mut JobRecord, error: String, max_retries: u32) -> JobState {
+/// Records a failure on `job` and returns the state it should move to: dead
+/// when its error said never to retry or it is out of retries, otherwise back
+/// on its queue, at once or (with its `run_at_ms` set) after a delay.
+pub(crate) fn record_failure(
+    job: &mut JobRecord,
+    error: String,
+    retry: Retry,
+    policy: RetryPolicy,
+) -> JobState {
     job.attempts += 1;
     job.last_error = Some(error);
-    if job.attempts > max_retries {
-        JobState::Dead
-    } else {
-        JobState::Pending
+    let delay = match retry {
+        Retry::Never => return JobState::Dead,
+        _ if job.attempts > policy.max_retries => return JobState::Dead,
+        Retry::After(delay) => delay,
+        Retry::Default => policy.backoff.delay(job.attempts),
+    };
+    if delay.is_zero() {
+        return JobState::Pending;
     }
+    job.run_at_ms = Some(millis(after(delay)));
+    JobState::Scheduled
 }
 
 /// A cheap-to-clone handle to a backend.
@@ -360,20 +373,39 @@ impl Queue {
         Ok(Job::from_record(record))
     }
 
-    /// Records a failed attempt: the job goes back on its queue for a retry,
-    /// or dies once it has failed more than `max_retries` times.
+    /// Records a failed attempt: the job is retried after its policy's
+    /// backoff, or dies once it has failed more than `max_retries` times. A
+    /// plain number is a policy that retries at once:
+    /// `queue.fail(worker, job, error, 3)`.
     pub fn fail(
         &self,
         worker: &str,
         job: Job<Processing>,
         error: String,
-        max_retries: u32,
+        policy: impl Into<RetryPolicy>,
+    ) -> Result<Failed> {
+        self.fail_with(worker, job, error, Retry::Default, policy)
+    }
+
+    /// Like [`fail`](Queue::fail), with what the job's error asked for:
+    /// [`Retry::Never`] makes it dead at once, and [`Retry::After`] replaces
+    /// the backoff's delay. A retry that waits is
+    /// [`Scheduled`](JobState::Scheduled), and promoted onto its queue when
+    /// it is due.
+    pub fn fail_with(
+        &self,
+        worker: &str,
+        job: Job<Processing>,
+        error: String,
+        retry: Retry,
+        policy: impl Into<RetryPolicy>,
     ) -> Result<Failed> {
         let mut record = job.into_record();
-        let next = record_failure(&mut record, error, max_retries);
+        let next = record_failure(&mut record, error, retry, policy.into());
         self.0.fail(worker, &record, next)?;
         Ok(match next {
             JobState::Dead => Failed::Dead(Job::from_record(record)),
+            JobState::Scheduled => Failed::Scheduled(Job::from_record(record)),
             _ => Failed::Retry(Job::from_record(record)),
         })
     }

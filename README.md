@@ -57,7 +57,8 @@ types, and the `reports` module belong to your application. See
 - **Durable queues.** Redis for workers across servers, SQLite or files for
   local processes, and an in-memory backend for tests and single-process apps.
 - **Recovery and retries.** Worker heartbeats recover abandoned jobs; failed
-  attempts retry, then remain visible for inspection.
+  attempts retry with exponential, polynomial or fixed backoff and jitter, per
+  job or per error, then remain visible for inspection.
 - **Scheduled jobs.** Run a job in five minutes or at 03:00 with
   `prepare(..)?.run_in(..)` or `.run_at(..)`, and cancel it while it waits.
 - **Resumable work.** Typed checkpoints let long jobs continue after a deploy,
@@ -90,6 +91,7 @@ crashes; storage durability still depends on the backend's configuration.
   - [Working with an enqueued job](#working-with-an-enqueued-job)
   - [Bulk enqueuing](#bulk-enqueuing)
   - [Scheduling jobs](#scheduling-jobs)
+  - [Retries and backoff](#retries-and-backoff)
   - [Results](#results)
   - [Running a worker](#running-a-worker)
   - [Job continuations](#job-continuations)
@@ -442,7 +444,8 @@ stateDiagram-v2
     scheduled --> cancelled: cancel()
     pending --> processing: claimed
     processing --> done: Ok
-    processing --> pending: retry, or crash recovery
+    processing --> pending: crash recovery, or retry at once
+    processing --> scheduled: retry after a backoff
     processing --> dead: failed, no retries left
     pending --> cancelled: cancel()
     done --> [*]
@@ -466,9 +469,11 @@ let done: Job<Done> = queue.complete(worker, job, output)?;
 let value: u32 = done.output()?;
 
 // Failing a (different) claimed job consumes it too: it comes back as a
-// Job<Pending> to retry, or a Job<Dead> once it is out of retries.
-match queue.fail(worker, other_job, error, max_retries)? {
+// Job<Pending> to retry at once, a Job<Scheduled> waiting out its backoff, or
+// a Job<Dead> once it is out of retries.
+match queue.fail(worker, other_job, error, RetryPolicy::new(3, Backoff::Exponential))? {
     Failed::Retry(pending) => println!("retrying after {:?}", pending.last_error()),
+    Failed::Scheduled(waiting) => println!("next attempt at {:?}", waiting.run_at()),
     Failed::Dead(dead) => println!("gave up: {}", dead.error()),
 }
 ```
@@ -526,6 +531,9 @@ pub async fn charge(customer_id: u64, cents: i64) { ... }
 #[butler::job(queue = "mailers")]             // route to a named queue
 pub async fn send_digest(user_id: u64) { ... }
 
+#[butler::job(retries = 10, backoff = "polynomial")]  // its own retry policy
+pub async fn sync_crm(account_id: u64) -> Result<(), CrmError> { ... }
+
 #[butler::job]                                // a plain fn: CPU-bound work
 pub fn thumbnail(path: PathBuf) -> Result<Vec<u8>, ImageError> { ... }
 ```
@@ -554,7 +562,8 @@ pub fn thumbnail(path: PathBuf) -> Result<Vec<u8>, ImageError> { ... }
   message, or anything else that converts into `butler::BoxError`
   (`Box<dyn Error + Send + Sync>`). butler doesn't depend on anyhow, but an app
   that uses it can return `anyhow::Result<T>` too. The worker stores `T` as the
-  job's result. An `Err` or a panic counts as a failure and triggers a retry.
+  job's result. An `Err` or a panic counts as a failure and triggers a retry
+  (see [Retries and backoff](#retries-and-backoff)).
   The error's message and its whole source chain are saved as the job's
   `last_error`, as `outer: inner: root`.
 - An `async fn` job runs as its own task on the worker's tokio runtime. A plain
@@ -645,6 +654,52 @@ is due rather than a whole `poll_interval_ms`; and each worker's keeper
 promotes them every 250 ms, so they move even while every worker is busy. How
 each backend stores them is under [Backends](#backends). The dashboard lists
 them in a Scheduled tab, with "Run now" and "Cancel".
+
+### Retries and backoff
+
+A failed job is retried up to `max_retries` times, waiting longer before each
+retry so a flaky API isn't hammered. Set it per worker in `[worker]`, or per
+job, which wins:
+
+```rust
+#[butler::job(retries = 10, backoff = "exponential")]
+async fn sync_crm(account_id: u64) -> Result<(), CrmError> { ... }
+```
+
+| Backoff | Delay before retry n | |
+|---|---|---|
+| `"exponential"` | 2ⁿ s | 2 s, 4 s, 8 s, 16 s, ... (the default) |
+| `"polynomial"` | n⁴ + 15 s | 16 s, 31 s, 96 s, 271 s, ... (Sidekiq's) |
+| `"fixed:30s"` | always the same | units `ms`, `s`, `m`, `h`, `d`; `"fixed:0s"` retries at once |
+
+Each delay gets up to 15% more at random, so jobs that failed together don't
+retry together, and none waits more than 30 days. A misspelled backoff is a
+compile error in `#[job]`, and a config error in `butler.toml`.
+
+A job waiting for its retry is `Scheduled`, like one enqueued with `run_in`:
+it keeps its error and attempt count, the dashboard shows when its next
+attempt is, and "Run now" retries it at once.
+
+An error can also decide for itself, like ActiveJob's `retry_on` and
+`discard_on`, by implementing `butler::Retryable` on the job's error type:
+
+```rust
+impl butler::Retryable for CrmError {
+    fn retry(&self) -> butler::Retry {
+        match self {
+            CrmError::AccountDeleted => butler::Retry::Never,         // dead at once
+            CrmError::RateLimited { retry_after } => butler::Retry::After(*retry_after),
+            _ => butler::Retry::Default,                               // the job's backoff
+        }
+    }
+}
+```
+
+`After` replaces the backoff (without jitter) but still counts as an attempt.
+The `#[job]` macro reads it from the error type the function returns, so it
+works for your own error types; an error boxed into `anyhow::Error` or
+`BoxError` uses the default. Errors from butler itself, such as a panic or an
+argument that no longer deserializes, follow the job's backoff.
 
 ### Results
 
@@ -838,8 +893,9 @@ How it behaves:
 - The job's own generated code runs, with the arguments serialized and
   deserialized as a worker would, so a type mismatch shows up in tests too.
 - `result()` and `wait_result()` work and return at once. A failing job is
-  not retried: it is dead after one attempt, and `wait_result` returns
-  `Error::JobFailed` with its error. A panic in a job fails the test.
+  not retried, whatever its `retries`: it is dead after one attempt, and
+  `wait_result` returns `Error::JobFailed` with its error. A panic in a job
+  fails the test.
 - Plain `fn` jobs run inline too (on the blocking pool under tokio).
 - Scheduled jobs (`run_in`, `run_at`) run at once too: the delay is ignored.
 - It needs no runtime: `butler::block_on(perform_enqueued_jobs(...))` works
@@ -957,7 +1013,8 @@ prefix = "butler"            # key namespace
 
 [worker]
 concurrency = 4              # jobs running at once
-max_retries = 3
+max_retries = 3              # unless a job sets #[job(retries = N)]
+backoff = "exponential"      # before each retry: "exponential", "polynomial", or "fixed:30s"
 poll_interval_ms = 100       # file: how often idle workers check; redis, memory: fallback only
 heartbeat_ttl_secs = 30      # a crashed worker's jobs are requeued after this
 recover_interval_secs = 10   # how often to look for crashed workers
@@ -1145,17 +1202,18 @@ waking on push, cancel against claim, results, retries, recovery, scheduled
 jobs: not claimable early, claimable once due, promoted to their own queue,
 cancel against promotion) against all four backends.
 
-**Upgrading.** Scheduled jobs add a `scheduled` state. Deploy this version to
-every worker and dashboard before enqueueing scheduled jobs: older versions
-don't promote them, and reading one fails with `Error::UnknownState`. Jobs
-already queued need nothing: their records read as before.
+**Upgrading.** Scheduled jobs add a `scheduled` state, which retries waiting
+out their backoff use too. Deploy this version to every worker and dashboard
+before enqueueing scheduled jobs or letting jobs fail: older versions don't
+promote them, and reading one fails with `Error::UnknownState`. Jobs already
+queued need nothing: their records read as before. Retries now wait
+(exponential backoff by default); `backoff = "fixed:0s"` in `[worker]` keeps
+the old immediate retries.
 
 ## Limitations
 
 - **At-least-once delivery.** A job interrupted by a crash runs again (see
   "Crashed workers don't lose jobs"), so job bodies should be safe to repeat.
-- **Retries.** Failed jobs are retried right away, with no delay between
-  attempts.
 - **Polling on the file backend.** Idle file-backed workers check every
   `poll_interval_ms`, and `wait_result` every interval it is given. Redis,
   SQLite, and memory support wake-ups, with polling as a fallback.
@@ -1175,6 +1233,7 @@ crates/butler/                   the library (published as `butler`)
   src/handle.rs                  JobHandle: state, cancel, wait
   src/prepared.rs                PreparedJob, enqueue_all (bulk enqueuing)
   src/progress.rs                Progress, Interrupted (job continuations)
+  src/retry.rs                   Backoff, Retry, Retryable, RetryPolicy
   src/testing.rs                 perform_enqueued_jobs, InlineJobs
   src/backend/mod.rs             Backend traits (Store, Monitor, Watch), Queue handle
   src/backend/file.rs            file backend

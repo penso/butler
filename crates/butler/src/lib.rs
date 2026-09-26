@@ -33,6 +33,7 @@ pub mod monitor;
 mod prepared;
 mod progress;
 mod queues;
+mod retry;
 mod signal;
 pub mod testing;
 mod worker;
@@ -54,7 +55,7 @@ pub use config::{
     BackendKind, Config, FileConfig, QueueConfig, QueueEntry, RedisConfig, SqliteConfig,
     WorkerConfig,
 };
-pub use error::{BoxError, Error, JobError, Result};
+pub use error::{BoxError, Error, Failure, JobError, Result};
 pub use executor::block_on;
 pub use handle::JobHandle;
 pub use job::{
@@ -63,6 +64,7 @@ pub use job::{
 pub use prepared::{PreparedJob, enqueue_all};
 pub use progress::{Interrupted, Progress};
 pub use queues::QueuePriority;
+pub use retry::{Backoff, JITTER, MAX_BACKOFF, Retry, RetryPolicy, Retryable};
 pub use signal::{JobWatch, Signal};
 pub use worker::Worker;
 
@@ -76,14 +78,26 @@ pub use worker::Worker;
 pub trait IntoJobResult {
     /// What the job produces on success.
     type Output: Serialize + DeserializeOwned + Send + 'static;
+    /// What the job fails with. The `#[job]` macro reads its
+    /// [`Retryable`] classification, when it has one.
+    type Error: Into<BoxError>;
 
-    fn into_job_result(self) -> Result<Self::Output, JobError>;
+    fn into_result(self) -> Result<Self::Output, Self::Error>;
+
+    fn into_job_result(self) -> Result<Self::Output, JobError>
+    where
+        Self: Sized,
+    {
+        self.into_result()
+            .map_err(|e| JobError::Failed(Failure::from(e.into())))
+    }
 }
 
 impl IntoJobResult for () {
     type Output = ();
+    type Error = std::convert::Infallible;
 
-    fn into_job_result(self) -> Result<(), JobError> {
+    fn into_result(self) -> Result<(), std::convert::Infallible> {
         Ok(())
     }
 }
@@ -94,20 +108,25 @@ where
     E: Into<BoxError>,
 {
     type Output = T;
+    type Error = E;
 
-    fn into_job_result(self) -> Result<T, JobError> {
-        self.map_err(|e| JobError::Failed(e.into()))
+    fn into_result(self) -> Result<T, E> {
+        self
     }
 }
 
-/// A job that a worker can run: its name, the queue it goes on, and the
-/// function that decodes the arguments and runs the body. `#[job] fn foo`
-/// generates it as `foo::JOB`.
+/// A job that a worker can run: its name, the queue it goes on, its retry
+/// settings, and the function that decodes the arguments and runs the body.
+/// `#[job] fn foo` generates it as `foo::JOB`.
 #[derive(Clone, Copy)]
 pub struct JobDef {
     pub name: &'static str,
     /// Set with `#[job(queue = "...")]`; [`DEFAULT_QUEUE`] otherwise.
     pub queue: &'static str,
+    /// Set with `#[job(retries = N)]`; the worker's `max_retries` otherwise.
+    pub retries: Option<u32>,
+    /// Set with `#[job(backoff = "...")]`; the worker's backoff otherwise.
+    pub backoff: Option<Backoff>,
     #[doc(hidden)]
     pub perform: fn(progress::Invocation) -> __private::BoxFuture,
 }
@@ -154,9 +173,48 @@ pub mod __private {
     /// A job run: its output as JSON, or why it failed.
     pub type BoxFuture = Pin<Box<dyn Future<Output = Result<serde_json::Value, JobError>> + Send>>;
 
-    /// Turns a job body's return value into the JSON the worker stores.
-    pub fn output<R: crate::IntoJobResult>(returned: R) -> Result<serde_json::Value, JobError> {
-        serde_json::to_value(returned.into_job_result()?).map_err(JobError::Output)
+    /// Turns a job body's return value into the JSON the worker stores, or
+    /// its error, with what `classify` says about retrying it.
+    pub fn output<R: crate::IntoJobResult>(
+        returned: R,
+        classify: impl FnOnce(&R::Error) -> crate::Retry,
+    ) -> Result<serde_json::Value, JobError> {
+        match returned.into_result() {
+            Ok(value) => serde_json::to_value(value).map_err(JobError::Output),
+            Err(error) => {
+                let retry = classify(&error);
+                Err(JobError::Failed(crate::Failure::new(error, retry)))
+            }
+        }
+    }
+
+    /// Reads a job error's [`Retryable`](crate::Retryable) classification
+    /// when its type has one, and [`Retry::Default`](crate::Retry::Default)
+    /// otherwise, without requiring the trait: the macro calls
+    /// `(&Classify(&error)).retry_policy()` with both traits below in scope.
+    /// Method lookup tries `Classify<E>` (needs `E: Retryable`) before
+    /// `&Classify<E>` (any `E`), so the first applies whenever it can. That
+    /// only works where `E` is a concrete type, as it is in generated code.
+    pub struct Classify<'a, E>(pub &'a E);
+
+    pub trait ClassifyRetry {
+        fn retry_policy(&self) -> crate::Retry;
+    }
+
+    impl<E: crate::Retryable> ClassifyRetry for Classify<'_, E> {
+        fn retry_policy(&self) -> crate::Retry {
+            self.0.retry()
+        }
+    }
+
+    pub trait DefaultRetry {
+        fn retry_policy(&self) -> crate::Retry;
+    }
+
+    impl<E> DefaultRetry for &Classify<'_, E> {
+        fn retry_policy(&self) -> crate::Retry {
+            crate::Retry::Default
+        }
     }
 
     /// Runs a synchronous job body. Inside a tokio runtime it goes to the

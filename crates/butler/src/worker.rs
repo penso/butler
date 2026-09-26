@@ -11,7 +11,8 @@ use std::{
 
 use crate::{
     __private::BoxFuture,
-    Config, Failed, Job, JobDef, JobError, Queue, QueuePriority, Result, WorkerConfig, block_on,
+    Backoff, Config, Failed, Job, JobDef, JobError, Queue, QueuePriority, Result, RetryPolicy,
+    WorkerConfig, block_on,
     error::Chain,
     executor::panic_message,
     limits::{Permit, QueueLimits},
@@ -67,13 +68,15 @@ const PROMOTE_INTERVAL: Duration = KEEPER_TICK;
 #[derive(Clone)]
 pub struct Worker {
     queue: Queue,
-    handlers: Arc<HashMap<&'static str, Handler>>,
+    /// Every job this worker can run, by name.
+    jobs: Arc<HashMap<&'static str, JobDef>>,
     id: Arc<str>,
     queues: QueuePriority,
     limits: QueueLimits,
     claimers: usize,
     concurrency: usize,
     max_retries: u32,
+    backoff: Backoff,
     poll_interval: Duration,
     heartbeat_ttl: Duration,
     recover_interval: Duration,
@@ -105,21 +108,22 @@ impl Worker {
     /// build-time mistake, and a worker running either one would be wrong.
     pub fn new(queue: impl Into<Queue>) -> Self {
         let defaults = WorkerConfig::default();
-        let mut handlers = HashMap::new();
+        let mut jobs = HashMap::new();
         for def in inventory::iter::<JobDef> {
-            if handlers.insert(def.name, def.perform).is_some() {
+            if jobs.insert(def.name, *def).is_some() {
                 panic!("butler: two jobs are registered as `{}`", def.name);
             }
         }
         Self {
             queue: queue.into(),
-            handlers: Arc::new(handlers),
+            jobs: Arc::new(jobs),
             id: new_worker_id().into(),
             queues: defaults.priority(),
             limits: QueueLimits::default(),
             claimers: defaults.claimers,
             concurrency: defaults.concurrency,
             max_retries: defaults.max_retries,
+            backoff: defaults.backoff,
             poll_interval: defaults.poll_interval(),
             heartbeat_ttl: defaults.heartbeat_ttl(),
             recover_interval: defaults.recover_interval(),
@@ -139,6 +143,7 @@ impl Worker {
             .concurrency(config.concurrency)
             .claimers(config.claimers)
             .max_retries(config.max_retries)
+            .backoff(config.backoff)
             .poll_interval(config.poll_interval())
             .heartbeat_ttl(config.heartbeat_ttl())
             .checkpoint_interval(config.checkpoint_interval())
@@ -158,7 +163,7 @@ impl Worker {
     /// that builds the worker binary. For jobs in a library crate, call
     /// `.register(my_lib::my_job::JOB)`, or the linker may drop them.
     pub fn register(mut self, job: JobDef) -> Self {
-        Arc::make_mut(&mut self.handlers).insert(job.name, job.perform);
+        Arc::make_mut(&mut self.jobs).insert(job.name, job);
         self
     }
 
@@ -205,9 +210,28 @@ impl Worker {
         self
     }
 
+    /// How many times a failed job is retried, unless it sets its own with
+    /// `#[job(retries = N)]`. It runs at most `n + 1` times.
     pub fn max_retries(mut self, n: u32) -> Self {
         self.max_retries = n;
         self
+    }
+
+    /// How long a failed job waits before each retry, unless it sets its own
+    /// with `#[job(backoff = "...")]`. Defaults to [`Backoff::Exponential`];
+    /// [`Backoff::NONE`] retries at once.
+    pub fn backoff(mut self, backoff: Backoff) -> Self {
+        self.backoff = backoff;
+        self
+    }
+
+    /// The retry policy for job `name`: its own settings, or this worker's.
+    fn retry_policy(&self, name: &str) -> RetryPolicy {
+        let def = self.jobs.get(name);
+        RetryPolicy::new(
+            def.and_then(|def| def.retries).unwrap_or(self.max_retries),
+            def.and_then(|def| def.backoff).unwrap_or(self.backoff),
+        )
     }
 
     /// The longest an idle claim waits before checking the queues again. Redis
@@ -242,7 +266,7 @@ impl Worker {
     }
 
     pub fn job_names(&self) -> Vec<&'static str> {
-        let mut names: Vec<_> = self.handlers.keys().copied().collect();
+        let mut names: Vec<_> = self.jobs.keys().copied().collect();
         names.sort_unstable();
         names
     }
@@ -467,9 +491,9 @@ impl Worker {
     }
 
     fn handler(&self, job: &Job<Processing>) -> Result<Handler, JobError> {
-        self.handlers
+        self.jobs
             .get(job.name())
-            .copied()
+            .map(|def| def.perform)
             .ok_or_else(|| JobError::UnknownJob {
                 name: job.name().to_owned(),
             })
@@ -503,9 +527,10 @@ impl Worker {
     }
 
     /// Stores the outcome: `done` with the job's output, back on its queue if
-    /// a checkpoint interrupted it, otherwise a retry or `dead`. A failed or
-    /// interrupted job keeps its latest progress, so the next run resumes
-    /// from there. The error's full cause chain becomes the job's `last_error`.
+    /// a checkpoint interrupted it, otherwise a retry (after the job's
+    /// backoff, or when its error asks) or `dead`. A failed or interrupted job
+    /// keeps its latest progress, so the next run resumes from there. The
+    /// error's full cause chain becomes the job's `last_error`.
     fn finish(
         &self,
         job: Job<Processing>,
@@ -541,12 +566,28 @@ impl Worker {
         }
         let error = Chain(&err).to_string();
         self.record(&metric(true));
-        match self.queue.fail(&self.id, job, error, self.max_retries)? {
+        let policy = self.retry_policy(&job_name);
+        match self
+            .queue
+            .fail_with(&self.id, job, error, err.retry(), policy)?
+        {
             Failed::Dead(job) => tracing::error!(
                 job = job.name(),
                 id = job.id(),
                 error = %Chain(&err),
                 "job failed and is dead"
+            ),
+            Failed::Scheduled(job) => tracing::warn!(
+                job = job.name(),
+                id = job.id(),
+                attempts = job.attempts(),
+                retry_in_ms = job
+                    .run_at()
+                    .duration_since(SystemTime::now())
+                    .unwrap_or_default()
+                    .as_millis(),
+                error = %Chain(&err),
+                "job failed and will retry later"
             ),
             Failed::Retry(job) => tracing::warn!(
                 job = job.name(),

@@ -13,7 +13,8 @@ use std::{
 };
 
 use butler::{
-    AnyJob, Failed, FileQueue, JobState, MemoryQueue, NewJob, Queue,
+    AnyJob, Backoff, Failed, FileQueue, JITTER, JobState, MemoryQueue, NewJob, Queue, Retry,
+    RetryPolicy,
     monitor::{JobMetric, ListFilter},
 };
 use serde_json::json;
@@ -760,5 +761,89 @@ fn scheduled_jobs_are_counted_listed_and_can_run_now() {
         let job = queue.claim("w", &["mailers"], NOW).unwrap().unwrap();
         assert_eq!(job.id(), later, "{name}");
         assert_eq!(queue.stats().unwrap().scheduled, 1, "{name}");
+    }
+}
+
+#[test]
+fn a_failed_attempt_waits_for_its_retry_on_its_own_queue() {
+    for (queue, _) in backends("retry-later") {
+        let name = queue.describe();
+        let mailers: &[&str] = &["mailers"];
+        let id = queue.push("mail", "mailers", vec![json!(1)]).unwrap();
+        let job = queue.claim("w", mailers, NOW).unwrap().unwrap();
+        let before = SystemTime::now();
+        let policy = RetryPolicy::new(3, Backoff::Fixed(HOUR));
+        let Failed::Scheduled(waiting) = queue
+            .fail_with("w", job, "timeout".into(), Retry::Default, policy)
+            .unwrap()
+        else {
+            panic!("{name}: a retry with a backoff waits");
+        };
+        // The next attempt's time, backoff plus jitter, is recorded.
+        let run_at = waiting.run_at();
+        assert!(millis(run_at) >= millis(before + HOUR), "{name}");
+        assert!(
+            run_at <= SystemTime::now() + HOUR.mul_f64(1.0 + JITTER),
+            "{name}"
+        );
+        let Some(AnyJob::Scheduled(stored)) = queue.get(&id).unwrap() else {
+            panic!("{name}: stored as scheduled");
+        };
+        assert_eq!(millis(stored.run_at()), millis(run_at), "{name}");
+        assert_eq!(stored.last_error(), Some("timeout"), "{name}");
+        assert!(queue.claim("w", mailers, NOW).unwrap().is_none(), "{name}");
+
+        assert_eq!(queue.promote(run_at).unwrap().moved, 1, "{name}");
+        assert!(queue.claim("w", DEFAULT, NOW).unwrap().is_none(), "{name}");
+        let again = queue.claim("w", mailers, NOW).unwrap().unwrap();
+        assert_eq!((again.id(), again.attempts()), (id.as_str(), 1), "{name}");
+    }
+}
+
+#[test]
+fn an_error_can_refuse_retries_or_pick_the_delay() {
+    for (queue, _) in backends("retry-classified") {
+        let name = queue.describe();
+        let policy = RetryPolicy::new(5, Backoff::Fixed(HOUR));
+
+        let never = queue.push("a", "default", vec![]).unwrap();
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        let failed = queue
+            .fail_with("w", job, "gone".into(), Retry::Never, policy)
+            .unwrap();
+        assert_eq!(
+            failed.state(),
+            JobState::Dead,
+            "{name}: retries left, but never"
+        );
+        assert_eq!(queue.state(&never), Some(JobState::Dead), "{name}");
+
+        queue.push("b", "default", vec![]).unwrap();
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        let before = SystemTime::now();
+        let delay = Duration::from_secs(90);
+        let Failed::Scheduled(waiting) = queue
+            .fail_with("w", job, "slow down".into(), Retry::After(delay), policy)
+            .unwrap()
+        else {
+            panic!("{name}: retry after a delay");
+        };
+        // Exactly the delay asked for: no backoff, no jitter.
+        assert!(millis(waiting.run_at()) >= millis(before + delay), "{name}");
+        assert!(waiting.run_at() <= SystemTime::now() + delay, "{name}");
+
+        // At once when there's no delay; dead once out of retries anyway.
+        queue.push("c", "default", vec![]).unwrap();
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        let failed = queue
+            .fail_with("w", job, "x".into(), Retry::After(Duration::ZERO), policy)
+            .unwrap();
+        assert_eq!(failed.state(), JobState::Pending, "{name}");
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        let out_of_retries = RetryPolicy::new(1, Backoff::Fixed(HOUR));
+        let failed = queue
+            .fail_with("w", job, "x".into(), Retry::After(delay), out_of_retries)
+            .unwrap();
+        assert_eq!(failed.state(), JobState::Dead, "{name}");
     }
 }

@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::Retry;
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Any error a job body can return: a `thiserror` enum, `std::io::Error`, a
@@ -53,6 +55,9 @@ pub enum Error {
 
     #[error("config selects the `{0}` backend, but butler was built without the `{0}` feature")]
     BackendDisabled(&'static str),
+
+    #[error("invalid backoff `{value}`: {reason}")]
+    InvalidBackoff { value: String, reason: &'static str },
 }
 
 /// Why one run of a job failed. Its full cause chain is stored as the job's
@@ -91,7 +96,64 @@ pub enum JobError {
     /// The job body returned an error. Its display and sources are the job's
     /// own, so the stored `last_error` shows the whole cause chain.
     #[error(transparent)]
-    Failed(BoxError),
+    Failed(Failure),
+}
+
+impl JobError {
+    /// Whether and when the job should be retried, as its error asked
+    /// through [`Retryable`](crate::Retryable). Errors from butler itself
+    /// (a panic, a bad argument, ...) follow the job's backoff.
+    pub fn retry(&self) -> Retry {
+        match self {
+            Self::Failed(failure) => failure.retry(),
+            _ => Retry::Default,
+        }
+    }
+}
+
+/// An error a job body returned, with what it asked for through
+/// [`Retryable`](crate::Retryable). It displays as the error itself, and its
+/// sources are the error's own.
+#[derive(Debug)]
+pub struct Failure {
+    error: BoxError,
+    retry: Retry,
+}
+
+impl Failure {
+    pub fn new(error: impl Into<BoxError>, retry: Retry) -> Self {
+        Self {
+            error: error.into(),
+            retry,
+        }
+    }
+
+    pub fn retry(&self) -> Retry {
+        self.retry
+    }
+
+    pub fn into_inner(self) -> BoxError {
+        self.error
+    }
+}
+
+/// An error that asks for nothing special: [`Retry::Default`].
+impl From<BoxError> for Failure {
+    fn from(error: BoxError) -> Self {
+        Self::new(error, Retry::Default)
+    }
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for Failure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
 }
 
 /// Displays an error followed by each of its sources: `outer: inner: root`.
@@ -127,10 +189,12 @@ mod tests {
     #[test]
     fn failed_job_error_is_transparent() {
         let root = std::io::Error::new(std::io::ErrorKind::NotFound, "root cause");
-        let err = JobError::Failed(Box::new(ReadingConfig(root)));
+        let err = JobError::Failed(Failure::new(ReadingConfig(root), Retry::Never));
         assert_eq!(Chain(&err).to_string(), "reading config: root cause");
+        assert_eq!(err.retry(), Retry::Never);
 
-        let message = JobError::Failed("plain message".into());
+        let message = JobError::Failed(Failure::from(BoxError::from("plain message")));
         assert_eq!(Chain(&message).to_string(), "plain message");
+        assert_eq!(message.retry(), Retry::Default);
     }
 }

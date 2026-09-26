@@ -35,7 +35,7 @@ let app = Router::new()
 |---|---|
 | `/` | Stat cards, live throughput (per second, over SSE), 24 h / 7 d history, duration (average and slowest), queues, busiest jobs |
 | `/jobs?state=dead` | Jobs by state and queue, paged; retry, discard, cancel; retry all / discard all |
-| `/jobs?state=scheduled` | Scheduled jobs, soonest first, with when they run; run now, cancel |
+| `/jobs?state=scheduled` | Scheduled jobs and retries waiting out their backoff, soonest first, with when they run next and their last error; run now, cancel |
 | `/jobs/{id}` | Arguments, attempts, the full error chain, result, saved progress |
 | `/workers` | Workers, their heartbeat, and the jobs they hold |
 | `/events` | The live stream (`text/event-stream`), one snapshot per second |

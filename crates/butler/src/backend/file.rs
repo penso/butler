@@ -27,7 +27,7 @@ use std::{
 
 use serde_json::Value;
 
-use super::Backend;
+use super::{Monitor, Store, Watch};
 use crate::{
     JobId, JobRecord, JobState, Result,
     job::DEFAULT_QUEUE,
@@ -174,7 +174,7 @@ impl FileQueue {
     }
 }
 
-impl Backend for FileQueue {
+impl Store for FileQueue {
     fn push(&self, name: &str, queue: &str, args: Vec<Value>) -> Result<JobId> {
         let job = JobRecord::new(name, queue, args);
         self.write(JobState::Pending, &job)?;
@@ -305,6 +305,12 @@ impl Backend for FileQueue {
         Ok(recovered)
     }
 
+    fn describe(&self) -> String {
+        format!("file:{}", self.root.display())
+    }
+}
+
+impl Monitor for FileQueue {
     fn stats(&self) -> Result<Stats> {
         let mut stats = Stats::default();
         for queue in self.subdirs(JobState::Pending)? {
@@ -438,11 +444,9 @@ impl Backend for FileQueue {
         }
         Ok(false)
     }
-
-    fn describe(&self) -> String {
-        format!("file:{}", self.root.display())
-    }
 }
+
+impl Watch for FileQueue {}
 
 fn ignore_missing(result: io::Result<()>) -> Result<()> {
     match result {

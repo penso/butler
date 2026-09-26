@@ -38,7 +38,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
-use super::{Backend, NewJob};
+use super::{Monitor, NewJob, Store, Watch};
 use crate::{
     Error, JobId, JobRecord, JobState, Result, Signal,
     monitor::{
@@ -254,7 +254,7 @@ fn now_ms() -> i64 {
     i64::try_from(ms).unwrap_or(i64::MAX)
 }
 
-impl Backend for SqliteQueue {
+impl Store for SqliteQueue {
     fn push(&self, name: &str, queue: &str, args: Vec<Value>) -> Result<JobId> {
         let job = JobRecord::new(name, queue, args);
         let data = serde_json::to_string(&job)?;
@@ -457,6 +457,12 @@ impl Backend for SqliteQueue {
         Ok(recovered)
     }
 
+    fn describe(&self) -> String {
+        format!("sqlite:{}", self.path.display())
+    }
+}
+
+impl Monitor for SqliteQueue {
     fn stats(&self) -> Result<Stats> {
         self.with_conn(|conn| {
             let mut stats = Stats::default();
@@ -676,13 +682,11 @@ impl Backend for SqliteQueue {
                 .collect()
         })
     }
+}
 
+impl Watch for SqliteQueue {
     fn watch_finished(&self, id: &str) -> Option<Arc<Signal>> {
         self.watch_other_processes();
         Some(self.signals.finished.watch(id))
-    }
-
-    fn describe(&self) -> String {
-        format!("sqlite:{}", self.path.display())
     }
 }

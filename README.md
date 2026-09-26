@@ -955,8 +955,11 @@ If `butler.toml` selects `redis` in a build without the feature,
 
 ## Backends
 
-Every backend implements `butler::Backend`. The worker and the enqueue path
-only use that trait.
+Every backend implements `butler::Backend`, which is three focused traits:
+`Store` (storage and the job lifecycle: push, claim, finish, recover),
+`Monitor` (what the dashboard reads, and the actions it takes), and `Watch`
+(wake-ups for callers waiting on a result). The worker and the enqueue path
+only use these traits.
 
 | Backend | A worker notices a new job | `wait_result` notices a finished job | Survives restarts |
 |---|---|---|---|
@@ -1117,7 +1120,7 @@ crates/butler/                   the library (published as `butler`)
   src/prepared.rs                PreparedJob, enqueue_all (bulk enqueuing)
   src/progress.rs                Progress, Interrupted (job continuations)
   src/testing.rs                 perform_enqueued_jobs, InlineJobs
-  src/backend/mod.rs             Backend trait, Queue handle
+  src/backend/mod.rs             Backend traits (Store, Monitor, Watch), Queue handle
   src/backend/file.rs            file backend
   src/backend/redis.rs           Redis backend (feature "redis")
   src/backend/sqlite.rs          SQLite backend (feature "sqlite")

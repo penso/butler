@@ -41,7 +41,7 @@ use std::{
 use redis::{Client, Connection, RedisResult};
 use serde_json::Value;
 
-use super::{Backend, NewJob};
+use super::{Monitor, NewJob, Store, Watch};
 use crate::{
     Error, JobId, JobRecord, JobState, Result, Signal,
     monitor::{
@@ -334,7 +334,7 @@ impl RedisQueue {
     }
 }
 
-impl Backend for RedisQueue {
+impl Store for RedisQueue {
     fn push(&self, name: &str, queue: &str, args: Vec<Value>) -> Result<JobId> {
         let job = JobRecord::new(name, queue, args);
         let data = serde_json::to_string(&job)?;
@@ -649,6 +649,12 @@ impl Backend for RedisQueue {
         Ok(recovered)
     }
 
+    fn describe(&self) -> String {
+        self.display.clone()
+    }
+}
+
+impl Monitor for RedisQueue {
     fn stats(&self) -> Result<Stats> {
         let queues: Vec<String> =
             self.with_conn(|con| redis::cmd("SMEMBERS").arg(self.key("queues")).query(con))?;
@@ -936,14 +942,12 @@ impl Backend for RedisQueue {
         }
         Ok(buckets)
     }
+}
 
+impl Watch for RedisQueue {
     fn watch_finished(&self, id: &str) -> Option<Arc<Signal>> {
         self.listen_for_signals();
         Some(self.signals.finished.watch(id))
-    }
-
-    fn describe(&self) -> String {
-        self.display.clone()
     }
 }
 

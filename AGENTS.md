@@ -19,7 +19,7 @@ after crashes. Reliability and correct job lifecycle semantics come first.
 
 | Location | Responsibility |
 | --- | --- |
-| `crates/butler/src/backend/` | `Backend` trait and the Redis, SQLite, file and in-memory queues |
+| `crates/butler/src/backend/` | `Backend` traits (`Store`, `Monitor`, `Watch`) and the Redis, SQLite, file and in-memory queues |
 | `crates/butler/src/job.rs` | Serialized job records, identifiers, states, and typed transitions |
 | `crates/butler/src/handle.rs` | `JobHandle<T>`: state, cancel, wait, and the job's result |
 | `crates/butler/src/arg.rs`, `prepared.rs` | Borrow-friendly job arguments, prepared jobs, and bulk enqueueing |

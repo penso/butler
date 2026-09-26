@@ -44,7 +44,7 @@ use serde::{Serialize, de::DeserializeOwned};
 pub use arg::JobArg;
 #[cfg(feature = "redis")]
 pub use backend::RedisQueue;
-pub use backend::{Backend, FileQueue, MemoryQueue, NewJob, Queue};
+pub use backend::{Backend, FileQueue, MemoryQueue, Monitor, NewJob, Queue, Store, Watch};
 #[cfg(feature = "sqlite")]
 pub use backend::{SQLITE_WATCH_TICK, SqliteQueue};
 pub use butler_macros::job;

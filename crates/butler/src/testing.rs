@@ -41,7 +41,7 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-    AnyJob, Backend, Failed, Job, JobDef, JobHandle, JobRecord, MemoryQueue, Queue, Result,
+    AnyJob, Failed, Job, JobDef, JobHandle, JobRecord, MemoryQueue, Queue, Result, Store,
     error::Chain,
     progress::{Checkpoints, Invocation},
 };

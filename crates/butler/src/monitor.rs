@@ -1,6 +1,6 @@
 //! What a dashboard reads: counts, job listings, history, and the actions it
-//! takes on failed jobs. Backends implement these on
-//! [`Backend`](crate::Backend); `butler-web` renders them.
+//! takes on failed jobs. Backends implement these with
+//! [`Monitor`](crate::Monitor); `butler-web` renders them.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -47,7 +47,7 @@ pub struct WorkerStats {
     pub expires_in_ms: i64,
 }
 
-/// Which jobs [`Backend::list`](crate::Backend::list) returns.
+/// Which jobs [`Monitor::list`](crate::Monitor::list) returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListFilter {
     pub state: JobState,

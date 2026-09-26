@@ -1,5 +1,9 @@
 //! Queue backends. The worker and the `#[job]` enqueue path only use the
-//! [`Backend`] trait, so they work the same with every backend.
+//! [`Backend`] traits, so they work the same with every backend:
+//!
+//! - [`Store`]: storage and the job lifecycle (push, claim, finish, recover);
+//! - [`Monitor`]: what a dashboard reads, and the actions it takes;
+//! - [`Watch`]: wake-ups for callers waiting on a job's result.
 
 mod file;
 mod memory;
@@ -23,15 +27,23 @@ use crate::{
     state::{Done, Pending, Processing},
 };
 
-/// Storage for jobs. Methods block; async callers run them through
-/// `spawn_blocking`.
+/// A complete backend: storage and the job lifecycle ([`Store`]), what a
+/// dashboard reads and does ([`Monitor`]), and wake-ups for result waiters
+/// ([`Watch`]). Implemented for every type that implements all three, so
+/// [`Queue`] can hold any configured backend as one `dyn Backend`.
+pub trait Backend: Store + Monitor + Watch {}
+
+impl<T: Store + Monitor + Watch> Backend for T {}
+
+/// Storage for jobs and their lifecycle: what the enqueue path and the worker
+/// need. Methods block; async callers run them through `spawn_blocking`.
 ///
 /// Delivery is at least once. Each worker process has an id; `claim` moves a
 /// job into that worker's own processing area, and the worker keeps a
 /// `heartbeat` alive while it runs. If the heartbeat lapses (the process
 /// crashed or hung), `recover` puts that worker's jobs back in the queue, so a
 /// job interrupted by a crash runs again. Job bodies should be safe to repeat.
-pub trait Backend: Send + Sync + 'static {
+pub trait Store: Send + Sync + 'static {
     /// Stores a new pending job on `queue` and returns its id.
     fn push(&self, name: &str, queue: &str, args: Vec<Value>) -> Result<JobId>;
 
@@ -85,14 +97,22 @@ pub trait Backend: Send + Sync + 'static {
     /// each job moves exactly once.
     fn recover(&self) -> Result<usize>;
 
-    /// A signal notified when job `id` may have finished (done, dead or
-    /// cancelled), so a waiting [`JobHandle`](crate::JobHandle) wakes at once.
-    /// Per job, so finishing one job only wakes its own waiters. `None`, the
-    /// default, makes waiters poll at the interval they were given.
-    fn watch_finished(&self, _id: &str) -> Option<Arc<Signal>> {
-        None
+    /// Whether calls can block on I/O (network, disk). Async callers send
+    /// blocking backends' calls to tokio's blocking pool; calls to backends
+    /// that never block run in place, which is much cheaper. `claim` with a
+    /// `wait` always counts as blocking.
+    fn blocks(&self) -> bool {
+        true
     }
 
+    /// Where the queue lives, for logs. Must not include secrets.
+    fn describe(&self) -> String;
+}
+
+/// What a dashboard reads and does: counts, listings, per-minute history, and
+/// the actions an operator takes on jobs. Every method has a default, so a
+/// backend only implements what it can support.
+pub trait Monitor: Send + Sync + 'static {
     /// Counts for a dashboard. Default: not supported.
     fn stats(&self) -> Result<Stats> {
         Err(Error::Unsupported("stats"))
@@ -126,20 +146,20 @@ pub trait Backend: Send + Sync + 'static {
     fn metrics(&self, _since_minute: u64) -> Result<Vec<MetricBucket>> {
         Ok(Vec::new())
     }
-
-    /// Whether calls can block on I/O (network, disk). Async callers send
-    /// blocking backends' calls to tokio's blocking pool; calls to backends
-    /// that never block run in place, which is much cheaper. `claim` with a
-    /// `wait` always counts as blocking.
-    fn blocks(&self) -> bool {
-        true
-    }
-
-    /// Where the queue lives, for logs. Must not include secrets.
-    fn describe(&self) -> String;
 }
 
-/// A job to push, for [`Backend::push_many`].
+/// Wake-ups for callers waiting on a job's result.
+pub trait Watch: Send + Sync + 'static {
+    /// A signal notified when job `id` may have finished (done, dead or
+    /// cancelled), so a waiting [`JobHandle`](crate::JobHandle) wakes at once.
+    /// Per job, so finishing one job only wakes its own waiters. `None`, the
+    /// default, makes waiters poll at the interval they were given.
+    fn watch_finished(&self, _id: &str) -> Option<Arc<Signal>> {
+        None
+    }
+}
+
+/// A job to push, for [`Store::push_many`].
 #[derive(Debug, Clone)]
 pub struct NewJob {
     pub name: String,

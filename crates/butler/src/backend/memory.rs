@@ -16,7 +16,7 @@ use std::{
 
 use serde_json::Value;
 
-use super::{Backend, NewJob};
+use super::{Monitor, NewJob, Store, Watch};
 use crate::{
     JobId, JobRecord, JobState, Result, Signal,
     monitor::{
@@ -89,7 +89,7 @@ impl State {
     }
 }
 
-impl Backend for MemoryQueue {
+impl Store for MemoryQueue {
     fn push(&self, name: &str, queue: &str, args: Vec<Value>) -> Result<JobId> {
         let job = JobRecord::new(name, queue, args);
         let id = job.id.clone();
@@ -275,10 +275,17 @@ impl Backend for MemoryQueue {
         Ok(recovered)
     }
 
-    fn watch_finished(&self, id: &str) -> Option<Arc<Signal>> {
-        Some(self.inner.finished.watch(id))
+    /// Every call is a few map updates under a lock.
+    fn blocks(&self) -> bool {
+        false
     }
 
+    fn describe(&self) -> String {
+        "memory".to_owned()
+    }
+}
+
+impl Monitor for MemoryQueue {
     fn stats(&self) -> Result<Stats> {
         let state = self.lock();
         let mut stats = Stats {
@@ -419,13 +426,10 @@ impl Backend for MemoryQueue {
             .map(|(_, bucket)| bucket.clone())
             .collect())
     }
+}
 
-    /// Every call is a few map updates under a lock.
-    fn blocks(&self) -> bool {
-        false
-    }
-
-    fn describe(&self) -> String {
-        "memory".to_owned()
+impl Watch for MemoryQueue {
+    fn watch_finished(&self, id: &str) -> Option<Arc<Signal>> {
+        Some(self.inner.finished.watch(id))
     }
 }

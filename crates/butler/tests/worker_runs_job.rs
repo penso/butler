@@ -28,13 +28,13 @@ fn awaited_job_is_executed_by_worker() {
     // `String`, and a bare `3` for `u32`.
     let enqueue = write_greeting(&out, "fabien", 3);
     // `.await` only enqueues; the job does not run here.
-    let id = butler::block_on(enqueue).unwrap();
-    assert_eq!(queue.state(&id), Some(JobState::Pending));
+    let job = butler::block_on(enqueue).unwrap();
+    assert_eq!(queue.state(job.id()), Some(JobState::Pending));
     assert!(!out.exists(), "job must not run inline");
 
-    let (_, job) = queue.get(&id).unwrap().unwrap();
-    assert_eq!(job.name, "write_greeting");
-    assert_eq!(job.args[1], "fabien");
+    let (_, record) = queue.get(job.id()).unwrap().unwrap();
+    assert_eq!(record.name, "write_greeting");
+    assert_eq!(record.args[1], "fabien");
 
     let stop = Arc::new(AtomicBool::new(false));
     let worker = {
@@ -43,7 +43,7 @@ fn awaited_job_is_executed_by_worker() {
         thread::spawn(move || w.run_until(stop))
     };
 
-    common::wait_for(&queue, &id, JobState::Done);
+    common::wait_for(&queue, job.id(), JobState::Done);
     stop.store(true, Ordering::Relaxed);
     worker.join().unwrap();
 

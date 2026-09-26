@@ -22,7 +22,6 @@ redis = ["dep:redis"]
 tokio = ["dep:tokio"]
 
 [dependencies]
-anyhow.workspace        = true
 butler-macros.workspace = true
 config.workspace        = true
 inventory.workspace     = true
@@ -34,4 +33,6 @@ tokio                   = { features = ["macros", "rt", "sync", "time"], optiona
 tracing.workspace       = true
 
 [dev-dependencies]
-tokio = { features = ["macros", "rt-multi-thread", "sync", "time"], workspace = true }
+# Only to show that jobs written with anyhow still work; the library doesn't use it.
+anyhow.workspace = true
+tokio            = { features = ["macros", "rt-multi-thread", "sync", "time"], workspace = true }

@@ -79,6 +79,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "butler",
+ "serde",
+ "thiserror",
  "tokio",
  "tracing-subscriber",
 ]

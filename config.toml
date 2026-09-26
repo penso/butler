@@ -12,6 +12,11 @@ prefix = "butler"
 url    = "redis://127.0.0.1:6379/"
 
 [worker]
-concurrency      = 4
-max_retries      = 1
-poll_interval_ms = 50
+concurrency           = 4
+heartbeat_ttl_secs    = 30
+max_retries           = 1
+poll_interval_ms      = 50
+recover_interval_secs = 10
+# Weighted: "critical" comes first 3 times out of 4. A plain list like
+# ["critical", "default"] would be strict priority instead.
+queues = [["critical", 3], ["default", 1]]

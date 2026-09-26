@@ -32,6 +32,10 @@ audit-workflows:
     actionlint .github/workflows/*.yml
     zizmor .github/
 
+# How the worker uses cores: I/O-bound and CPU-bound jobs, in memory.
+bench:
+    cargo run --locked --release -p demo --bin bench
+
 # Package and verify both crates the way crates.io would, without uploading.
 publish-dry-run:
     cargo publish --locked --workspace --dry-run
@@ -39,6 +43,10 @@ publish-dry-run:
 # Publishes butler-macros, then butler. Needs `cargo login` and a license in Cargo.toml.
 publish:
     cargo publish --locked --workspace
+
+# Parse every mermaid diagram in the README the way GitHub does. Needs Node.
+check-diagrams:
+    bash scripts/check-mermaid.sh README.md
 
 # A throwaway Redis for the demo and the Redis test.
 redis:

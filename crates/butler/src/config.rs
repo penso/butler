@@ -3,7 +3,7 @@
 //!
 //! ```toml
 //! [queue]
-//! backend = "redis"            # "file" (default) or "redis"
+//! backend = "redis"            # "file" (default), "redis", or "memory" (in-process)
 //!
 //! [queue.file]
 //! dir = ".butler"
@@ -16,6 +16,9 @@
 //! concurrency = 4
 //! max_retries = 3
 //! poll_interval_ms = 100
+//! heartbeat_ttl_secs = 30      # crashed workers' jobs are requeued after this
+//! recover_interval_secs = 10
+//! queues = [["critical", 6], ["default", 3], ["low", 1]]   # or ["critical", "default"]
 //! ```
 //!
 //! The config file is `$BUTLER_CONFIG` if set (it must then exist), otherwise
@@ -30,7 +33,10 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::{FileQueue, Queue, Result};
+use crate::{
+    Error, FileQueue, Queue, QueuePriority, Result,
+    job::{DEFAULT_QUEUE, is_valid_queue_name},
+};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -53,6 +59,8 @@ pub enum BackendKind {
     #[default]
     File,
     Redis,
+    /// In-process only: see [`MemoryQueue`](crate::MemoryQueue).
+    Memory,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -90,17 +98,46 @@ impl Default for RedisConfig {
 #[serde(default)]
 pub struct WorkerConfig {
     /// Jobs run at the same time (threads for `run`, tasks for `run_async`).
+    /// Defaults to the number of CPUs.
     pub concurrency: usize,
     pub max_retries: u32,
     pub poll_interval_ms: u64,
+    /// A worker counts as alive this long after each heartbeat; it refreshes
+    /// every third of it. After a crash, its jobs are requeued once this lapses.
+    pub heartbeat_ttl_secs: u64,
+    /// How often to requeue jobs held by workers whose heartbeat expired.
+    pub recover_interval_secs: u64,
+    /// Queues to serve. Plain names are strict priority, in order:
+    /// `["critical", "default"]`. Any `[name, weight]` pair makes it weighted,
+    /// with plain names weighing 1: `[["critical", 6], ["default", 1]]`.
+    pub queues: Vec<QueueEntry>,
+}
+
+/// One entry of `[worker] queues`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum QueueEntry {
+    Name(String),
+    Weighted(String, u32),
+}
+
+impl QueueEntry {
+    fn name(&self) -> &str {
+        match self {
+            Self::Name(name) | Self::Weighted(name, _) => name,
+        }
+    }
 }
 
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
-            concurrency: 1,
+            concurrency: std::thread::available_parallelism().map_or(4, |n| n.get()),
             max_retries: 3,
             poll_interval_ms: 100,
+            heartbeat_ttl_secs: 30,
+            recover_interval_secs: 10,
+            queues: vec![QueueEntry::Name(DEFAULT_QUEUE.to_owned())],
         }
     }
 }
@@ -108,6 +145,47 @@ impl Default for WorkerConfig {
 impl WorkerConfig {
     pub fn poll_interval(&self) -> Duration {
         Duration::from_millis(self.poll_interval_ms)
+    }
+
+    pub fn heartbeat_ttl(&self) -> Duration {
+        Duration::from_secs(self.heartbeat_ttl_secs)
+    }
+
+    pub fn recover_interval(&self) -> Duration {
+        Duration::from_secs(self.recover_interval_secs)
+    }
+
+    pub fn priority(&self) -> QueuePriority {
+        let weighted = self
+            .queues
+            .iter()
+            .any(|entry| matches!(entry, QueueEntry::Weighted(..)));
+        if !weighted {
+            return QueuePriority::strict(self.queues.iter().map(QueueEntry::name));
+        }
+        QueuePriority::weighted(self.queues.iter().map(|entry| match entry {
+            QueueEntry::Name(name) => (name.as_str(), 1),
+            QueueEntry::Weighted(name, weight) => (name.as_str(), *weight),
+        }))
+    }
+
+    /// Rejects queue names that can't be file names or Redis keys, and zero
+    /// weights, which would mean a queue is listed but never served.
+    fn validate(&self) -> Result<()> {
+        for entry in &self.queues {
+            let reason = match entry {
+                _ if !is_valid_queue_name(entry.name()) => {
+                    "use 1 to 64 of A-Z a-z 0-9 _ - . (not starting with a dot)"
+                }
+                QueueEntry::Weighted(_, 0) => "weights start at 1",
+                _ => continue,
+            };
+            return Err(Error::InvalidQueue {
+                name: entry.name().to_owned(),
+                reason,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -132,20 +210,23 @@ impl Config {
                     .try_parsing(true),
             )
             .build()?;
-        Ok(config.try_deserialize()?)
+        let config: Self = config.try_deserialize()?;
+        config.worker.validate()?;
+        Ok(config)
     }
 
     /// Opens the configured backend.
     pub fn connect(&self) -> Result<Queue> {
         match self.queue.backend {
             BackendKind::File => Ok(FileQueue::new(&self.queue.file.dir)?.into()),
+            BackendKind::Memory => Ok(crate::MemoryQueue::shared().into()),
             #[cfg(feature = "redis")]
             BackendKind::Redis => {
                 let redis = &self.queue.redis;
                 Ok(crate::RedisQueue::connect(&redis.url, &redis.prefix)?.into())
             }
             #[cfg(not(feature = "redis"))]
-            BackendKind::Redis => Err(crate::Error::BackendDisabled("redis")),
+            BackendKind::Redis => Err(Error::BackendDisabled("redis")),
         }
     }
 }
@@ -173,6 +254,48 @@ mod tests {
         assert_eq!(config.queue.file.dir, PathBuf::from(".butler"));
         assert_eq!(config.worker.concurrency, 8);
         assert_eq!(config.worker.max_retries, 3);
+    }
+
+    fn load(toml: &str) -> Result<Config> {
+        let path = std::env::temp_dir().join(format!(
+            "butler-config-queues-{}-{}.toml",
+            std::process::id(),
+            toml.len()
+        ));
+        std::fs::write(&path, toml).unwrap();
+        let config = Config::load_from(&path, true);
+        std::fs::remove_file(&path).unwrap();
+        config
+    }
+
+    #[test]
+    fn queues_are_strict_or_weighted() {
+        let strict = load("[worker]\nqueues = [\"critical\", \"default\"]\n").unwrap();
+        assert_eq!(
+            strict.worker.priority(),
+            QueuePriority::strict(["critical", "default"])
+        );
+
+        let weighted =
+            load("[worker]\nqueues = [[\"critical\", 6], \"default\", [\"low\", 1]]\n").unwrap();
+        assert_eq!(
+            weighted.worker.priority(),
+            QueuePriority::weighted([("critical", 6), ("default", 1), ("low", 1)])
+        );
+
+        let default = load("").unwrap();
+        assert_eq!(
+            default.worker.priority(),
+            QueuePriority::strict(["default"])
+        );
+    }
+
+    #[test]
+    fn bad_queues_are_rejected() {
+        let bad_name = load("[worker]\nqueues = [\"../etc\"]\n").unwrap_err();
+        assert!(matches!(bad_name, Error::InvalidQueue { ref name, .. } if name == "../etc"));
+        let zero = load("[worker]\nqueues = [[\"low\", 0]]\n").unwrap_err();
+        assert!(matches!(zero, Error::InvalidQueue { ref name, .. } if name == "low"));
     }
 
     #[test]

@@ -13,12 +13,13 @@ Engineering guidance for agents working in this repository. Read it alongside
 
 | Location | Responsibility |
 | --- | --- |
-| `crates/butler/src/backend/` | `Backend` trait and the file and Redis queues |
+| `crates/butler/src/backend/` | `Backend` trait and the file, Redis and in-memory queues |
+| `crates/butler/src/handle.rs` | `JobHandle<T>`: state, cancel, wait, and the job's result |
 | `crates/butler/src/worker.rs` | Claiming, running, retrying: `run` (threads), `run_async` (tokio), `drain` |
 | `crates/butler/src/config.rs` | `config.toml` and `BUTLER_*` environment loading |
 | `crates/butler/src/lib.rs` | Public API, the global queue, the `#[job]` enqueue helpers |
 | `crates/butler-macros/` | The `#[job]` attribute macro |
-| `examples/demo/` | `injector` and `worker` binaries sharing one job crate; not published |
+| `examples/demo/` | `injector` and `worker` binaries sharing one job crate, and `bench`; not published |
 
 - `butler` and `butler-macros` are published together with the same version;
   `butler` pins the macros with `=`. The macro's output may only call
@@ -26,16 +27,27 @@ Engineering guidance for agents working in this repository. Read it alongside
 - `.await` on a `#[job]` function enqueues; it never runs the body. Keep that
   contract, and keep the enqueue return type distinct from the job's own.
 - The worker and the enqueue path only talk to storage through `Backend`. A
-  backend's `claim` must be atomic: exactly one worker gets each job.
+  backend's `claim`, `cancel` and `recover` must each be atomic per job:
+  exactly one of them gets it.
+- Delivery is at least once. A claimed job lives in its worker's processing
+  area, and `recover` requeues jobs of workers whose heartbeat expired. Keep
+  the heartbeat independent of job execution, so long jobs never look dead.
 - Backend calls block. Async code reaches them through `spawn_blocking`.
+- Jobs live on named queues (`#[job(queue = ...)]`, default `"default"`), and
+  workers claim in `QueuePriority` order. Retries and recovery must put a job
+  back on its own queue.
+- Every backend must pass `crates/butler/tests/backends.rs`. Add new backend
+  behavior there, so all backends are held to it.
 
 ## Rust Conventions
 
 - Every crate exposes its root `Error` and `Result<T>`, defined with
   `thiserror`, with meaningful typed variants. Match on variants, never on text.
-- `anyhow` belongs at application boundaries (the demo binaries) and in job
-  bodies, which are user code. Inside the library, use typed errors such as
-  `butler::Error` and `butler::JobError`.
+- `anyhow` belongs at application boundaries only (the demo binaries' `main`).
+  The `butler` library must not depend on it: jobs return any
+  `E: Into<BoxError>`, so users pick `thiserror`, plain errors, or anyhow.
+  Inside the library, use typed errors such as `butler::Error` and
+  `butler::JobError`.
 - Never use `String` or `&str` as an error type. Strings are fine as diagnostic
   payloads, such as the stored `last_error`.
 - Propagate errors with `?`. Keep causes with `#[from]`/`#[source]`, and don't
@@ -67,6 +79,7 @@ just format
 just ci            # format-check, clippy on every feature combination, tests
 just audit-deps    # cargo deny, after dependency changes
 just audit-workflows   # after .github changes
+just check-diagrams    # after README mermaid changes
 ```
 
 The Redis test skips itself when no server is reachable. Run `just redis` first

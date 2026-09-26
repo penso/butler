@@ -11,13 +11,16 @@ use butler::{JobState, Worker};
 static FLAKY_CALLS: AtomicU32 = AtomicU32::new(0);
 
 #[butler::job]
-async fn flaky(succeed_on_attempt: u32) -> anyhow::Result<()> {
+async fn flaky(succeed_on_attempt: u32) -> Result<(), String> {
     let n = FLAKY_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
-    anyhow::ensure!(n >= succeed_on_attempt, "attempt {n} failed");
+    if n < succeed_on_attempt {
+        return Err(format!("attempt {n} failed"));
+    }
     Ok(())
 }
 
 #[butler::job]
+/// Apps that use anyhow can keep using it in jobs; butler converts it.
 async fn read_missing(path: String) -> anyhow::Result<()> {
     use anyhow::Context;
     std::fs::read(&path).with_context(|| format!("reading {path}"))?;
@@ -45,17 +48,17 @@ fn retries_then_succeeds_or_dies() {
     // flaky: 3 runs. boom and read_missing: 1 run + 2 retries each.
     assert_eq!(worker.drain().unwrap(), 9);
 
-    let (state, job) = queue.get(&ok).unwrap().unwrap();
+    let (state, job) = queue.get(ok.id()).unwrap().unwrap();
     assert_eq!(state, JobState::Done);
     assert_eq!(job.attempts, 2);
 
-    let (state, job) = queue.get(&dead).unwrap().unwrap();
+    let (state, job) = queue.get(dead.id()).unwrap().unwrap();
     assert_eq!(state, JobState::Dead);
     assert_eq!(job.attempts, 3);
     assert_eq!(job.last_error.as_deref(), Some("job panicked: kaboom"));
 
     // The whole anyhow context chain is kept, not just the outer message.
-    let (_, job) = queue.get(&missing).unwrap().unwrap();
+    let (_, job) = queue.get(missing.id()).unwrap().unwrap();
     let err = job.last_error.unwrap();
     assert!(err.starts_with("reading /nonexistent/butler: "), "{err}");
     assert!(err.contains("No such file or directory"), "{err}");

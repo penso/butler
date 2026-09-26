@@ -11,5 +11,7 @@ workspace = true
 [dependencies]
 anyhow.workspace             = true
 butler.workspace             = true
+serde.workspace              = true
+thiserror.workspace          = true
 tokio                        = { features = ["macros", "rt-multi-thread", "signal", "time"], workspace = true }
 tracing-subscriber.workspace = true

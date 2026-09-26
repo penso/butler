@@ -18,8 +18,8 @@ async fn redis_sleepy_write(path: String) -> std::io::Result<()> {
 }
 
 #[butler::job]
-async fn redis_always_fails() -> anyhow::Result<()> {
-    anyhow::bail!("nope")
+async fn redis_always_fails() -> std::io::Result<()> {
+    Err(std::io::Error::other("nope"))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -39,29 +39,41 @@ async fn redis_roundtrip_with_retry() {
     let out = std::env::temp_dir().join(format!("{prefix}.txt"));
     let ok = redis_sleepy_write(out.display().to_string()).await.unwrap();
     let bad = redis_always_fails().await.unwrap();
-    assert_eq!(queue.state(&ok), Some(JobState::Pending));
+    assert_eq!(ok.state().await.unwrap(), Some(JobState::Pending));
+
+    // Cancelling a job no worker has claimed yet removes it from the queue.
+    let doomed = redis_sleepy_write(out.display().to_string()).await.unwrap();
+    assert!(doomed.cancel().await.unwrap());
+    assert_eq!(doomed.state().await.unwrap(), Some(JobState::Cancelled));
+    assert!(
+        !doomed.cancel().await.unwrap(),
+        "a second cancel changes nothing"
+    );
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let worker = Worker::new(queue.clone())
         .max_retries(1)
         .poll_interval(Duration::from_millis(10));
-    let handle = tokio::spawn(worker.run_async(async {
+    let running = tokio::spawn(worker.run_async(async {
         let _ = stop_rx.await;
     }));
 
-    let q = queue.clone();
-    let (ok2, bad2) = (ok.clone(), bad.clone());
-    tokio::task::spawn_blocking(move || {
-        common::wait_for(&q, &ok2, JobState::Done);
-        common::wait_for(&q, &bad2, JobState::Dead);
-    })
-    .await
-    .unwrap();
+    let poll = Duration::from_millis(10);
+    let both = async { (ok.wait(poll).await, bad.wait(poll).await) };
+    let (ok_state, bad_state) = tokio::time::timeout(Duration::from_secs(5), both)
+        .await
+        .expect("jobs did not finish in time");
+    assert_eq!(ok_state.unwrap(), JobState::Done);
+    assert_eq!(bad_state.unwrap(), JobState::Dead);
+    assert!(
+        !ok.cancel().await.unwrap(),
+        "a finished job can't be cancelled"
+    );
     stop_tx.send(()).unwrap();
-    handle.await.unwrap();
+    running.await.unwrap();
 
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "via redis");
-    let (_, dead) = queue.get(&bad).unwrap().unwrap();
+    let dead = bad.job().await.unwrap().unwrap();
     assert_eq!(dead.attempts, 2);
     assert_eq!(dead.last_error.as_deref(), Some("nope"));
     let _ = std::fs::remove_file(out);

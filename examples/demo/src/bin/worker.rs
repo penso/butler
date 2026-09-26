@@ -9,12 +9,15 @@
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
     let config = butler::Config::load()?;
-    let worker = butler::Worker::from_config(&config)?.register(demo::process_tick::JOB);
+    let worker = butler::Worker::from_config(&config)?
+        .register(demo::process_tick::JOB)
+        .register(demo::alert::JOB);
     println!(
-        "[worker {}] started on {}, jobs: {:?}",
+        "[worker {}] started on {}, jobs: {:?}, queues: {:?}",
         std::process::id(),
         worker.queue().describe(),
-        worker.job_names()
+        worker.job_names(),
+        worker.served_queues()
     );
 
     worker

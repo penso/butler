@@ -42,11 +42,39 @@ async fn main() -> anyhow::Result<()> {
 
         // butler .await: only writes the job to the queue; the worker runs it.
         let started = Instant::now();
-        let id = demo::process_tick(tick, demo::now_ms(), std::process::id()).await?;
+        let job = demo::process_tick(tick, demo::now_ms(), std::process::id()).await?;
         println!(
-            "[injector] tick #{tick}: tokio sleep took {slept:.0?}, enqueue took {:.1?} -> job {id}",
+            "[injector] tick #{tick}: tokio sleep took {slept:.0?}, enqueue took {:.1?} -> job {job}",
             started.elapsed()
         );
+
+        // The result comes back through the queue: wait for it in its own task,
+        // so the loop keeps enqueueing.
+        let pending = job.clone();
+        tokio::spawn(async move {
+            match pending.wait_result(Duration::from_millis(100)).await {
+                Ok(report) => println!(
+                    "[injector] tick #{tick}: result from worker {}: {report:?}",
+                    report.worker_pid
+                ),
+                Err(err) => println!("[injector] tick #{tick}: no result: {err}"),
+            }
+        });
+
+        // Every third tick also raises an alert, on the "critical" queue.
+        if tick.is_multiple_of(3) {
+            let alert = demo::alert(tick).await?;
+            println!("[injector] tick #{tick}: alert -> job {alert} on the critical queue");
+        }
+
+        // The handle can cancel a job that no worker has claimed yet.
+        if tick.is_multiple_of(5) {
+            if job.cancel().await? {
+                println!("[injector] tick #{tick}: cancelled before a worker picked it up");
+            } else {
+                println!("[injector] tick #{tick}: too late to cancel, a worker already has it");
+            }
+        }
     }
     println!("[injector] stopped after {tick} jobs");
     Ok(())

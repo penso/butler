@@ -22,22 +22,23 @@ async fn tokio_worker_runs_job_enqueued_from_tokio() {
     let (queue, dir) = common::temp_queue("tokio");
     let out = dir.join("out.txt");
 
-    let id = sleepy_write(out.display().to_string(), 50).await.unwrap();
-    assert_eq!(queue.state(&id), Some(JobState::Pending));
+    let job = sleepy_write(out.display().to_string(), 50).await.unwrap();
+    assert_eq!(job.state().await.unwrap(), Some(JobState::Pending));
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let worker = Worker::new(queue.clone()).poll_interval(Duration::from_millis(10));
-    let handle = tokio::spawn(worker.run_async(async {
+    let running = tokio::spawn(worker.run_async(async {
         let _ = stop_rx.await;
     }));
 
-    let q = queue.clone();
-    let id2 = id.clone();
-    tokio::task::spawn_blocking(move || common::wait_for(&q, &id2, JobState::Done))
-        .await
-        .unwrap();
+    let finished =
+        tokio::time::timeout(Duration::from_secs(5), job.wait(Duration::from_millis(10)))
+            .await
+            .expect("job did not finish in time")
+            .unwrap();
+    assert_eq!(finished, JobState::Done);
     stop_tx.send(()).unwrap();
-    handle.await.unwrap();
+    running.await.unwrap();
 
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "slept 50ms");
 }

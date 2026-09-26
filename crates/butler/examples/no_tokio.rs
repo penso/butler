@@ -9,14 +9,13 @@
 use std::time::Duration;
 
 #[butler::job]
-async fn greet(name: String, times: u32) -> anyhow::Result<()> {
+async fn greet(name: String, times: u32) {
     for i in 1..=times {
         println!("[{}] hello {name} ({i}/{times})", std::process::id());
     }
-    Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<(), butler::Error> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("worker") => {

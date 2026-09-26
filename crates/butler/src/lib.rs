@@ -6,7 +6,8 @@
 //!
 //! // Enqueue: returns as soon as the job is persisted. Arguments accept
 //! // borrowed values too (see [`JobArg`]).
-//! let id = send_email("a@b.c", "hi").await?;
+//! let job = send_email("a@b.c", "hi").await?;
+//! job.cancel().await?;   // or job.state(), job.wait(interval), ... (see [`JobHandle`])
 //!
 //! // Elsewhere (same binary/crate that defines the jobs):
 //! butler::Worker::from_config(&butler::Config::load()?)?.run();
@@ -25,46 +26,72 @@ mod backend;
 mod config;
 mod error;
 mod executor;
+mod handle;
 mod job;
+mod queues;
 mod worker;
 
 use std::sync::{PoisonError, RwLock};
 
+use serde::{Serialize, de::DeserializeOwned};
+
 pub use arg::JobArg;
 #[cfg(feature = "redis")]
 pub use backend::RedisQueue;
-pub use backend::{Backend, FileQueue, Queue};
+pub use backend::{Backend, FileQueue, MemoryQueue, Queue};
 pub use butler_macros::job;
-pub use config::{BackendKind, Config, FileConfig, QueueConfig, RedisConfig, WorkerConfig};
-pub use error::{Error, JobError, Result};
+pub use config::{
+    BackendKind, Config, FileConfig, QueueConfig, QueueEntry, RedisConfig, WorkerConfig,
+};
+pub use error::{BoxError, Error, JobError, Result};
 pub use executor::block_on;
-pub use job::{Job, JobId, JobState};
+pub use handle::JobHandle;
+pub use job::{DEFAULT_QUEUE, Job, JobId, JobState, is_valid_queue_name};
+pub use queues::QueuePriority;
 pub use worker::Worker;
 
-/// Converts a job's return value into success or failure. Implemented for `()`
-/// and for `Result<T, E>` where `E` converts into `anyhow::Error`: any
-/// `std::error::Error + Send + Sync`, or `anyhow::Error` itself.
+/// Converts a job's return value into its output or a failure.
+///
+/// Implemented for `()` and for `Result<T, E>`, where `T` is serializable (the
+/// worker stores it, and [`JobHandle::result`] returns it) and `E` converts
+/// into a [`BoxError`]: any `std::error::Error + Send + Sync` (a `thiserror`
+/// enum, `std::io::Error`, ...), a `String` or `&str` message, or an
+/// `anyhow::Error` if your app uses anyhow. butler itself doesn't depend on it.
 pub trait IntoJobResult {
-    fn into_job_result(self) -> Result<(), JobError>;
+    /// What the job produces on success.
+    type Output: Serialize + DeserializeOwned + Send + 'static;
+
+    fn into_job_result(self) -> Result<Self::Output, JobError>;
 }
 
 impl IntoJobResult for () {
+    type Output = ();
+
     fn into_job_result(self) -> Result<(), JobError> {
         Ok(())
     }
 }
 
-impl<T, E: Into<anyhow::Error>> IntoJobResult for Result<T, E> {
-    fn into_job_result(self) -> Result<(), JobError> {
-        self.map(|_| ()).map_err(|e| JobError::Failed(e.into()))
+impl<T, E> IntoJobResult for Result<T, E>
+where
+    T: Serialize + DeserializeOwned + Send + 'static,
+    E: Into<BoxError>,
+{
+    type Output = T;
+
+    fn into_job_result(self) -> Result<T, JobError> {
+        self.map_err(|e| JobError::Failed(e.into()))
     }
 }
 
-/// A job that a worker can run: its name plus the function that decodes the
-/// arguments and runs the body. `#[job] fn foo` generates it as `foo::JOB`.
+/// A job that a worker can run: its name, the queue it goes on, and the
+/// function that decodes the arguments and runs the body. `#[job] fn foo`
+/// generates it as `foo::JOB`.
 #[derive(Clone, Copy)]
 pub struct JobDef {
     pub name: &'static str,
+    /// Set with `#[job(queue = "...")]`; [`DEFAULT_QUEUE`] otherwise.
+    pub queue: &'static str,
     #[doc(hidden)]
     pub perform: fn(Vec<serde_json::Value>) -> __private::BoxFuture,
 }
@@ -106,7 +133,34 @@ pub mod __private {
 
     use crate::JobError;
 
-    pub type BoxFuture = Pin<Box<dyn Future<Output = Result<(), JobError>> + Send>>;
+    /// A job run: its output as JSON, or why it failed.
+    pub type BoxFuture = Pin<Box<dyn Future<Output = Result<serde_json::Value, JobError>> + Send>>;
+
+    /// Turns a job body's return value into the JSON the worker stores.
+    pub fn output<R: crate::IntoJobResult>(returned: R) -> Result<serde_json::Value, JobError> {
+        serde_json::to_value(returned.into_job_result()?).map_err(JobError::Output)
+    }
+
+    /// Runs a synchronous job body. Inside a tokio runtime it goes to the
+    /// blocking pool, so CPU-heavy or blocking work never stalls the async
+    /// worker threads; elsewhere it runs in place.
+    pub async fn run_blocking<T: Send + 'static>(
+        body: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, JobError> {
+        #[cfg(feature = "tokio")]
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            return handle.spawn_blocking(body).await.map_err(|e| {
+                if e.is_panic() {
+                    JobError::Panicked {
+                        message: crate::executor::panic_message(&*e.into_panic()),
+                    }
+                } else {
+                    JobError::Cancelled(e)
+                }
+            });
+        }
+        Ok(body())
+    }
 
     inventory::collect!(crate::JobDef);
 
@@ -117,19 +171,14 @@ pub mod __private {
         values.into_iter().map(|v| v.map_err(Into::into)).collect()
     }
 
-    pub async fn enqueue(
-        name: &'static str,
+    pub async fn enqueue<T>(
+        job: &'static crate::JobDef,
         args: Vec<serde_json::Value>,
-    ) -> crate::Result<crate::JobId> {
+    ) -> crate::Result<crate::JobHandle<T>> {
         let queue = crate::queue()?;
-        // Inside a tokio runtime, keep the file I/O off the async worker threads.
-        #[cfg(feature = "tokio")]
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            return handle
-                .spawn_blocking(move || queue.push(name, args))
-                .await?;
-        }
-        queue.push(name, args)
+        let pushing = queue.clone();
+        let id = crate::executor::unblock(move || pushing.push(job.name, job.queue, args)).await?;
+        Ok(crate::JobHandle::new(queue, id))
     }
 
     pub fn arg<T: serde::de::DeserializeOwned>(

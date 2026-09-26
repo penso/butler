@@ -27,8 +27,8 @@ fn enqueue_future_does_not_borrow_its_arguments() {
     let enqueue = assert_send_static(record(&path, &name, 1));
     drop((path, name));
 
-    let id = butler::block_on(enqueue).unwrap();
-    let (_, job) = queue.get(&id).unwrap().unwrap();
+    let job = butler::block_on(enqueue).unwrap();
+    let (_, job) = queue.get(job.id()).unwrap().unwrap();
     assert_eq!(job.args[1], "borrowed");
     assert_eq!(job.args[2], 1);
 }

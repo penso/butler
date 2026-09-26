@@ -10,17 +10,17 @@ use std::{
 };
 
 use crate::{
-    FileQueue, Job, JobState, block_on,
-    __private::{BoxFuture, JobDef},
+    Config, Job, JobDef, JobState, Queue, WorkerConfig, block_on,
+    __private::BoxFuture,
 };
 
 type Handler = fn(Vec<serde_json::Value>) -> BoxFuture;
 
-/// Pulls jobs from a [`FileQueue`] and runs them. It can run every `#[job]`
+/// Pulls jobs from a [`Queue`] and runs them. It can run every `#[job]`
 /// function compiled into the current binary.
 #[derive(Clone)]
 pub struct Worker {
-    queue: FileQueue,
+    queue: Queue,
     handlers: Arc<HashMap<&'static str, Handler>>,
     concurrency: usize,
     max_retries: u32,
@@ -28,7 +28,13 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn new(queue: FileQueue) -> Self {
+    /// Opens the configured backend and applies the `[worker]` settings.
+    pub fn from_config(config: &Config) -> Result<Self, crate::Error> {
+        Ok(Self::new(config.connect()?).with_config(&config.worker))
+    }
+
+    pub fn new(queue: impl Into<Queue>) -> Self {
+        let defaults = WorkerConfig::default();
         let mut handlers = HashMap::new();
         for def in inventory::iter::<JobDef> {
             if handlers.insert(def.name, def.perform).is_some() {
@@ -36,15 +42,33 @@ impl Worker {
             }
         }
         Self {
-            queue,
+            queue: queue.into(),
             handlers: Arc::new(handlers),
-            concurrency: 1,
-            max_retries: 3,
-            poll_interval: Duration::from_millis(100),
+            concurrency: defaults.concurrency,
+            max_retries: defaults.max_retries,
+            poll_interval: defaults.poll_interval(),
         }
     }
 
-    /// Sets how many worker threads run jobs at the same time.
+    pub fn with_config(self, config: &WorkerConfig) -> Self {
+        self.concurrency(config.concurrency)
+            .max_retries(config.max_retries)
+            .poll_interval(config.poll_interval())
+    }
+
+    pub fn queue(&self) -> &Queue {
+        &self.queue
+    }
+
+    /// Adds a job explicitly. Automatic registration covers jobs in the crate
+    /// that builds the worker binary. For jobs in a library crate, call
+    /// `.register(my_lib::my_job::JOB)`, or the linker may drop them.
+    pub fn register(mut self, job: JobDef) -> Self {
+        Arc::make_mut(&mut self.handlers).insert(job.name, job.perform);
+        self
+    }
+
+    /// Sets how many jobs run at the same time (threads for `run`, tasks for `run_async`).
     pub fn concurrency(mut self, n: usize) -> Self {
         self.concurrency = n.max(1);
         self
@@ -66,7 +90,8 @@ impl Worker {
         names
     }
 
-    /// Runs forever.
+    /// Runs forever on plain threads, using the built-in `block_on`. Jobs that
+    /// use tokio APIs need `run_async` instead.
     pub fn run(self) {
         self.run_until(Arc::new(AtomicBool::new(false)));
     }
@@ -113,29 +138,113 @@ impl Worker {
         let Some(job) = self.queue.claim()? else {
             return Ok(false);
         };
-        match self.execute(&job) {
-            Ok(()) => self.queue.complete(&job)?,
-            Err(err) => {
-                let state = self.queue.fail(job.clone(), err.clone(), self.max_retries)?;
-                let verb = if state == JobState::Dead { "is dead" } else { "will retry" };
-                eprintln!("butler: job {} ({}) failed and {verb}: {err}", job.name, job.id);
+        let result = match self.handler(&job) {
+            Ok(handler) => {
+                let fut = handler(job.args.clone());
+                catch_unwind(AssertUnwindSafe(|| block_on(fut)))
+                    .unwrap_or_else(|panic| Err(format!("job panicked: {}", panic_message(&*panic))))
             }
-        }
+            Err(e) => Err(e),
+        };
+        self.finish(job, result)?;
         Ok(true)
     }
 
-    fn execute(&self, job: &Job) -> Result<(), String> {
-        let handler = self
-            .handlers
+    fn handler(&self, job: &Job) -> Result<Handler, String> {
+        self.handlers
             .get(job.name.as_str())
-            .ok_or_else(|| format!("no job named `{}` is registered in this worker", job.name))?;
-        let fut = handler(job.args.clone());
-        catch_unwind(AssertUnwindSafe(|| block_on(fut)))
-            .unwrap_or_else(|panic| Err(format!("job panicked: {}", panic_message(&panic))))
+            .copied()
+            .ok_or_else(|| format!("no job named `{}` is registered in this worker", job.name))
+    }
+
+    /// Stores the outcome: `done/` on success, otherwise a retry or `dead/`.
+    fn finish(&self, job: Job, result: Result<(), String>) -> Result<(), crate::Error> {
+        match result {
+            Ok(()) => self.queue.complete(&job),
+            Err(err) => {
+                let (name, id) = (job.name.clone(), job.id.clone());
+                let state = self.queue.fail(job, err.clone(), self.max_retries)?;
+                let verb = if state == JobState::Dead { "is dead" } else { "will retry" };
+                eprintln!("butler: job {name} ({id}) failed and {verb}: {err}");
+                Ok(())
+            }
+        }
     }
 }
 
-fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+#[cfg(feature = "tokio")]
+impl Worker {
+    /// Runs the worker inside the current tokio runtime until `shutdown`
+    /// completes. Each job is a tokio task, so job bodies can use tokio timers
+    /// and I/O. At most `concurrency` jobs run at once. On shutdown, the worker
+    /// stops claiming jobs and waits for the running ones to finish.
+    pub async fn run_async(self, shutdown: impl std::future::Future<Output = ()>) {
+        use tokio::{sync::Semaphore, task::JoinSet};
+
+        let permits = Arc::new(Semaphore::new(self.concurrency));
+        let mut running = JoinSet::new();
+        let mut shutdown = std::pin::pin!(shutdown);
+
+        loop {
+            let permit = tokio::select! {
+                _ = &mut shutdown => break,
+                permit = permits.clone().acquire_owned() => permit.expect("semaphore is never closed"),
+            };
+
+            // Not raced against `shutdown`: once a claim has started, it must
+            // finish, or the job would be stranded in `processing/`.
+            let queue = self.queue.clone();
+            let claimed = tokio::task::spawn_blocking(move || queue.claim())
+                .await
+                .unwrap_or_else(|e| Err(crate::Error::Io(std::io::Error::other(e))));
+
+            match claimed {
+                Ok(Some(job)) => {
+                    let worker = self.clone();
+                    running.spawn(async move {
+                        worker.execute_async(job).await;
+                        drop(permit);
+                    });
+                }
+                Ok(None) | Err(_) => {
+                    if let Err(e) = claimed {
+                        eprintln!("butler: queue error: {e}");
+                    }
+                    drop(permit);
+                    tokio::select! {
+                        _ = &mut shutdown => break,
+                        _ = tokio::time::sleep(self.poll_interval) => {}
+                    }
+                }
+            }
+            while running.try_join_next().is_some() {}
+        }
+
+        while running.join_next().await.is_some() {}
+    }
+
+    async fn execute_async(&self, job: Job) {
+        let result = match self.handler(&job) {
+            // A separate task, so a panic in the job surfaces as a JoinError.
+            Ok(handler) => match tokio::spawn(handler(job.args.clone())).await {
+                Ok(result) => result,
+                Err(e) if e.is_panic() => {
+                    Err(format!("job panicked: {}", panic_message(&*e.into_panic())))
+                }
+                Err(e) => Err(e.to_string()),
+            },
+            Err(e) => Err(e),
+        };
+
+        let worker = self.clone();
+        let stored = tokio::task::spawn_blocking(move || worker.finish(job, result)).await;
+        if let Err(e) = stored.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())) {
+            eprintln!("butler: could not store job result: {e}");
+        }
+    }
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
     panic
         .downcast_ref::<&str>()
         .map(|s| s.to_string())

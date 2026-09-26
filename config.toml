@@ -1,0 +1,17 @@
+# butler settings, read by `butler::Config::load()` from the current directory.
+# Environment variables override any key, e.g. BUTLER_QUEUE__BACKEND=file.
+
+[queue]
+backend = "redis"   # "file" or "redis"
+
+[queue.file]
+dir = ".butler"
+
+[queue.redis]
+url = "redis://127.0.0.1:6379/"
+prefix = "butler"
+
+[worker]
+concurrency = 4
+max_retries = 1
+poll_interval_ms = 50

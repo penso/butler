@@ -12,6 +12,11 @@
 //!   serializes the arguments and pushes a job onto the queue (like `perform_async`).
 //! - a hidden `__butler_perform_send_email` holding the original body.
 //! - a registration entry so any `Worker` in the same binary can dispatch it by name.
+//! - `send_email::JOB`, a handle for `Worker::register`. Jobs defined in another
+//!   crate need it: the linker drops that crate's automatic registration unless
+//!   the binary references something from it.
+//!
+//! Job bodies must be `Send`, so a tokio worker can spawn them.
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -82,7 +87,7 @@ fn expand(func: ItemFn, job_name: Option<LitStr>) -> syn::Result<proc_macro2::To
             let args = ::std::vec![
                 #(::butler::__private::serde_json::to_value(&#idents)?),*
             ];
-            ::butler::__private::enqueue(#job_name, args)
+            ::butler::__private::enqueue(#job_name, args).await
         }
 
         #[doc(hidden)]
@@ -103,8 +108,13 @@ fn expand(func: ItemFn, job_name: Option<LitStr>) -> syn::Result<proc_macro2::To
             })
         }
 
-        ::butler::__private::inventory::submit! {
-            ::butler::__private::JobDef { name: #job_name, perform: #dispatch }
+        #[doc(hidden)]
+        #vis mod #name {
+            /// Pass to `Worker::register` when the job lives in another crate.
+            pub const JOB: ::butler::JobDef =
+                ::butler::JobDef { name: #job_name, perform: super::#dispatch };
         }
+
+        ::butler::__private::inventory::submit! { #name::JOB }
     })
 }

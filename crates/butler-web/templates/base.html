@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Dashboard{% endblock %} · butler</title>
+  <script>
+    (function () {
+      try {
+        var theme = localStorage.getItem("butler-theme") || "system";
+        if (theme === "system") {
+          theme = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+        }
+        document.documentElement.dataset.theme = theme;
+      } catch (e) {}
+    })();
+  </script>
+  <link rel="stylesheet" href="{{ base }}/assets/uplot.min.css">
+  <link rel="stylesheet" href="{{ base }}/assets/app.css">
+</head>
+<body class="min-h-screen" data-base="{{ base }}">
+  <header class="sticky top-0 z-10 border-b border-[var(--border)] bg-[var(--bg)]/85 backdrop-blur">
+    <div class="mx-auto flex max-w-7xl items-center gap-4 px-6 py-3">
+      <a href="{{ base }}/" class="flex items-center gap-2 font-semibold tracking-tight">
+        <span class="grid h-7 w-7 place-items-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent)]">
+          <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h10M4 17h6"/><circle cx="18" cy="16" r="3"/></svg>
+        </span>
+        butler
+      </a>
+      <nav class="flex items-center gap-1">
+        <a href="{{ base }}/" class="nav-link {% if nav == "dashboard" %}active{% endif %}">Dashboard</a>
+        <a href="{{ base }}/jobs?state=dead" class="nav-link {% if nav == "jobs" %}active{% endif %}">Jobs</a>
+        <a href="{{ base }}/workers" class="nav-link {% if nav == "workers" %}active{% endif %}">Workers</a>
+      </nav>
+      <div class="ml-auto flex items-center gap-3 text-xs text-[var(--muted)]">
+        <span class="flex items-center gap-1.5" title="Live updates">
+          <span class="dot bg-[var(--muted)]" data-live-dot></span>
+          <span data-live-label>connecting</span>
+        </span>
+        <button type="button" class="btn" data-theme-toggle title="Toggle theme">
+          <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+          Theme
+        </button>
+      </div>
+    </div>
+  </header>
+  <main class="mx-auto max-w-7xl px-6 py-8">
+    {% block content %}{% endblock %}
+  </main>
+  <script src="{{ base }}/assets/uplot.min.js"></script>
+  <script src="{{ base }}/assets/app.js"></script>
+</body>
+</html>

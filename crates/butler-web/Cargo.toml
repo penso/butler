@@ -1,0 +1,33 @@
+[package]
+categories.workspace   = true
+description            = "Web dashboard for butler: live stats over SSE, charts, and failed-job management"
+edition.workspace      = true
+keywords               = ["background", "dashboard", "jobs", "queue", "web"]
+name                   = "butler-web"
+readme                 = "README.md"
+rust-version.workspace = true
+version.workspace      = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "butler-web"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace             = true
+askama.workspace             = true
+axum.workspace               = true
+butler.workspace             = true
+serde.workspace              = true
+serde_json.workspace         = true
+thiserror.workspace          = true
+tokio                        = { features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"], workspace = true }
+tokio-stream                 = { features = ["sync"], workspace = true }
+tracing.workspace            = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+tower.workspace          = true

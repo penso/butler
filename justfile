@@ -49,6 +49,15 @@ publish:
 check-diagrams:
     bash scripts/check-mermaid.sh README.md
 
+# Rebuild the dashboard's stylesheet after changing templates or ui/input.css.
+# Needs the standalone Tailwind CSS v4 CLI (`tailwindcss`).
+web-css:
+    cd crates/butler-web && tailwindcss -i ui/input.css -o assets/app.css --minify
+
+# The dashboard, reading ./config.toml like the demo worker: http://127.0.0.1:9090
+web:
+    cargo run --locked -p butler-web
+
 # A throwaway Redis for the demo and the Redis test.
 redis:
     docker run -d --rm --name butler-redis -p 6379:6379 redis:8-alpine

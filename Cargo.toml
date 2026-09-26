@@ -1,5 +1,5 @@
 [workspace]
-members  = ["crates/butler", "crates/butler-macros", "examples/demo"]
+members  = ["crates/butler", "crates/butler-macros", "crates/butler-web", "examples/demo"]
 resolver = "3"
 
 # Shared by every crate. Published crates also need `license` (and ideally
@@ -20,15 +20,18 @@ unwrap_used = "deny"
 
 [workspace.dependencies]
 anyhow = "1.0.104"
+askama = "0.15"
+axum   = "0.8.9"
 butler = { path = "crates/butler", version = "0.1.0" }
 # Exact: the macro expands to calls into `butler::__private`, so the two crates
 # are released in lockstep.
-butler-macros = { path = "crates/butler-macros", version = "=0.1.0" }
-config        = { default-features = false, features = ["toml"], version = "0.15.26" }
-inventory     = "0.3.24"
-proc-macro2   = "1.0.107"
-quote         = "1.0.47"
-redis         = { default-features = false, version = "1.7.1" }
+butler-macros  = { path = "crates/butler-macros", version = "=0.1.0" }
+config         = { default-features = false, features = ["toml"], version = "0.15.26" }
+http-body-util = "0.1.5"
+inventory      = "0.3.24"
+proc-macro2    = "1.0.107"
+quote          = "1.0.47"
+redis          = { default-features = false, version = "1.7.1" }
 # Bundled: SQLite is compiled in, so there is no system library to install.
 rusqlite           = { features = ["bundled"], version = "0.40.2" }
 serde              = { features = ["derive"], version = "1.0.229" }
@@ -36,5 +39,7 @@ serde_json         = "1.0.151"
 syn                = { features = ["full"], version = "2" }
 thiserror          = "2.0.19"
 tokio              = { default-features = false, version = "1.53.1" }
+tokio-stream       = "0.1.19"
+tower              = { features = ["util"], version = "0.5.3" }
 tracing            = "0.1"
 tracing-subscriber = { default-features = false, features = ["ansi", "fmt", "std"], version = "0.3" }

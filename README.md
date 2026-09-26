@@ -16,6 +16,7 @@ queues a job, and a worker process runs the body later.
 - [Why butler](#why-butler)
 - [Rust at the core](#rust-at-the-core)
 - [Performance](#performance)
+- [Web dashboard](#web-dashboard)
 - [Two kinds of `.await`](#two-kinds-of-await)
   - [How Rust tells them apart](#how-rust-tells-them-apart)
   - [How a worker finds your function](#how-a-worker-finds-your-function)
@@ -82,6 +83,9 @@ memory, until it is done:
   its full error chain, instead of disappearing.
 - **Shutdowns finish what they started.** On Ctrl-C, a worker stops taking
   new jobs and waits for the running ones to complete.
+- **See what's happening.** [`butler-web`](#web-dashboard) shows live
+  throughput, queues, workers and every failed job with its full error, and
+  retries or discards them in a click.
 - **Long jobs resume instead of restarting.** A job with
   [checkpoints](#job-continuations) picks up where it stopped after a deploy,
   a crash or a failed attempt, instead of redoing hours of work.
@@ -186,6 +190,29 @@ nothing else running. On this 16-CPU machine:
 Async jobs are tokio tasks, so thousands can wait at once on a few threads.
 CPU-bound jobs are plain `fn`s that run on tokio's blocking pool, one core
 each. See [Concurrency and cores](#concurrency-and-cores) for tuning.
+
+## Web dashboard
+
+`butler-web` is a dashboard for all of it, like Sidekiq's Web UI or Rails'
+Mission Control: live counts streamed over server-sent events, throughput and
+duration charts, and every job, with retry and discard for the failed ones.
+
+![butler-web dashboard, dark theme](https://raw.githubusercontent.com/penso/butler/main/docs/images/dashboard-dark.png)
+
+| Dead jobs, retry or discard | One job: arguments, error chain, actions |
+|---|---|
+| ![Dead jobs](https://raw.githubusercontent.com/penso/butler/main/docs/images/dead-jobs.png) | ![A failed job](https://raw.githubusercontent.com/penso/butler/main/docs/images/job.png) |
+
+```sh
+just web        # or: cargo run -p butler-web   ->  http://127.0.0.1:9090
+```
+
+It reads the same `config.toml` as the workers, so it sees whichever backend
+they use. To embed it in your own axum app, behind your own authentication:
+`butler_web::Dashboard::new(queue).base_path("/admin/jobs").router()`. It has
+a light theme too, and history for Redis, SQLite and memory (the file backend
+keeps none). See [crates/butler-web](crates/butler-web/README.md) for pages,
+security, and how it's built.
 
 ## Two kinds of `.await`
 
@@ -1088,6 +1115,7 @@ crates/butler/                   the library (published as `butler`)
                                  crash recovery with a real aborted worker)
   examples/no_tokio.rs           the same flow without tokio
 crates/butler-macros/            #[job] attribute macro (published as `butler-macros`)
+crates/butler-web/               web dashboard: axum + Askama + Tailwind + uPlot (published as `butler-web`)
 examples/demo/                   injector + worker binaries, and bench (not published)
 justfile                 format, lint, test, audit and demo tasks
 deny.toml, taplo.toml    dependency policy, TOML formatting
@@ -1102,6 +1130,8 @@ tasks are in the `justfile`:
 just format        # cargo fmt + taplo fmt
 just ci            # format check, clippy on every feature combination, tests
 just audit-deps    # cargo deny: advisories, bans, sources
+just web           # the web dashboard on http://127.0.0.1:9090
+just web-css       # rebuild its stylesheet after changing templates
 just redis         # throwaway Redis for the demo and the Redis test
 just worker        # demo worker
 just injector      # demo injector

@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<div class="mb-6 flex items-end justify-between gap-4">
+  <div>
+    <h1 class="text-xl font-semibold tracking-tight">Dashboard</h1>
+    <p class="mt-1 text-sm text-[var(--muted)] mono">{{ backend }}</p>
+  </div>
+</div>
+
+<section class="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-6">
+  <div class="stat">
+    <span class="card-title">Processed</span>
+    <span class="stat-value" data-stat="processed_total">{{ processed }}</span>
+    <span class="text-xs text-[var(--muted)]"><span class="tabular-nums" data-rate="processed">0</span>/s now</span>
+  </div>
+  <div class="stat">
+    <span class="card-title">Failed</span>
+    <span class="stat-value text-[var(--error)]" data-stat="failed_total">{{ failed }}</span>
+    <span class="text-xs text-[var(--muted)]"><span class="tabular-nums" data-rate="failed">0</span>/s now</span>
+  </div>
+  <div class="stat">
+    <span class="card-title">Running</span>
+    <span class="stat-value text-[var(--warn)]" data-stat="processing">{{ running }}</span>
+    <span class="text-xs text-[var(--muted)]">jobs in flight</span>
+  </div>
+  <div class="stat">
+    <span class="card-title">Pending</span>
+    <span class="stat-value text-[var(--info)]" data-stat="pending">{{ pending }}</span>
+    <span class="text-xs text-[var(--muted)]">waiting in queues</span>
+  </div>
+  <a class="stat transition-colors hover:border-[var(--error)]" href="{{ base }}/jobs?state=dead">
+    <span class="card-title">Dead</span>
+    <span class="stat-value" data-stat="dead">{{ dead }}</span>
+    <span class="text-xs text-[var(--muted)]">out of retries &rarr;</span>
+  </a>
+  <a class="stat transition-colors hover:border-[var(--accent)]" href="{{ base }}/workers">
+    <span class="card-title">Workers</span>
+    <span class="stat-value text-[var(--accent)]" data-stat="workers_alive">{{ workers }}</span>
+    <span class="text-xs text-[var(--muted)]">alive &rarr;</span>
+  </a>
+</section>
+
+<section class="card mt-6 p-5">
+  <div class="mb-3 flex items-center justify-between">
+    <div>
+      <h2 class="text-sm font-semibold">Live throughput</h2>
+      <p class="text-xs text-[var(--muted)]">Jobs finished per second, last 5 minutes, streamed from the server</p>
+    </div>
+  </div>
+  <div id="live-chart"></div>
+</section>
+
+<section class="mt-6 grid gap-6 lg:grid-cols-2">
+  <div class="card p-5">
+    <div class="mb-3 flex items-center justify-between">
+      <div>
+        <h2 class="text-sm font-semibold">History</h2>
+        <p class="text-xs text-[var(--muted)]">Processed and failed per minute</p>
+      </div>
+      <div class="flex gap-1" data-range-group>
+        <button type="button" class="range" data-range="60">1h</button>
+        <button type="button" class="range active" data-range="1440">24h</button>
+        <button type="button" class="range" data-range="10080">7d</button>
+      </div>
+    </div>
+    <div id="history-chart"></div>
+  </div>
+  <div class="card p-5">
+    <div class="mb-3">
+      <h2 class="text-sm font-semibold">Duration</h2>
+      <p class="text-xs text-[var(--muted)]">Average and slowest job per minute, in ms</p>
+    </div>
+    <div id="duration-chart"></div>
+  </div>
+</section>
+
+<section class="mt-6 grid gap-6 lg:grid-cols-3">
+  <div class="card overflow-hidden">
+    <div class="px-5 pt-5 pb-2">
+      <h2 class="text-sm font-semibold">Queues</h2>
+      <p class="text-xs text-[var(--muted)]">Jobs waiting, live</p>
+    </div>
+    <table class="table">
+      <thead><tr><th>Queue</th><th class="text-right">Pending</th></tr></thead>
+      <tbody>
+        {% for queue in queues %}
+        <tr>
+          <td><a class="link mono" href="{{ base }}/jobs?state=pending&queue={{ queue.name }}">{{ queue.name }}</a></td>
+          <td class="text-right tabular-nums" data-queue-pending="{{ queue.name }}">{{ queue.pending }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="2" class="text-[var(--muted)]">No queue has had a job yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="card overflow-hidden lg:col-span-2">
+    <div class="px-5 pt-5 pb-2">
+      <h2 class="text-sm font-semibold">Busiest jobs</h2>
+      <p class="text-xs text-[var(--muted)]">Last 24 hours</p>
+    </div>
+    <table class="table">
+      <thead>
+        <tr><th>Job</th><th>Queue</th><th class="text-right">Processed</th><th class="text-right">Failed</th><th class="text-right">Avg</th><th class="text-right">Max</th></tr>
+      </thead>
+      <tbody>
+        {% for job in jobs %}
+        <tr>
+          <td class="mono">{{ job.job }}</td>
+          <td class="mono text-[var(--muted)]">{{ job.queue }}</td>
+          <td class="text-right tabular-nums">{{ job.processed }}</td>
+          <td class="text-right tabular-nums {% if job.failed > 0 %}text-[var(--error)]{% endif %}">{{ job.failure_rate }}</td>
+          <td class="text-right tabular-nums">{{ job.avg }}</td>
+          <td class="text-right tabular-nums">{{ job.max }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="text-[var(--muted)]">No jobs finished in the last 24 hours.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script type="application/json" id="initial-snapshot">{{ snapshot_json|safe }}</script>
+{% endblock %}

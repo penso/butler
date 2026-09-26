@@ -19,6 +19,7 @@ Engineering guidance for agents working in this repository. Read it alongside
 | `crates/butler/src/config.rs` | `config.toml` and `BUTLER_*` environment loading |
 | `crates/butler/src/lib.rs` | Public API, the global queue, the `#[job]` enqueue helpers |
 | `crates/butler-macros/` | The `#[job]` attribute macro |
+| `crates/butler-web/` | Dashboard: axum routes, Askama templates, Tailwind CSS, uPlot charts, SSE |
 | `examples/demo/` | `injector` and `worker` binaries sharing one job crate, and `bench`; not published |
 
 - `butler` and `butler-macros` are published together with the same version;
@@ -86,6 +87,18 @@ Engineering guidance for agents working in this repository. Read it alongside
 - `tokio` and `redis` are default features. Gate imports and call sites
   consistently; `just lint` checks every feature combination.
 - Use the pinned `rust-toolchain.toml`, and `--locked` for reproducible checks.
+
+## Web dashboard
+
+- Pages are server-rendered Askama templates in `crates/butler-web/templates`;
+  the only script is `assets/app.js` (plain JS, no build step). Use Tailwind
+  classes and the component classes in `ui/input.css`, not inline styles.
+- After changing templates or `ui/input.css`, run `just web-css`: the built
+  `assets/app.css` is committed so the crate publishes as is.
+- Anything from a job (names, arguments, errors) goes through Askama's escaping;
+  never mark it `|safe`. Actions are POSTs, and must keep the cross-site check
+  and the in-dashboard `return_to` redirect.
+- Backend calls block: run them on `spawn_blocking`.
 
 ## Verification
 

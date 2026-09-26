@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}{{ label }} jobs{% endblock %}
+{% block content %}
+<div class="mb-4 flex flex-wrap items-end justify-between gap-4">
+  <h1 class="text-xl font-semibold tracking-tight">Jobs</h1>
+  <form method="get" action="{{ base }}/jobs" class="flex items-center gap-2 text-sm">
+    <input type="hidden" name="state" value="{{ state }}">
+    <label class="text-[var(--muted)]" for="queue">Queue</label>
+    <select id="queue" name="queue" class="rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1" onchange="this.form.submit()">
+      <option value="">All queues</option>
+      {% for name in queues %}
+      <option value="{{ name }}" {% if name.as_str() == queue.as_str() %}selected{% endif %}>{{ name }}</option>
+      {% endfor %}
+    </select>
+  </form>
+</div>
+
+<nav class="mb-4 flex gap-1 border-b border-[var(--border)]">
+  {% for tab in tabs %}
+  <a class="tab {% if tab.active %}active{% endif %}" href="{{ base }}/jobs?state={{ tab.state }}{% if !queue.is_empty() %}&queue={{ queue }}{% endif %}">
+    {{ tab.label }} <span class="count">{{ tab.count }}</span>
+  </a>
+  {% endfor %}
+</nav>
+
+{% if can_retry || can_discard %}
+<div class="mb-3 flex justify-end gap-2">
+  {% if can_retry %}
+  <form method="post" action="{{ base }}/jobs/retry-all" data-confirm="Retry every {{ label|lower }} job{% if !queue.is_empty() %} on {{ queue }}{% endif %}?">
+    <input type="hidden" name="state" value="{{ state }}"><input type="hidden" name="queue" value="{{ queue }}"><input type="hidden" name="return_to" value="{{ return_to }}">
+    <button class="btn btn-accent" {% if rows.is_empty() %}disabled{% endif %}>Retry all</button>
+  </form>
+  {% endif %}
+  {% if can_discard %}
+  <form method="post" action="{{ base }}/jobs/discard-all" data-confirm="Discard every {{ label|lower }} job{% if !queue.is_empty() %} on {{ queue }}{% endif %}? This deletes them.">
+    <input type="hidden" name="state" value="{{ state }}"><input type="hidden" name="queue" value="{{ queue }}"><input type="hidden" name="return_to" value="{{ return_to }}">
+    <button class="btn btn-danger" {% if rows.is_empty() %}disabled{% endif %}>Discard all</button>
+  </form>
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="card overflow-hidden">
+  <table class="table">
+    <thead>
+      <tr><th>Job</th><th>Queue</th><th>Enqueued</th><th class="text-right">Attempts</th>{% if can_retry %}<th>Error</th>{% endif %}<th class="text-right">Actions</th></tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td>
+          <a class="link mono" href="{{ base }}/jobs/{{ row.id }}">{{ row.name }}</a>
+          <div class="mono text-xs text-[var(--muted)]">…{{ row.short_id }}</div>
+        </td>
+        <td class="mono text-[var(--muted)]">{{ row.queue }}</td>
+        <td class="whitespace-nowrap text-[var(--muted)]" data-ms="{{ row.enqueued_ms }}">{{ row.enqueued_ago }}</td>
+        <td class="text-right tabular-nums">{{ row.attempts }}</td>
+        {% if can_retry %}
+        <td class="max-w-md truncate text-[var(--error)] mono text-xs" title="{% if let Some(error) = row.error %}{{ error }}{% endif %}">{% if let Some(error) = row.error %}{{ error }}{% endif %}</td>
+        {% endif %}
+        <td class="text-right">
+          <div class="flex justify-end gap-1.5">
+            {% if can_retry %}
+            <form method="post" action="{{ base }}/jobs/{{ row.id }}/retry"><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn btn-accent">Retry</button></form>
+            {% endif %}
+            {% if can_cancel %}
+            <form method="post" action="{{ base }}/jobs/{{ row.id }}/cancel"><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn">Cancel</button></form>
+            {% endif %}
+            {% if can_discard %}
+            <form method="post" action="{{ base }}/jobs/{{ row.id }}/discard"><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn btn-danger">Discard</button></form>
+            {% endif %}
+          </div>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="py-10 text-center text-[var(--muted)]">No {{ label|lower }} jobs{% if !queue.is_empty() %} on {{ queue }}{% endif %}.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="mt-4 flex items-center justify-between text-sm text-[var(--muted)]">
+  <span>Page {{ page }}</span>
+  <div class="flex gap-2">
+    {% if let Some(url) = prev_url %}<a class="btn" href="{{ url }}">&larr; Newer</a>{% endif %}
+    {% if let Some(url) = next_url %}<a class="btn" href="{{ url }}">Older &rarr;</a>{% endif %}
+  </div>
+</div>
+{% endblock %}

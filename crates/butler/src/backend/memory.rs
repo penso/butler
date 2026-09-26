@@ -9,7 +9,7 @@
 //! job is pushed.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError},
     time::{Duration, Instant},
 };
@@ -17,7 +17,14 @@ use std::{
 use serde_json::Value;
 
 use super::{Backend, NewJob};
-use crate::{JobId, JobRecord, JobState, Result, Signal, signal::JobWatch};
+use crate::{
+    JobId, JobRecord, JobState, Result, Signal,
+    monitor::{
+        JobMetric, ListFilter, METRICS_RETENTION_MINUTES, MetricBucket, QueueStats, Stats,
+        WorkerStats,
+    },
+    signal::JobWatch,
+};
 
 #[derive(Clone, Default)]
 pub struct MemoryQueue {
@@ -42,6 +49,13 @@ struct State {
     processing: HashMap<String, HashSet<JobId>>,
     /// When each worker's heartbeat expires.
     heartbeats: HashMap<String, Instant>,
+    /// History, per (minute, queue, job).
+    metrics: BTreeMap<(u64, String, String), MetricBucket>,
+    processed_total: u64,
+    failed_total: u64,
+    /// The minute history was last pruned, so it's pruned once a minute, not
+    /// on every job.
+    pruned_at_minute: u64,
 }
 
 impl MemoryQueue {
@@ -263,6 +277,147 @@ impl Backend for MemoryQueue {
 
     fn watch_finished(&self, id: &str) -> Option<Arc<Signal>> {
         Some(self.inner.finished.watch(id))
+    }
+
+    fn stats(&self) -> Result<Stats> {
+        let state = self.lock();
+        let mut stats = Stats {
+            processed_total: state.processed_total,
+            failed_total: state.failed_total,
+            ..Stats::default()
+        };
+        let mut queues: BTreeMap<&str, u64> = state
+            .pending
+            .iter()
+            .map(|(queue, ids)| (queue.as_str(), ids.len() as u64))
+            .collect();
+        for (job_state, job) in state.jobs.values() {
+            queues.entry(job.queue.as_str()).or_default();
+            match job_state {
+                JobState::Processing => stats.processing += 1,
+                JobState::Done => stats.done += 1,
+                JobState::Dead => stats.dead += 1,
+                JobState::Cancelled => stats.cancelled += 1,
+                JobState::Pending => {}
+            }
+        }
+        stats.queues = queues
+            .into_iter()
+            .map(|(name, pending)| QueueStats {
+                name: name.to_owned(),
+                pending,
+            })
+            .collect();
+        let now = Instant::now();
+        stats.workers = state
+            .processing
+            .iter()
+            .map(|(id, held)| WorkerStats {
+                id: id.clone(),
+                running: held.len() as u64,
+                expires_in_ms: state.heartbeats.get(id).map_or(-1, |expires| {
+                    if *expires >= now {
+                        i64::try_from((*expires - now).as_millis()).unwrap_or(i64::MAX)
+                    } else {
+                        -i64::try_from((now - *expires).as_millis()).unwrap_or(i64::MAX)
+                    }
+                }),
+            })
+            .collect();
+        stats.workers.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(stats)
+    }
+
+    fn list(&self, filter: &ListFilter) -> Result<Vec<JobRecord>> {
+        let state = self.lock();
+        let mut jobs: Vec<&JobRecord> = state
+            .jobs
+            .values()
+            .filter(|(job_state, job)| {
+                *job_state == filter.state
+                    && filter
+                        .queue
+                        .as_deref()
+                        .is_none_or(|queue| queue == job.queue)
+            })
+            .map(|(_, job)| job)
+            .collect();
+        // Ids start with the enqueue time.
+        jobs.sort_by(|a, b| a.id.cmp(&b.id));
+        if filter.state.is_finished() {
+            jobs.reverse();
+        }
+        Ok(jobs
+            .into_iter()
+            .skip(filter.offset)
+            .take(filter.limit)
+            .cloned()
+            .collect())
+    }
+
+    fn retry(&self, id: &str) -> Result<bool> {
+        let mut state = self.lock();
+        let Some((job_state, job)) = state.jobs.get_mut(id) else {
+            return Ok(false);
+        };
+        if *job_state != JobState::Dead {
+            return Ok(false);
+        }
+        *job_state = JobState::Pending;
+        job.attempts = 0;
+        let queue = job.queue.clone();
+        state
+            .pending
+            .entry(queue)
+            .or_default()
+            .push_back(id.to_owned());
+        self.inner.pushed.notify_all();
+        Ok(true)
+    }
+
+    fn discard(&self, id: &str) -> Result<bool> {
+        let mut state = self.lock();
+        let finished = state
+            .jobs
+            .get(id)
+            .is_some_and(|(job_state, _)| job_state.is_finished());
+        if finished {
+            state.jobs.remove(id);
+        }
+        Ok(finished)
+    }
+
+    fn record_metric(&self, metric: &JobMetric) -> Result<()> {
+        let mut state = self.lock();
+        state.processed_total += 1;
+        state.failed_total += u64::from(metric.failed);
+        state
+            .metrics
+            .entry((metric.minute, metric.queue.clone(), metric.job.clone()))
+            .or_insert_with(|| MetricBucket {
+                minute: metric.minute,
+                queue: metric.queue.clone(),
+                job: metric.job.clone(),
+                ..MetricBucket::default()
+            })
+            .add(metric);
+        if metric.minute > state.pruned_at_minute {
+            state.pruned_at_minute = metric.minute;
+            let oldest = metric.minute.saturating_sub(METRICS_RETENTION_MINUTES);
+            state.metrics = state
+                .metrics
+                .split_off(&(oldest, String::new(), String::new()));
+        }
+        Ok(())
+    }
+
+    fn metrics(&self, since_minute: u64) -> Result<Vec<MetricBucket>> {
+        let state = self.lock();
+        Ok(state
+            .metrics
+            .range((since_minute, String::new(), String::new())..)
+            .map(|(_, bucket)| bucket.clone())
+            .collect())
     }
 
     /// Every call is a few map updates under a lock.

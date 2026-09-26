@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}{{ name }}{% endblock %}
+{% block content %}
+<a href="{{ base }}/jobs?state={{ state }}" class="text-sm text-[var(--muted)] hover:text-[var(--text)]">&larr; {{ label }} jobs</a>
+<div class="mt-3 mb-6 flex flex-wrap items-start justify-between gap-4">
+  <div>
+    <div class="flex items-center gap-3">
+      <h1 class="text-xl font-semibold tracking-tight mono">{{ name }}</h1>
+      <span class="badge badge-{{ state }}">{{ label }}</span>
+    </div>
+    <p class="mt-1 text-xs text-[var(--muted)] mono">{{ id }}</p>
+  </div>
+  <div class="flex gap-2">
+    {% if can_retry %}
+    <form method="post" action="{{ base }}/jobs/{{ id }}/retry"><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn btn-accent">Retry</button></form>
+    {% endif %}
+    {% if can_cancel %}
+    <form method="post" action="{{ base }}/jobs/{{ id }}/cancel"><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn">Cancel</button></form>
+    {% endif %}
+    {% if can_discard %}
+    <form method="post" action="{{ base }}/jobs/{{ id }}/discard" data-confirm="Discard this job? This deletes it."><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn btn-danger">Discard</button></form>
+    {% endif %}
+  </div>
+</div>
+
+<section class="grid grid-cols-2 gap-3 md:grid-cols-4">
+  <div class="stat"><span class="card-title">Queue</span><span class="mono">{{ queue }}</span></div>
+  <div class="stat"><span class="card-title">State</span><span>{{ label }}</span></div>
+  <div class="stat"><span class="card-title">Failed attempts</span><span class="tabular-nums">{{ attempts }}</span></div>
+  <div class="stat"><span class="card-title">Enqueued</span><span data-ms="{{ enqueued_ms }}">{{ enqueued_ago }}</span></div>
+</section>
+
+{% if let Some(error) = last_error %}
+<section class="card mt-6 border-[var(--error)]/40 p-5">
+  <h2 class="mb-2 text-sm font-semibold text-[var(--error)]">Last error</h2>
+  <pre class="code whitespace-pre-wrap text-[var(--error)]">{{ error }}</pre>
+</section>
+{% endif %}
+
+<section class="mt-6 grid gap-6 lg:grid-cols-2">
+  <div class="card p-5">
+    <h2 class="mb-2 text-sm font-semibold">Arguments</h2>
+    <pre class="code">{{ args }}</pre>
+  </div>
+  <div class="flex flex-col gap-6">
+    {% if let Some(result) = result %}
+    <div class="card p-5">
+      <h2 class="mb-2 text-sm font-semibold">Result</h2>
+      <pre class="code">{{ result }}</pre>
+    </div>
+    {% endif %}
+    {% if let Some(progress) = progress %}
+    <div class="card p-5">
+      <h2 class="mb-2 text-sm font-semibold">Progress</h2>
+      <p class="mb-2 text-xs text-[var(--muted)]">Saved at the job's last checkpoint; it resumes from here.</p>
+      <pre class="code">{{ progress }}</pre>
+    </div>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

@@ -25,8 +25,12 @@
 //! Use a file path: `:memory:` databases are private to one connection.
 
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, PoisonError, Weak},
+    sync::{
+        Arc, Mutex, OnceLock, PoisonError, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -35,7 +39,14 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
 use super::{Backend, NewJob};
-use crate::{Error, JobId, JobRecord, JobState, Result, Signal, signal::JobWatch};
+use crate::{
+    Error, JobId, JobRecord, JobState, Result, Signal,
+    monitor::{
+        JobMetric, ListFilter, METRICS_RETENTION_MINUTES, MetricBucket, QueueStats, Stats,
+        WorkerStats,
+    },
+    signal::JobWatch,
+};
 
 /// How often the watcher checks `PRAGMA data_version` for commits made by other
 /// processes. Each check is a read of shared memory, a few microseconds.
@@ -65,6 +76,20 @@ CREATE TABLE IF NOT EXISTS butler_workers (
     worker        TEXT PRIMARY KEY,
     expires_at_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS butler_metrics (
+    minute    INTEGER NOT NULL,
+    queue     TEXT NOT NULL,
+    job       TEXT NOT NULL,
+    processed INTEGER NOT NULL,
+    failed    INTEGER NOT NULL,
+    total_ms  INTEGER NOT NULL,
+    max_ms    INTEGER NOT NULL,
+    PRIMARY KEY (minute, queue, job)
+);
+CREATE TABLE IF NOT EXISTS butler_counters (
+    name  TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
 ";
 
 pub struct SqliteQueue {
@@ -75,6 +100,8 @@ pub struct SqliteQueue {
     signals: Arc<Signals>,
     /// The cross-process watcher thread, started by the first waiter.
     watcher: OnceLock<()>,
+    /// The minute history was last pruned, so it's pruned once a minute.
+    pruned_at_minute: AtomicU64,
 }
 
 /// A job was pushed (idle claims re-check their queues), or a job finished
@@ -97,6 +124,7 @@ impl SqliteQueue {
             conn: Mutex::new(conn),
             signals: Arc::default(),
             watcher: OnceLock::new(),
+            pruned_at_minute: AtomicU64::new(0),
         })
     }
 
@@ -211,6 +239,11 @@ fn watch_once(path: &Path, signals: &Weak<Signals>) -> rusqlite::Result<()> {
             signals.finished.notify(&id);
         }
     }
+}
+
+/// SQLite integers are signed; counts and durations are never negative.
+fn count(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
 }
 
 fn now_ms() -> i64 {
@@ -422,6 +455,226 @@ impl Backend for SqliteQueue {
             self.signals.pushed.notify();
         }
         Ok(recovered)
+    }
+
+    fn stats(&self) -> Result<Stats> {
+        self.with_conn(|conn| {
+            let mut stats = Stats::default();
+            let mut queues: BTreeMap<String, u64> = BTreeMap::new();
+            let mut by_state = conn
+                .prepare("SELECT queue, state, COUNT(*) FROM butler_jobs GROUP BY queue, state")?;
+            let rows = by_state.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    count(row.get::<_, i64>(2)?),
+                ))
+            })?;
+            for row in rows {
+                let (queue, state, count) = row?;
+                let pending = queues.entry(queue).or_default();
+                match JobState::parse(&state) {
+                    Some(JobState::Pending) => *pending += count,
+                    Some(JobState::Processing) => stats.processing += count,
+                    Some(JobState::Done) => stats.done += count,
+                    Some(JobState::Dead) => stats.dead += count,
+                    Some(JobState::Cancelled) => stats.cancelled += count,
+                    None => {}
+                }
+            }
+            stats.queues = queues
+                .into_iter()
+                .map(|(name, pending)| QueueStats { name, pending })
+                .collect();
+
+            let mut counters = conn.prepare("SELECT name, value FROM butler_counters")?;
+            for row in counters.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, count(row.get::<_, i64>(1)?)))
+            })? {
+                match row? {
+                    (name, value) if name == "processed" => stats.processed_total = value,
+                    (name, value) if name == "failed" => stats.failed_total = value,
+                    _ => {}
+                }
+            }
+
+            // Workers with a heartbeat, and any still holding jobs without one.
+            let mut workers: BTreeMap<String, WorkerStats> = BTreeMap::new();
+            let now = now_ms();
+            let mut beats = conn.prepare("SELECT worker, expires_at_ms FROM butler_workers")?;
+            for row in beats.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })? {
+                let (id, expires_at_ms) = row?;
+                workers.insert(
+                    id.clone(),
+                    WorkerStats {
+                        id,
+                        running: 0,
+                        expires_in_ms: expires_at_ms - now,
+                    },
+                );
+            }
+            let mut held = conn.prepare(
+                "SELECT worker, COUNT(*) FROM butler_jobs
+                 WHERE state = 'processing' AND worker IS NOT NULL GROUP BY worker",
+            )?;
+            for row in held.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, count(row.get::<_, i64>(1)?)))
+            })? {
+                let (id, running) = row?;
+                workers
+                    .entry(id.clone())
+                    .or_insert_with(|| WorkerStats {
+                        id,
+                        running: 0,
+                        expires_in_ms: -1,
+                    })
+                    .running = running;
+            }
+            stats.workers = workers.into_values().collect();
+            Ok(stats)
+        })
+    }
+
+    fn list(&self, filter: &ListFilter) -> Result<Vec<JobRecord>> {
+        let order = if filter.state.is_finished() {
+            "finished_seq DESC"
+        } else {
+            "seq ASC"
+        };
+        let sql = format!(
+            "SELECT data FROM butler_jobs
+             WHERE state = ?1 AND (?2 IS NULL OR queue = ?2)
+             ORDER BY {order} LIMIT ?3 OFFSET ?4"
+        );
+        let rows: Vec<String> = self.with_conn(|conn| {
+            let mut select = conn.prepare(&sql)?;
+            select
+                .query_map(
+                    params![
+                        filter.state.as_str(),
+                        filter.queue,
+                        i64::try_from(filter.limit).unwrap_or(i64::MAX),
+                        i64::try_from(filter.offset).unwrap_or(i64::MAX),
+                    ],
+                    |row| row.get(0),
+                )?
+                .collect()
+        })?;
+        rows.iter()
+            .map(|data| Ok(serde_json::from_str(data)?))
+            .collect()
+    }
+
+    fn retry(&self, id: &str) -> Result<bool> {
+        let data: Option<String> = self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT data FROM butler_jobs WHERE id = ?1 AND state = 'dead'",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+        })?;
+        let Some(data) = data else {
+            return Ok(false);
+        };
+        let mut job: JobRecord = serde_json::from_str(&data)?;
+        job.attempts = 0;
+        let data = serde_json::to_string(&job)?;
+        let changed = self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE butler_jobs
+                 SET state = 'pending', worker = NULL, finished_seq = NULL, data = ?2,
+                     seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM butler_jobs)
+                 WHERE id = ?1 AND state = 'dead'",
+                params![id, data],
+            )
+        })?;
+        if changed > 0 {
+            self.signals.pushed.notify();
+        }
+        Ok(changed > 0)
+    }
+
+    fn discard(&self, id: &str) -> Result<bool> {
+        let changed = self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM butler_jobs
+                 WHERE id = ?1 AND state IN ('done', 'dead', 'cancelled')",
+                params![id],
+            )
+        })?;
+        Ok(changed > 0)
+    }
+
+    /// One transaction: the bucket and both lifetime counters.
+    fn record_metric(&self, metric: &JobMetric) -> Result<()> {
+        let prune = self
+            .pruned_at_minute
+            .fetch_max(metric.minute, Ordering::AcqRel)
+            < metric.minute;
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let duration = i64::try_from(metric.duration_ms).unwrap_or(i64::MAX);
+            tx.execute(
+                "INSERT INTO butler_metrics (minute, queue, job, processed, failed, total_ms, max_ms)
+                 VALUES (?1, ?2, ?3, 1, ?4, ?5, ?5)
+                 ON CONFLICT (minute, queue, job) DO UPDATE SET
+                     processed = processed + 1,
+                     failed = failed + excluded.failed,
+                     total_ms = total_ms + excluded.total_ms,
+                     max_ms = MAX(max_ms, excluded.max_ms)",
+                params![
+                    i64::try_from(metric.minute).unwrap_or(i64::MAX),
+                    metric.queue,
+                    metric.job,
+                    i64::from(metric.failed),
+                    duration
+                ],
+            )?;
+            let mut count = tx.prepare(
+                "INSERT INTO butler_counters (name, value) VALUES (?1, 1)
+                 ON CONFLICT (name) DO UPDATE SET value = value + 1",
+            )?;
+            count.execute(params!["processed"])?;
+            if metric.failed {
+                count.execute(params!["failed"])?;
+            }
+            drop(count);
+            if prune {
+                tx.execute(
+                    "DELETE FROM butler_metrics WHERE minute < ?1",
+                    params![i64::try_from(metric.minute.saturating_sub(METRICS_RETENTION_MINUTES)).unwrap_or(0)],
+                )?;
+            }
+            tx.commit()
+        })
+    }
+
+    fn metrics(&self, since_minute: u64) -> Result<Vec<MetricBucket>> {
+        self.with_conn(|conn| {
+            let mut select = conn.prepare(
+                "SELECT minute, queue, job, processed, failed, total_ms, max_ms
+                 FROM butler_metrics WHERE minute >= ?1 ORDER BY minute, queue, job",
+            )?;
+            select
+                .query_map(
+                    params![i64::try_from(since_minute).unwrap_or(i64::MAX)],
+                    |row| {
+                        Ok(MetricBucket {
+                            minute: count(row.get(0)?),
+                            queue: row.get(1)?,
+                            job: row.get(2)?,
+                            processed: count(row.get(3)?),
+                            failed: count(row.get(4)?),
+                            total_ms: count(row.get(5)?),
+                            max_ms: count(row.get(6)?),
+                        })
+                    },
+                )?
+                .collect()
+        })
     }
 
     fn watch_finished(&self, id: &str) -> Option<Arc<Signal>> {

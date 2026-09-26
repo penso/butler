@@ -18,7 +18,8 @@ pub use self::redis::RedisQueue;
 pub use self::sqlite::{SqliteQueue, WATCH_TICK as SQLITE_WATCH_TICK};
 pub use self::{file::FileQueue, memory::MemoryQueue};
 use crate::{
-    AnyJob, Failed, Job, JobId, JobRecord, JobState, Result, Signal,
+    AnyJob, Error, Failed, Job, JobId, JobRecord, JobState, Result, Signal,
+    monitor::{JobMetric, ListFilter, MetricBucket, Stats},
     state::{Done, Pending, Processing},
 };
 
@@ -90,6 +91,40 @@ pub trait Backend: Send + Sync + 'static {
     /// default, makes waiters poll at the interval they were given.
     fn watch_finished(&self, _id: &str) -> Option<Arc<Signal>> {
         None
+    }
+
+    /// Counts for a dashboard. Default: not supported.
+    fn stats(&self) -> Result<Stats> {
+        Err(Error::Unsupported("stats"))
+    }
+
+    /// Jobs in `filter.state`: pending and processing jobs oldest first,
+    /// finished ones (done, dead, cancelled) most recent first.
+    fn list(&self, _filter: &ListFilter) -> Result<Vec<JobRecord>> {
+        Err(Error::Unsupported("listing jobs"))
+    }
+
+    /// Puts a dead job back on its queue, with its attempts reset. Returns
+    /// `false` if `id` isn't a dead job.
+    fn retry(&self, _id: &str) -> Result<bool> {
+        Err(Error::Unsupported("retrying jobs"))
+    }
+
+    /// Deletes a finished job (done, dead or cancelled). Returns `false` if
+    /// `id` isn't a finished job.
+    fn discard(&self, _id: &str) -> Result<bool> {
+        Err(Error::Unsupported("discarding jobs"))
+    }
+
+    /// Records one finished attempt, for history. Default: ignored.
+    fn record_metric(&self, _metric: &JobMetric) -> Result<()> {
+        Ok(())
+    }
+
+    /// Per-minute history since `since_minute` (minutes since the epoch).
+    /// Default: none.
+    fn metrics(&self, _since_minute: u64) -> Result<Vec<MetricBucket>> {
+        Ok(Vec::new())
     }
 
     /// Whether calls can block on I/O (network, disk). Async callers send
@@ -234,6 +269,36 @@ impl Queue {
 
     pub fn blocks(&self) -> bool {
         self.0.blocks()
+    }
+
+    pub fn stats(&self) -> Result<Stats> {
+        self.0.stats()
+    }
+
+    pub fn list(&self, filter: &ListFilter) -> Result<Vec<AnyJob>> {
+        let state = filter.state;
+        Ok(self
+            .0
+            .list(filter)?
+            .into_iter()
+            .map(|record| AnyJob::new(state, record))
+            .collect())
+    }
+
+    pub fn retry(&self, id: &str) -> Result<bool> {
+        self.0.retry(id)
+    }
+
+    pub fn discard(&self, id: &str) -> Result<bool> {
+        self.0.discard(id)
+    }
+
+    pub fn record_metric(&self, metric: &JobMetric) -> Result<()> {
+        self.0.record_metric(metric)
+    }
+
+    pub fn metrics(&self, since_minute: u64) -> Result<Vec<MetricBucket>> {
+        self.0.metrics(since_minute)
     }
 
     pub fn describe(&self) -> String {

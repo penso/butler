@@ -1,0 +1,166 @@
+/* Tailwind v4, CSS-first. Build: `just web-css` (writes ../assets/app.css). */
+@import "tailwindcss" source(none);
+@source "../templates";
+@source "../assets/app.js";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Dark first, like moltis; light via data-theme. */
+:root,
+[data-theme="dark"] {
+  --bg: #0f1115;
+  --surface: #14161d;
+  --surface-2: #1b1e28;
+  --text: #e4e4e7;
+  --muted: #8b8b94;
+  --border: #262a33;
+  --accent: #4ade80;
+  --accent-soft: rgb(74 222 128 / 0.12);
+  --error: #f87171;
+  --error-soft: rgb(248 113 113 / 0.12);
+  --warn: #fbbf24;
+  --warn-soft: rgb(251 191 36 / 0.12);
+  --info: #60a5fa;
+  --info-soft: rgb(96 165 250 / 0.12);
+  --grid: rgb(255 255 255 / 0.06);
+  color-scheme: dark;
+}
+
+[data-theme="light"] {
+  --bg: #f7f7f8;
+  --surface: #ffffff;
+  --surface-2: #f1f2f4;
+  --text: #18181b;
+  --muted: #6b6b76;
+  --border: #e4e4e7;
+  --accent: #16a34a;
+  --accent-soft: rgb(22 163 74 / 0.1);
+  --error: #dc2626;
+  --error-soft: rgb(220 38 38 / 0.08);
+  --warn: #d97706;
+  --warn-soft: rgb(217 119 6 / 0.1);
+  --info: #2563eb;
+  --info-soft: rgb(37 99 235 / 0.08);
+  --grid: rgb(0 0 0 / 0.06);
+  color-scheme: light;
+}
+
+@layer base {
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  code,
+  pre,
+  .mono {
+    font-family: var(--font-mono);
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-xl border border-[var(--border)] bg-[var(--surface)];
+  }
+  .card-title {
+    @apply text-xs font-medium tracking-wide text-[var(--muted)] uppercase;
+  }
+  .stat {
+    @apply flex flex-col gap-1 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4;
+  }
+  .stat-value {
+    @apply text-2xl font-semibold tabular-nums;
+  }
+  .nav-link {
+    @apply rounded-md px-3 py-1.5 text-sm text-[var(--muted)] transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--text)];
+  }
+  .nav-link.active {
+    @apply bg-[var(--surface-2)] text-[var(--text)];
+  }
+  .btn {
+    @apply inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-2.5 py-1 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--muted)];
+  }
+  .btn-accent {
+    @apply border-transparent bg-[var(--accent-soft)] text-[var(--accent)] hover:border-[var(--accent)];
+  }
+  .btn-danger {
+    @apply border-transparent bg-[var(--error-soft)] text-[var(--error)] hover:border-[var(--error)];
+  }
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium;
+  }
+  .badge-pending {
+    @apply bg-[var(--info-soft)] text-[var(--info)];
+  }
+  .badge-processing {
+    @apply bg-[var(--warn-soft)] text-[var(--warn)];
+  }
+  .badge-done {
+    @apply bg-[var(--accent-soft)] text-[var(--accent)];
+  }
+  .badge-dead {
+    @apply bg-[var(--error-soft)] text-[var(--error)];
+  }
+  .badge-cancelled {
+    @apply bg-[var(--surface-2)] text-[var(--muted)];
+  }
+  .table {
+    @apply w-full text-left text-sm;
+  }
+  .table th {
+    @apply border-b border-[var(--border)] px-4 py-2.5 text-xs font-medium tracking-wide text-[var(--muted)] uppercase;
+  }
+  .table td {
+    @apply border-b border-[var(--border)] px-4 py-2.5 align-top;
+  }
+  .table tr:last-child td {
+    @apply border-b-0;
+  }
+  .table tbody tr {
+    @apply transition-colors hover:bg-[var(--surface-2)];
+  }
+  .link {
+    @apply text-[var(--accent)] hover:underline;
+  }
+  .tab {
+    @apply inline-flex items-center gap-2 border-b-2 border-transparent px-3 py-2 text-sm text-[var(--muted)] hover:text-[var(--text)];
+  }
+  .tab.active {
+    @apply border-[var(--accent)] text-[var(--text)];
+  }
+  .count {
+    @apply rounded-full bg-[var(--surface-2)] px-1.5 text-xs tabular-nums;
+  }
+  .code {
+    @apply overflow-x-auto rounded-lg border border-[var(--border)] bg-[var(--bg)] p-3 text-xs leading-relaxed;
+  }
+  .dot {
+    @apply inline-block h-2 w-2 rounded-full;
+  }
+  .range {
+    @apply rounded-md px-2 py-0.5 text-xs text-[var(--muted)] hover:text-[var(--text)];
+  }
+  .range.active {
+    @apply bg-[var(--surface-2)] text-[var(--text)];
+  }
+}
+
+/* uPlot in the dashboard's colors. */
+.uplot {
+  font-family: var(--font-sans);
+  color: var(--muted);
+}
+.u-legend {
+  font-size: 12px;
+  color: var(--muted);
+}
+.u-legend .u-marker {
+  border-radius: 9999px;
+}
+.u-select {
+  background: var(--accent-soft);
+}

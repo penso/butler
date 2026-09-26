@@ -32,6 +32,7 @@
 //! are lost.
 
 use std::{
+    collections::BTreeMap,
     sync::{Arc, Mutex, OnceLock, PoisonError, Weak},
     thread,
     time::{Duration, Instant},
@@ -41,9 +42,38 @@ use redis::{Client, Connection, RedisResult};
 use serde_json::Value;
 
 use super::{Backend, NewJob};
-use crate::{Error, JobId, JobRecord, JobState, Result, Signal, signal::JobWatch};
+use crate::{
+    Error, JobId, JobRecord, JobState, Result, Signal,
+    monitor::{
+        JobMetric, ListFilter, METRICS_RETENTION_MINUTES, MetricBucket, QueueStats, Stats,
+        WorkerStats, current_minute,
+    },
+    signal::JobWatch,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many recent done and cancelled job ids are kept for listing.
+const RECENT_CAP: isize = 1_000;
+
+/// Records one finished attempt: per-minute bucket fields (KEYS[1], a hash
+/// that expires), and the lifetime counters (KEYS[2], KEYS[3]). ARGV: field
+/// prefix, failed (0/1), duration in ms, expiry in seconds.
+const RECORD_METRIC: &str = r"
+local key, base, duration = KEYS[1], ARGV[1], tonumber(ARGV[3])
+redis.call('HINCRBY', key, base .. 'processed', 1)
+redis.call('HINCRBY', key, base .. 'failed', tonumber(ARGV[2]))
+redis.call('HINCRBY', key, base .. 'total_ms', duration)
+local max = tonumber(redis.call('HGET', key, base .. 'max_ms') or '0')
+if duration > max then redis.call('HSET', key, base .. 'max_ms', duration) end
+redis.call('EXPIRE', key, tonumber(ARGV[4]))
+redis.call('INCR', KEYS[2])
+if tonumber(ARGV[2]) > 0 then redis.call('INCR', KEYS[3]) end
+return 0
+";
+
+/// Separates queue, job and counter name in metric hash fields.
+const FIELD_SEP: char = '\u{1f}';
 
 /// How long finished (done or cancelled) jobs stay queryable before Redis expires them.
 const DONE_TTL_SECS: u64 = 24 * 60 * 60;
@@ -177,6 +207,26 @@ impl RedisQueue {
         format!("{}:queue:{queue}", self.prefix)
     }
 
+    fn metrics_key(&self, minute: u64) -> String {
+        format!("{}:metrics:{minute}", self.prefix)
+    }
+
+    /// The records of `ids`, in order, skipping ids whose job has expired.
+    fn records(&self, ids: &[String]) -> Result<Vec<JobRecord>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pipe = redis::pipe();
+        for id in ids {
+            pipe.cmd("HGET").arg(self.job_key(id)).arg("data");
+        }
+        let data: Vec<Option<String>> = self.with_conn(|con| pipe.query(con))?;
+        data.into_iter()
+            .flatten()
+            .map(|data| Ok(serde_json::from_str(&data)?))
+            .collect()
+    }
+
     fn processing_key(&self, worker: &str) -> String {
         format!("{}:processing:{worker}", self.prefix)
     }
@@ -304,6 +354,10 @@ impl Backend for RedisQueue {
                 .arg(self.queue_key(queue))
                 .arg(&job.id)
                 .ignore()
+                .cmd("SADD")
+                .arg(self.key("queues"))
+                .arg(queue)
+                .ignore()
                 .cmd("PUBLISH")
                 .arg(self.key("wake"))
                 .arg(queue)
@@ -340,6 +394,7 @@ impl Backend for RedisQueue {
             ids.push(job.id);
         }
         for queue in &queues {
+            pipe.cmd("SADD").arg(self.key("queues")).arg(queue).ignore();
             pipe.cmd("PUBLISH")
                 .arg(self.key("wake"))
                 .arg(queue)
@@ -392,6 +447,15 @@ impl Backend for RedisQueue {
                 .cmd("EXPIRE")
                 .arg(self.job_key(&job.id))
                 .arg(DONE_TTL_SECS)
+                .ignore()
+                .cmd("LPUSH")
+                .arg(self.key("recent:done"))
+                .arg(&job.id)
+                .ignore()
+                .cmd("LTRIM")
+                .arg(self.key("recent:done"))
+                .arg(0)
+                .arg(RECENT_CAP - 1)
                 .ignore()
                 .cmd("PUBLISH")
                 .arg(self.key("done"))
@@ -509,6 +573,15 @@ impl Backend for RedisQueue {
                 .arg(self.job_key(id))
                 .arg(DONE_TTL_SECS)
                 .ignore()
+                .cmd("LPUSH")
+                .arg(self.key("recent:cancelled"))
+                .arg(id)
+                .ignore()
+                .cmd("LTRIM")
+                .arg(self.key("recent:cancelled"))
+                .arg(0)
+                .arg(RECENT_CAP - 1)
+                .ignore()
                 .cmd("PUBLISH")
                 .arg(self.key("done"))
                 .arg(id)
@@ -576,6 +649,294 @@ impl Backend for RedisQueue {
         Ok(recovered)
     }
 
+    fn stats(&self) -> Result<Stats> {
+        let queues: Vec<String> =
+            self.with_conn(|con| redis::cmd("SMEMBERS").arg(self.key("queues")).query(con))?;
+        let workers: Vec<String> =
+            self.with_conn(|con| redis::cmd("SMEMBERS").arg(self.key("workers")).query(con))?;
+        let mut pipe = redis::pipe();
+        for queue in &queues {
+            pipe.cmd("LLEN").arg(self.queue_key(queue));
+        }
+        for worker in &workers {
+            pipe.cmd("LLEN").arg(self.processing_key(worker));
+            pipe.cmd("PTTL").arg(self.worker_key(worker));
+        }
+        pipe.cmd("LLEN").arg(self.key("dead"));
+        pipe.cmd("LLEN").arg(self.key("recent:done"));
+        pipe.cmd("LLEN").arg(self.key("recent:cancelled"));
+        pipe.cmd("GET").arg(self.key("counter:processed"));
+        pipe.cmd("GET").arg(self.key("counter:failed"));
+        let values: Vec<Option<i64>> = self.with_conn(|con| pipe.query(con))?;
+        let mut values = values.into_iter().map(|value| value.unwrap_or(0));
+        let mut next = || values.next().unwrap_or(0);
+
+        let mut stats = Stats::default();
+        let mut queue_stats: Vec<QueueStats> = queues
+            .into_iter()
+            .map(|name| QueueStats {
+                name,
+                pending: count(next()),
+            })
+            .collect();
+        queue_stats.sort_by(|a, b| a.name.cmp(&b.name));
+        stats.queues = queue_stats;
+        let mut worker_stats: Vec<WorkerStats> = workers
+            .into_iter()
+            .map(|id| WorkerStats {
+                id,
+                running: count(next()),
+                // PTTL: -2 once the key expired, -1 without expiry.
+                expires_in_ms: next(),
+            })
+            .collect();
+        worker_stats.sort_by(|a, b| a.id.cmp(&b.id));
+        stats.processing = worker_stats.iter().map(|worker| worker.running).sum();
+        stats.workers = worker_stats;
+        stats.dead = count(next());
+        stats.done = count(next());
+        stats.cancelled = count(next());
+        stats.processed_total = count(next());
+        stats.failed_total = count(next());
+        Ok(stats)
+    }
+
+    fn list(&self, filter: &ListFilter) -> Result<Vec<JobRecord>> {
+        let list_key = match filter.state {
+            JobState::Dead => Some(self.key("dead")),
+            JobState::Done => Some(self.key("recent:done")),
+            JobState::Cancelled => Some(self.key("recent:cancelled")),
+            JobState::Pending | JobState::Processing => None,
+        };
+        let Some(list_key) = list_key else {
+            // Pending and processing: gather ids (oldest first) from every list.
+            let lists: Vec<String> = if filter.state == JobState::Pending {
+                match &filter.queue {
+                    Some(queue) => vec![self.queue_key(queue)],
+                    None => self
+                        .with_conn(|con| {
+                            redis::cmd("SMEMBERS")
+                                .arg(self.key("queues"))
+                                .query::<Vec<String>>(con)
+                        })?
+                        .iter()
+                        .map(|queue| self.queue_key(queue))
+                        .collect(),
+                }
+            } else {
+                self.with_conn(|con| {
+                    redis::cmd("SMEMBERS")
+                        .arg(self.key("workers"))
+                        .query::<Vec<String>>(con)
+                })?
+                .iter()
+                .map(|worker| self.processing_key(worker))
+                .collect()
+            };
+            let mut ids = Vec::new();
+            for list in lists {
+                let mut some: Vec<String> = self
+                    .with_conn(|con| redis::cmd("LRANGE").arg(&list).arg(0).arg(-1).query(con))?;
+                ids.append(&mut some);
+            }
+            // Ids start with the enqueue time.
+            ids.sort();
+            let records = self.records(&ids)?;
+            return Ok(records
+                .into_iter()
+                .filter(|job| {
+                    filter
+                        .queue
+                        .as_deref()
+                        .is_none_or(|queue| queue == job.queue)
+                })
+                .skip(filter.offset)
+                .take(filter.limit)
+                .collect());
+        };
+        // Finished jobs: the lists hold the most recent first. With a queue
+        // filter, read windows until the page is full or the list ends.
+        let window = (filter.limit.max(1) * 4) as isize;
+        let mut skipped = 0;
+        let mut page = Vec::new();
+        let mut start: isize = if filter.queue.is_some() {
+            0
+        } else {
+            filter.offset as isize
+        };
+        loop {
+            let ids: Vec<String> = self.with_conn(|con| {
+                redis::cmd("LRANGE")
+                    .arg(&list_key)
+                    .arg(start)
+                    .arg(start + window - 1)
+                    .query(con)
+            })?;
+            let exhausted = (ids.len() as isize) < window;
+            for job in self.records(&ids)? {
+                if filter
+                    .queue
+                    .as_deref()
+                    .is_some_and(|queue| queue != job.queue)
+                {
+                    continue;
+                }
+                if filter.queue.is_some() && skipped < filter.offset {
+                    skipped += 1;
+                    continue;
+                }
+                page.push(job);
+                if page.len() == filter.limit {
+                    return Ok(page);
+                }
+            }
+            if exhausted {
+                return Ok(page);
+            }
+            start += window;
+        }
+    }
+
+    fn retry(&self, id: &str) -> Result<bool> {
+        let removed: i64 = self.with_conn(|con| {
+            redis::cmd("LREM")
+                .arg(self.key("dead"))
+                .arg(1)
+                .arg(id)
+                .query(con)
+        })?;
+        if removed == 0 {
+            return Ok(false);
+        }
+        // Out of the dead list, so this retry is the only one moving it.
+        let Some(mut job) = self.records(&[id.to_owned()])?.pop() else {
+            return Ok(false);
+        };
+        job.attempts = 0;
+        let data = serde_json::to_string(&job)?;
+        self.with_conn(|con| {
+            redis::pipe()
+                .atomic()
+                .cmd("HSET")
+                .arg(self.job_key(id))
+                .arg("state")
+                .arg(JobState::Pending.as_str())
+                .arg("data")
+                .arg(&data)
+                .ignore()
+                .cmd("LPUSH")
+                .arg(self.queue_key(&job.queue))
+                .arg(id)
+                .ignore()
+                .cmd("PUBLISH")
+                .arg(self.key("wake"))
+                .arg(&job.queue)
+                .ignore()
+                .exec(con)
+        })?;
+        Ok(true)
+    }
+
+    fn discard(&self, id: &str) -> Result<bool> {
+        let state: Option<String> = self.with_conn(|con| {
+            redis::cmd("HGET")
+                .arg(self.job_key(id))
+                .arg("state")
+                .query(con)
+        })?;
+        let finished = state
+            .as_deref()
+            .and_then(JobState::parse)
+            .is_some_and(JobState::is_finished);
+        if !finished {
+            return Ok(false);
+        }
+        self.with_conn(|con| {
+            redis::pipe()
+                .atomic()
+                .cmd("DEL")
+                .arg(self.job_key(id))
+                .ignore()
+                .cmd("LREM")
+                .arg(self.key("dead"))
+                .arg(0)
+                .arg(id)
+                .ignore()
+                .cmd("LREM")
+                .arg(self.key("recent:done"))
+                .arg(0)
+                .arg(id)
+                .ignore()
+                .cmd("LREM")
+                .arg(self.key("recent:cancelled"))
+                .arg(0)
+                .arg(id)
+                .ignore()
+                .exec(con)
+        })?;
+        Ok(true)
+    }
+
+    fn record_metric(&self, metric: &JobMetric) -> Result<()> {
+        let base = format!("{}{FIELD_SEP}{}{FIELD_SEP}", metric.queue, metric.job);
+        self.with_conn(|con| {
+            redis::cmd("EVAL")
+                .arg(RECORD_METRIC)
+                .arg(3)
+                .arg(self.metrics_key(metric.minute))
+                .arg(self.key("counter:processed"))
+                .arg(self.key("counter:failed"))
+                .arg(&base)
+                .arg(u8::from(metric.failed))
+                .arg(metric.duration_ms)
+                .arg(METRICS_RETENTION_MINUTES * 60)
+                .exec(con)
+        })
+    }
+
+    fn metrics(&self, since_minute: u64) -> Result<Vec<MetricBucket>> {
+        let now = current_minute();
+        let first = since_minute.max(now.saturating_sub(METRICS_RETENTION_MINUTES));
+        let minutes: Vec<u64> = (first..=now).collect();
+        if minutes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pipe = redis::pipe();
+        for minute in &minutes {
+            pipe.cmd("HGETALL").arg(self.metrics_key(*minute));
+        }
+        let hashes: Vec<Vec<(String, u64)>> = self.with_conn(|con| pipe.query(con))?;
+        let mut buckets = Vec::new();
+        for (minute, fields) in minutes.into_iter().zip(hashes) {
+            let mut by_job: BTreeMap<(String, String), MetricBucket> = BTreeMap::new();
+            for (field, value) in fields {
+                let mut parts = field.splitn(3, FIELD_SEP);
+                let (Some(queue), Some(job), Some(name)) =
+                    (parts.next(), parts.next(), parts.next())
+                else {
+                    continue;
+                };
+                let bucket = by_job
+                    .entry((queue.to_owned(), job.to_owned()))
+                    .or_insert_with(|| MetricBucket {
+                        minute,
+                        queue: queue.to_owned(),
+                        job: job.to_owned(),
+                        ..MetricBucket::default()
+                    });
+                match name {
+                    "processed" => bucket.processed = value,
+                    "failed" => bucket.failed = value,
+                    "total_ms" => bucket.total_ms = value,
+                    "max_ms" => bucket.max_ms = value,
+                    _ => {}
+                }
+            }
+            buckets.extend(by_job.into_values());
+        }
+        Ok(buckets)
+    }
+
     fn watch_finished(&self, id: &str) -> Option<Arc<Signal>> {
         self.listen_for_signals();
         Some(self.signals.finished.watch(id))
@@ -584,6 +945,11 @@ impl Backend for RedisQueue {
     fn describe(&self) -> String {
         self.display.clone()
     }
+}
+
+/// Redis counts and lengths, which are never negative here.
+fn count(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
 }
 
 /// Hides the credentials in `redis://user:pass@host/`.

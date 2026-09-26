@@ -11,7 +11,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use butler::{Failed, FileQueue, JobState, MemoryQueue, NewJob, Queue};
+use butler::{
+    Failed, FileQueue, JobState, MemoryQueue, NewJob, Queue,
+    monitor::{JobMetric, ListFilter},
+};
 use serde_json::json;
 
 /// Whether `claim` with a wait blocks until a job arrives.
@@ -368,6 +371,124 @@ fn saved_progress_survives_crash_recovery() {
             Some(json!({ "after": 41 })),
             "{}",
             queue.describe()
+        );
+    }
+}
+
+#[test]
+fn stats_listing_retry_and_discard_for_a_dashboard() {
+    for (queue, _) in backends("monitor") {
+        let name = queue.describe();
+        queue.heartbeat("w", Duration::from_secs(60)).unwrap();
+        let done = queue.push("a", "default", vec![]).unwrap();
+        let dead = queue.push("b", "default", vec![json!("x")]).unwrap();
+        let low = queue.push("c", "low", vec![]).unwrap();
+        let cancelled = queue.push("d", "default", vec![]).unwrap();
+
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        queue.complete("w", job, json!(1)).unwrap();
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        queue.fail("w", job, "boom".into(), 0).unwrap();
+        assert!(queue.cancel(&cancelled).unwrap());
+
+        let stats = queue.stats().unwrap();
+        assert_eq!(stats.pending(), 1, "{name}");
+        assert_eq!(
+            (stats.processing, stats.done, stats.dead, stats.cancelled),
+            (0, 1, 1, 1),
+            "{name}"
+        );
+        let low_queue = stats.queues.iter().find(|q| q.name == "low").unwrap();
+        assert_eq!(low_queue.pending, 1, "{name}");
+        let worker = stats.workers.iter().find(|w| w.id == "w").unwrap();
+        assert!(worker.expires_in_ms > 0, "{name}: w is alive");
+
+        let ids = |state, queue_name: Option<&str>| -> Vec<String> {
+            let mut filter = ListFilter::new(state);
+            filter.queue = queue_name.map(str::to_owned);
+            queue
+                .list(&filter)
+                .unwrap()
+                .iter()
+                .map(|job| job.record().id.clone())
+                .collect()
+        };
+        assert_eq!(ids(JobState::Dead, None), [dead.as_str()], "{name}");
+        assert_eq!(ids(JobState::Done, None), [done.as_str()], "{name}");
+        assert_eq!(ids(JobState::Pending, None), [low.as_str()], "{name}");
+        assert_eq!(
+            ids(JobState::Pending, Some("low")),
+            [low.as_str()],
+            "{name}"
+        );
+        assert!(ids(JobState::Dead, Some("low")).is_empty(), "{name}");
+        let listed = queue.list(&ListFilter::new(JobState::Dead)).unwrap();
+        assert_eq!(
+            listed[0].record().last_error.as_deref(),
+            Some("boom"),
+            "{name}"
+        );
+
+        // Retry: only dead jobs, back on their queue with attempts reset.
+        assert!(!queue.retry(&done).unwrap(), "{name}");
+        assert!(queue.retry(&dead).unwrap(), "{name}");
+        assert!(!queue.retry(&dead).unwrap(), "{name}: already retried");
+        let (state, record) = queue.get(&dead).unwrap().unwrap().into_parts();
+        assert_eq!((state, record.attempts), (JobState::Pending, 0), "{name}");
+        assert_eq!(
+            queue.claim("w", DEFAULT, NOW).unwrap().unwrap().id(),
+            dead,
+            "{name}"
+        );
+
+        // Discard: only finished jobs.
+        assert!(!queue.discard(&low).unwrap(), "{name}: still pending");
+        assert!(queue.discard(&done).unwrap(), "{name}");
+        assert_eq!(queue.state(&done), None, "{name}");
+        assert!(queue.discard(&cancelled).unwrap(), "{name}");
+    }
+}
+
+#[test]
+fn metrics_keep_per_minute_history_and_lifetime_totals() {
+    for (queue, _) in backends("metrics") {
+        let name = queue.describe();
+        if name.starts_with("file:") {
+            continue; // the file backend keeps no history
+        }
+        let minute = butler::monitor::current_minute();
+        for (failed, ms) in [(false, 10), (false, 30), (true, 5)] {
+            let metric = JobMetric {
+                job: "send_email".into(),
+                queue: "mailers".into(),
+                failed,
+                duration_ms: ms,
+                minute,
+            };
+            queue.record_metric(&metric).unwrap();
+        }
+        let buckets = queue.metrics(minute).unwrap();
+        let bucket = buckets
+            .iter()
+            .find(|b| b.job == "send_email" && b.queue == "mailers")
+            .unwrap_or_else(|| panic!("{name}: no bucket in {buckets:?}"));
+        assert_eq!(
+            (
+                bucket.minute,
+                bucket.processed,
+                bucket.failed,
+                bucket.total_ms,
+                bucket.max_ms
+            ),
+            (minute, 3, 1, 45, 30),
+            "{name}"
+        );
+        assert!(queue.metrics(minute + 1).unwrap().is_empty(), "{name}");
+        let stats = queue.stats().unwrap();
+        assert_eq!(
+            (stats.processed_total, stats.failed_total),
+            (3, 1),
+            "{name}"
         );
     }
 }

@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Workers{% endblock %}
+{% block content %}
+<h1 class="mb-1 text-xl font-semibold tracking-tight">Workers</h1>
+<p class="mb-6 text-sm text-[var(--muted)]">Each worker process keeps a heartbeat. When it expires, another worker puts its jobs back on their queues.</p>
+<div class="card overflow-hidden">
+  <table class="table">
+    <thead><tr><th>Worker</th><th>Status</th><th class="text-right">Running</th><th>Heartbeat</th></tr></thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td class="mono">{{ row.id }}</td>
+        <td>{% if row.alive %}<span class="badge badge-done"><span class="dot bg-[var(--accent)]"></span>alive</span>{% else %}<span class="badge badge-dead">stopped</span>{% endif %}</td>
+        <td class="text-right tabular-nums">{{ row.running }}</td>
+        <td class="text-[var(--muted)]">{{ row.heartbeat }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="4" class="py-10 text-center text-[var(--muted)]">No worker is running.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

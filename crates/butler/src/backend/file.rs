@@ -19,6 +19,7 @@
 //! one succeeds.
 
 use std::{
+    collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -27,7 +28,11 @@ use std::{
 use serde_json::Value;
 
 use super::Backend;
-use crate::{JobId, JobRecord, JobState, Result, job::DEFAULT_QUEUE};
+use crate::{
+    JobId, JobRecord, JobState, Result,
+    job::DEFAULT_QUEUE,
+    monitor::{ListFilter, QueueStats, Stats, WorkerStats},
+};
 
 /// Checked in this order. During a retry, a job is briefly in both
 /// `processing/` and `pending/`, and `processing/` wins.
@@ -73,6 +78,37 @@ impl FileQueue {
 
     fn processing(&self, worker: &str) -> PathBuf {
         self.dir(JobState::Processing).join(worker)
+    }
+
+    /// Subdirectories of a state's directory: queues, or workers.
+    fn subdirs(&self, state: JobState) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(self.dir(state))? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir()
+                && let Some(name) = entry.file_name().to_str()
+            {
+                names.push(name.to_owned());
+            }
+        }
+        Ok(names)
+    }
+
+    /// The job files in `dir`; none if it doesn't exist.
+    fn job_files(&self, dir: &Path) -> Result<Vec<PathBuf>> {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut files = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                files.push(path);
+            }
+        }
+        Ok(files)
     }
 
     fn heartbeat_file(&self, worker: &str) -> PathBuf {
@@ -267,6 +303,140 @@ impl Backend for FileQueue {
             ignore_missing(fs::remove_file(self.heartbeat_file(&worker)))?;
         }
         Ok(recovered)
+    }
+
+    fn stats(&self) -> Result<Stats> {
+        let mut stats = Stats::default();
+        for queue in self.subdirs(JobState::Pending)? {
+            let pending = self.job_files(&self.pending(&queue))?.len() as u64;
+            stats.queues.push(QueueStats {
+                name: queue,
+                pending,
+            });
+        }
+        stats.queues.sort_by(|a, b| a.name.cmp(&b.name));
+        stats.dead = self.job_files(&self.dir(JobState::Dead))?.len() as u64;
+        stats.done = self.job_files(&self.dir(JobState::Done))?.len() as u64;
+        stats.cancelled = self.job_files(&self.dir(JobState::Cancelled))?.len() as u64;
+
+        let now = now_ms();
+        let mut workers: BTreeMap<String, WorkerStats> = BTreeMap::new();
+        for entry in fs::read_dir(self.root.join(WORKERS))? {
+            let entry = entry?;
+            let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let expires_at = fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|deadline| deadline.trim().parse::<u128>().ok())
+                .unwrap_or(0);
+            let expires_in_ms = i64::try_from(expires_at).unwrap_or(i64::MAX)
+                - i64::try_from(now).unwrap_or(i64::MAX);
+            workers.insert(
+                id.clone(),
+                WorkerStats {
+                    id,
+                    running: 0,
+                    expires_in_ms,
+                },
+            );
+        }
+        for worker in self.subdirs(JobState::Processing)? {
+            let running = self.job_files(&self.processing(&worker))?.len() as u64;
+            stats.processing += running;
+            workers
+                .entry(worker.clone())
+                .or_insert_with(|| WorkerStats {
+                    id: worker,
+                    running: 0,
+                    expires_in_ms: -1,
+                })
+                .running = running;
+        }
+        stats.workers = workers.into_values().collect();
+        Ok(stats)
+    }
+
+    fn list(&self, filter: &ListFilter) -> Result<Vec<JobRecord>> {
+        let dirs: Vec<PathBuf> = match filter.state {
+            JobState::Pending => match &filter.queue {
+                Some(queue) => vec![self.pending(queue)],
+                None => self
+                    .subdirs(JobState::Pending)?
+                    .iter()
+                    .map(|queue| self.pending(queue))
+                    .collect(),
+            },
+            JobState::Processing => self
+                .subdirs(JobState::Processing)?
+                .iter()
+                .map(|worker| self.processing(worker))
+                .collect(),
+            state => vec![self.dir(state)],
+        };
+        let mut files = Vec::new();
+        for dir in dirs {
+            files.extend(self.job_files(&dir)?);
+        }
+        // File names start with the enqueue time.
+        files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        if filter.state.is_finished() {
+            files.reverse();
+        }
+        let mut page = Vec::new();
+        let mut skipped = 0;
+        for path in files {
+            let job: JobRecord = match fs::read(&path) {
+                Ok(bytes) => serde_json::from_slice(&bytes)?,
+                // Moved on while we were listing.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if filter
+                .queue
+                .as_deref()
+                .is_some_and(|queue| queue != job.queue)
+            {
+                continue;
+            }
+            if skipped < filter.offset {
+                skipped += 1;
+                continue;
+            }
+            page.push(job);
+            if page.len() == filter.limit {
+                break;
+            }
+        }
+        Ok(page)
+    }
+
+    fn retry(&self, id: &str) -> Result<bool> {
+        let file = format!("{id}.json");
+        // Taking it out of dead/ first makes this retry the only one moving it.
+        let taken = self.root.join("tmp").join(format!("retry-{file}"));
+        match fs::rename(self.dir(JobState::Dead).join(&file), &taken) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+        let mut job: JobRecord = serde_json::from_slice(&fs::read(&taken)?)?;
+        job.attempts = 0;
+        self.write(JobState::Pending, &job)?;
+        ignore_missing(fs::remove_file(taken))?;
+        Ok(true)
+    }
+
+    fn discard(&self, id: &str) -> Result<bool> {
+        let file = format!("{id}.json");
+        for state in [JobState::Done, JobState::Dead, JobState::Cancelled] {
+            match fs::remove_file(self.dir(state).join(&file)) {
+                Ok(()) => return Ok(true),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(false)
     }
 
     fn describe(&self) -> String {

@@ -15,6 +15,7 @@ use crate::{
     error::Chain,
     executor::panic_message,
     limits::{Permit, QueueLimits},
+    monitor::JobMetric,
     progress::{Checkpoints, Invocation},
     state::Processing,
 };
@@ -334,6 +335,7 @@ impl Worker {
             Claimed::Nothing { throttled: false } => return Ok(Step::Idle),
         };
         let checkpoints = self.checkpoints(&job);
+        let started = Instant::now();
         let result = self.handler(&job).and_then(|handler| {
             let fut = handler(Invocation {
                 args: job.args().to_vec(),
@@ -345,7 +347,7 @@ impl Worker {
                 })
             })
         });
-        self.finish(job, result, &checkpoints)?;
+        self.finish(job, result, &checkpoints, started)?;
         drop(permit);
         Ok(Step::Ran)
     }
@@ -421,6 +423,14 @@ impl Worker {
         Ok(())
     }
 
+    /// Records one attempt for the dashboard's history. Best effort: a
+    /// metrics hiccup must never fail the job.
+    fn record(&self, metric: &JobMetric) {
+        if let Err(err) = self.queue.record_metric(metric) {
+            tracing::warn!(error = %Chain(&err), "could not record job metric");
+        }
+    }
+
     fn log_upkeep(&self, force: bool) {
         if let Err(err) = self.upkeep(force) {
             tracing::error!(worker = %self.id, error = %Chain(&err), "heartbeat or recovery failed");
@@ -478,10 +488,17 @@ impl Worker {
         job: Job<Processing>,
         result: Result<serde_json::Value, JobError>,
         checkpoints: &Checkpoints,
+        started: Instant,
     ) -> Result<()> {
+        let (job_name, job_queue) = (job.name().to_owned(), job.queue().to_owned());
+        let metric = |failed| {
+            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            JobMetric::now(&job_name, &job_queue, failed, duration_ms)
+        };
         let err = match result {
             Ok(output) => {
                 self.queue.complete(&self.id, job, output)?;
+                self.record(&metric(false));
                 return Ok(());
             }
             Err(err) => err,
@@ -500,6 +517,7 @@ impl Worker {
             return Ok(());
         }
         let error = Chain(&err).to_string();
+        self.record(&metric(true));
         match self.queue.fail(&self.id, job, error, self.max_retries)? {
             Failed::Dead(job) => tracing::error!(
                 job = job.name(),
@@ -636,6 +654,7 @@ impl Worker {
 
     async fn execute_async(&self, job: Job<Processing>) {
         let checkpoints = self.checkpoints(&job);
+        let started = Instant::now();
         let invocation = Invocation {
             args: job.args().to_vec(),
             checkpoints: checkpoints.clone(),
@@ -654,7 +673,7 @@ impl Worker {
 
         let worker = self.clone();
         let stored = crate::executor::unblock(self.queue.blocks(), move || {
-            worker.finish(job, result, &checkpoints)
+            worker.finish(job, result, &checkpoints, started)
         })
         .await;
         if let Err(err) = stored {

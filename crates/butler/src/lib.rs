@@ -29,6 +29,7 @@ mod executor;
 mod handle;
 mod job;
 mod limits;
+pub mod monitor;
 mod prepared;
 mod progress;
 mod queues;

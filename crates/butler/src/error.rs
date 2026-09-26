@@ -32,6 +32,9 @@ pub enum Error {
     #[error("blocking queue task did not complete")]
     Join(#[from] tokio::task::JoinError),
 
+    #[error("this backend doesn't support {0}")]
+    Unsupported(&'static str),
+
     #[error("job {id} is not in the queue")]
     JobNotFound { id: String },
 

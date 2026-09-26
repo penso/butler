@@ -1,0 +1,12 @@
+[package]
+name = "butler-macros"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+proc-macro2 = "1.0.107"
+quote = "1.0.47"
+syn = { version = "2", features = ["full"] }
+
+[lib]
+proc-macro = true

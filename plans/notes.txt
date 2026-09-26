@@ -1,0 +1,39 @@
+Comparing against ActiveJob, plus the Solid Queue and Mission Control features that come with Rails 8, most of the surface is covered now:
+
+┌────────────────────────────────┬──────────────────────────────────┐
+│              Have              │       ActiveJob equivalent       │
+├────────────────────────────────┼──────────────────────────────────┤
+│ job(args).await                │ perform_later                    │
+├────────────────────────────────┼──────────────────────────────────┤
+│ prepare(..).on_queue("low")    │ set(queue: :low)                 │
+├────────────────────────────────┼──────────────────────────────────┤
+│ enqueue_all                    │ perform_all_later                │
+├────────────────────────────────┼──────────────────────────────────┤
+│ Progress<S> checkpoints        │ Continuations                    │
+├────────────────────────────────┼──────────────────────────────────┤
+│ testing::perform_enqueued_jobs │ the test helper of the same name │
+├────────────────────────────────┼──────────────────────────────────┤
+│ butler-web                     │ Mission Control                  │
+└────────────────────────────────┴──────────────────────────────────┘
+
+Here's what's still missing, roughly in order of how much you'd miss it:
+
+1. Scheduled jobs (set(wait: 5.minutes), set(wait_until: ...)). This is the biggest gap: every job runs as soon as a worker is free. It would be prepare(..)?.run_in(Duration::from_secs(300)) or .run_at(time). Each backend would need a "scheduled" set that moves jobs into their queue when due. Redis has a natural fit (a sorted set keyed by run time), and SQLite would add a run_at column.
+2. Retry policies (retry_on SomeError, wait: :polynomially_longer, attempts: 10 and discard_on SomeError). Today every failure retries immediately, and max_retries is one global number. That means no backoff, so a flaky API gets hammered. There are also no per-job limits, and no way to say "this error is permanent, don't retry". This depends on scheduling (1), since backoff needs delayed retries. In Rust it could be #[job(retries = 10, backoff = "exponential")], plus a trait for classifying errors as retryable or not.
+3. Callbacks (before_enqueue, around_perform, after_discard and so on). There are no hooks around enqueuing or running. They're what you'd use for logging context, metrics, tenant setup, or alerting when a job dies. In Rust the natural shape is middleware, like tower layers: worker-wide Worker::wrap(...) and enqueue-side hooks.
+4. perform_now, to run a job synchronously in the current process, bypassing the queue. It only exists inside the testing helper today. The .now() idea from early on would add it: send_email(..).now().await.
+5. Recurring jobs (Solid Queue's recurring.yml): cron-style schedules, such as a nightly report at 3am. They need scheduling (1), plus a leader or lock so only one process enqueues each tick.
+6. Per-key concurrency and uniqueness (Solid Queue's limits_concurrency to: 1, key: ->(user) { user.id }, and Sidekiq Enterprise's unique jobs). butler limits concurrency per queue, but not per key, such as "one sync job per account at a time" or "don't enqueue this if an identical one is already waiting".
+7. Job priority within a queue (queue_with_priority). butler has priorities between queues, strict or weighted, but within a queue it's strictly first in, first out.
+8. Pausing a queue (a Mission Control action): stop workers taking jobs from a queue without stopping the workers. It would fit well in butler-web.
+9. Cleanup of finished jobs (Solid Queue's clear_finished_jobs_after). Redis expires them after 24 hours, but SQLite and file keep every finished job forever. That needs a retention setting.
+10. More test assertions (assert_enqueued_with(job:, args:), assert_no_enqueued_jobs). InlineJobs records jobs that ran, but there's no test mode that only records what was enqueued, without running it.
+
+Not needed in Rust:
+- GlobalID (passing ActiveRecord objects by reference): serde covers serialization, and passing ids is the norm anyway.
+- Choosing a queue backend per job: butler picks one backend from config.toml.
+- Carrying locale and time zone into the job: not applicable to butler.
+
+I'd do 1 and 2 together first, since they're what makes failure handling production-grade, then 3 and 4. Want me to start?
+
+The CI run for the dashboard push is still in progress in the background. I'll report when it finishes.

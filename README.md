@@ -1,18 +1,78 @@
 # butler
 
-A small Sidekiq-style background job runner for Rust. Put `#[butler::job]` on an
-async function, and calling it with `.await` no longer runs the body. Instead it
-queues a job, and a worker process runs the body later.
+**Call it like an async function. Run it as a durable background job.**
 
-> [!NOTE]
-> **butler is not about speed.** Calling a function directly is always faster
-> than sending it through a queue. butler is about **where** work runs and
-> **making sure it happens**: spreading jobs over as many workers and servers
-> as you need, and not losing them when something restarts or crashes. See
-> [Why butler](#why-butler).
+```rust
+tokio::time::sleep(Duration::from_millis(200)).await; // runs here
+let job = generate_report(user_id).await?;          // queued for a worker
+let report: Option<Report> = job.result().await?;    // typed result, when ready
+```
+
+**The same `.await`. A different place to run.** Butler saves the job to a
+queue and returns a `JobHandle<Report>`. A worker executes it independently—even
+after the calling process exits. Use Redis, SQLite, or files to persist the
+work across process restarts.
+
+**Async I/O or blocking work. Same enqueue call.** Add `#[butler::job]` to
+your function; its body stays ordinary Rust:
+
+```rust
+#[butler::job]
+async fn generate_report(user_id: u64) -> Result<Report, ReportError> {
+    reports::generate(user_id).await // async I/O: worker's Tokio task
+}
+
+#[butler::job]
+fn render_report(report: Report) -> Result<Vec<u8>, RenderError> {
+    reports::render(report)          // blocking work: worker's Tokio blocking pool
+}
+```
+
+Both enqueue with `.await`: `generate_report(user_id).await?` and
+`render_report(report).await?`. Neither runs the body in the caller. With a
+Tokio worker, `async fn` jobs run as async tasks; plain `fn` jobs run through
+`spawn_blocking`, keeping synchronous I/O and CPU-heavy work off the async
+executor threads.
+
+`job.result().await?` checks for a completed result; it returns `None` if there
+is no successful result yet. To wait for completion and receive the report
+or a job failure:
+
+```rust
+let report: Report = job.wait_result(Duration::from_millis(100)).await?;
+```
+
+The duration is a fallback check interval, not a timeout. These snippets assume
+an async caller, a configured queue, and a running worker; `Report`, the error
+types, and the `reports` module belong to your application. See
+[Defining jobs](#defining-jobs) for serialization requirements.
+
+[Run the demo](#running-the-demo) · [How it works](#two-kinds-of-await) ·
+[Web dashboard](#web-dashboard)
+
+## Features
+
+- **Typed calls and results.** Ordinary Rust functions, borrow-friendly
+  arguments, `Send + 'static` enqueue futures, and `JobHandle<T>` results.
+- **Durable queues.** Redis for workers across servers, SQLite or files for
+  local processes, and an in-memory backend for tests and single-process apps.
+- **Recovery and retries.** Worker heartbeats recover abandoned jobs; failed
+  attempts retry, then remain visible for inspection.
+- **Resumable work.** Typed checkpoints let long jobs continue after a deploy,
+  crash, or failed attempt.
+- **Controlled concurrency.** Named queues, strict or weighted priority,
+  per-queue limits, and bulk enqueueing. Async jobs run as Tokio tasks;
+  synchronous jobs use its blocking pool. A thread worker also runs without Tokio.
+- **Built-in visibility.** A live web dashboard for throughput, workers,
+  queues, job details, and retry/cancel/discard actions.
+
+Delivery is **at least once**: jobs must be safe to repeat, including work done
+since the last saved checkpoint. Durable backends recover work after worker
+crashes; storage durability still depends on the backend's configuration.
 
 ## Contents
 
+- [Features](#features)
 - [Why butler](#why-butler)
 - [Rust at the core](#rust-at-the-core)
 - [Performance](#performance)
@@ -47,94 +107,42 @@ queues a job, and a worker process runs the body later.
 
 ## Why butler
 
-Take the classic example: a user signs up, and you send them a welcome email.
-Sending it inside the web request makes the user wait on your SMTP provider,
-and if the process restarts at the wrong moment, the email is simply never
-sent. With butler, the request only records the job, returns at once, and
-the job is guaranteed to run somewhere, eventually, even across restarts.
+Use butler when work needs to outlive a request or run in another process:
+email delivery, report generation, image processing, imports, and other work
+you want to retry and inspect independently of the caller.
 
-**Spread the load.** Jobs go through a message queue, so the process that
-enqueues them and the processes that run them are independent:
+**Separate accepting work from doing it.** A web request can enqueue an email
+instead of waiting for SMTP. Workers can run on the same machine or, with
+Redis, on other servers. Add workers as the queue grows and route jobs using
+[named queues and priorities](#queues-and-priority).
 
-- Run workers in separate processes, or on other servers entirely (Redis),
-  and add more when the queue grows. Every worker claims jobs atomically, so
-  a job is only ever in one worker's hands at a time.
-- Keep the web servers free: they only enqueue, which takes about a
-  millisecond, and heavy or slow work happens elsewhere.
-- Route work with [named queues and priorities](#queues-and-priority), and cap
-  what a fragile downstream (an SMTP provider, a rate-limited API) receives
-  with [per-queue limits](#concurrency-and-cores).
+**Recover after a worker stops.** Claims live in the backend under a worker's
+identity. An independent heartbeat keeps long-running jobs from looking
+abandoned; expired heartbeats let another worker requeue them. On graceful
+shutdown, workers stop claiming new jobs and wait for active jobs, while
+checkpointed jobs can yield and resume later. The test suite exercises
+recovery with real worker processes that abort mid-job.
 
-**Survive restarts and crashes.** A job lives in the queue, not in a process's
-memory, until it is done:
+**Keep the Rust API across the queue boundary.** The macro generates argument
+conversion, serialization, and dispatch. Callers use a regular function
+signature; workers deserialize into the same types. Results come back through
+a typed handle, and failures retain their diagnostic error chain. No job
+struct or hand-built JSON payload is required.
 
-- **Enqueued jobs survive restarts.** With Redis, SQLite or files, a job
-  enqueued before a deploy is still there after it, and a worker picks it up
-  when it comes back. (The in-memory backend is for tests and single-process
-  apps: it doesn't survive a restart.)
-- **A crash mid-job doesn't lose the job.** A worker holds each job in its own
-  processing area and keeps a heartbeat. If it is killed, even with
-  `kill -9`, the heartbeat expires and another worker puts the job back in the
-  queue and runs it ([how](#crashed-workers-dont-lose-jobs)). The test suite
-  checks this with a real worker process aborting mid-job, on the Redis,
-  SQLite and file backends.
-- **Failures retry, then stay visible.** A job that returns an error or
-  panics is retried up to `max_retries` times, and then kept as `dead` with
-  its full error chain, instead of disappearing.
-- **Shutdowns finish what they started.** On Ctrl-C, a worker stops taking
-  new jobs and waits for the running ones to complete.
-- **See what's happening.** [`butler-web`](#web-dashboard) shows live
-  throughput, queues, workers and every failed job with its full error, and
-  retries or discards them in a click.
-- **Long jobs resume instead of restarting.** A job with
-  [checkpoints](#job-continuations) picks up where it stopped after a deploy,
-  a crash or a failed attempt, instead of redoing hours of work.
+**Control load and see failures.** Per-queue concurrency limits protect
+downstream services. Bulk enqueueing reduces storage round trips. Failed jobs
+retry up to `max_retries` times, then remain in the dead queue for inspection
+and manual retry through the [dashboard](#web-dashboard).
 
-One consequence to design for: delivery is **at least once**. A job
-interrupted by a crash runs again from the start, so a job should be safe to
-run twice (for example, record that the welcome email was sent, and skip it
-if it already was).
-
-**Write it as plain Rust.** Enqueueing a job looks like calling an async
-function, because it is one:
-
-```rust
-#[butler::job]
-async fn send_welcome(user_id: u64) -> Result<(), MailError> { ... }
-
-send_welcome(user.id).await?;               // enqueued: a worker will send it
-```
-
-There is no job struct to declare, no `perform` method to implement, and no
-arguments packed into a hash by hand. The compiler checks the arguments at
-the call site, `?` handles enqueue errors, and the returned
-[`JobHandle`](#working-with-an-enqueued-job) brings the job's result back with
-the same `.await` syntax. Moving work out of a request mostly comes down to
-adding `#[butler::job]` to the function (its arguments must be serializable)
-and running a worker. See [Two kinds of `.await`](#two-kinds-of-await) for
-how that works.
-
-**Not built for speed, but fast.** Speed isn't the reason to reach for butler,
-but it doesn't cost you any either. Workers run each job as its own tokio
-task, so a single worker process can have tens of thousands in flight where
-Sidekiq runs a few dozen per process, and CPU-bound jobs spread over every
-core. On a 16-CPU machine ([details](#performance)):
-
-- 100,000 jobs that each wait 1 s, all at once in one worker: done in
-  **1.88 s** (about 53,000 jobs/s).
-- CPU-bound jobs: **12.9× faster** on 16 cores than on one.
-- Enqueueing takes about a millisecond on Redis, and **10,000 jobs in 39 ms**
-  with [bulk enqueuing](#bulk-enqueuing) (21 ms on SQLite).
-- With Redis, SQLite and memory, idle workers wake the moment a job arrives
-  (on SQLite, within about 2.5 ms across processes), and `wait_result`
-  returns the moment a job finishes, instead of waiting on a polling
-  interval. Only the file backend polls.
+If you know Sidekiq or ActiveJob, the enqueue/worker model will feel familiar.
+Butler expresses it through Rust functions, typed results and progress, with a
+choice of storage backends. It uses its own job format and workers.
 
 ## Rust at the core
 
-Background jobs cross a process boundary, so most job libraries give up on
-types there: arguments become a hash, results a string, states a column. butler
-keeps the compiler involved on both sides of the queue.
+Background jobs cross a process boundary. Butler combines compile-time checks
+at the call site with typed deserialization in the worker; persisted data is
+still validated at runtime.
 
 - **The enqueue call is type-checked.** `#[butler::job]` generates a real
   function with your parameter types, so a wrong argument type or count is a
@@ -150,10 +158,9 @@ keeps the compiler involved on both sides of the queue.
   a `Job<Processing>`; `complete` and `fail` take it by value, so a job can't be
   finished twice, and only a `Job<Done>` has an `.output()`. Doc tests check
   that the wrong transitions don't compile.
-- **Mistakes caught at build time.** An invalid queue name in
-  `#[job(queue = "...")]`, a job output that isn't `Serialize`, or two jobs
-  with the same name in one worker (at startup) all fail early, with the error
-  pointing at your code.
+- **Early validation.** An invalid queue name in `#[job(queue = "...")]` or
+  a job output that isn't `Serialize` fails at compile time. Duplicate job
+  names are rejected when the worker is constructed.
 - **Futures you can move around.** The enqueue future is `Send + 'static`
   whatever you pass it: arguments are converted and serialized during the call,
   so it never borrows them. Hand it to `tokio::spawn`, store it, race it.
@@ -167,17 +174,18 @@ keeps the compiler involved on both sides of the queue.
   waiting for a result `await`s a `tokio::sync::Notify` instead of holding a
   thread, so thousands of handles can wait at once.
 - **Safe and strict.** `unsafe_code` is denied workspace-wide, and so are
-  `unwrap()` and `expect()` outside tests. Clippy runs on every feature
-  combination, and every backend passes the same contract test suite.
+  `unwrap()` and `expect()` outside tests. Clippy checks all features, no
+  defaults, and each feature individually. Backends share one contract test suite.
 
 ## Performance
 
-Moving jobs through a queue is the point, not speed (see the note at the top).
-These numbers show that once jobs reach a worker, it runs them concurrently
-and uses every core, so the worker doesn't become the bottleneck.
+Queueing adds serialization and storage overhead compared with a direct call.
+Workers make progress concurrently: Tokio tasks overlap I/O, and synchronous
+jobs use the blocking pool for CPU-bound work.
 
-`just bench` measures this in one process, with the in-memory backend and
-nothing else running. On this 16-CPU machine:
+The following measurements were recorded on a 16-CPU machine with `just bench`,
+in one process using the in-memory backend. They illustrate worker concurrency,
+not durable-backend throughput or a comparison with another job library:
 
 - 2,000 async jobs that each wait 50 ms finished in 117 ms (about 17,000
   jobs/s); one at a time they would take 100 s, so **about 850× faster**.
@@ -193,9 +201,10 @@ each. See [Concurrency and cores](#concurrency-and-cores) for tuning.
 
 ## Web dashboard
 
-`butler-web` is a dashboard for all of it, like Sidekiq's Web UI or Rails'
-Mission Control: live counts streamed over server-sent events, throughput and
-duration charts, and every job, with retry and discard for the failed ones.
+`butler-web` shows live counts streamed over server-sent events, throughput and
+duration charts, queues, workers, and job details. Retry or discard failed
+jobs, cancel pending work, and inspect arguments, results, errors, and saved
+progress from one place.
 
 ![butler-web dashboard, dark theme](https://raw.githubusercontent.com/penso/butler/main/docs/images/dashboard-dark.png)
 
@@ -216,20 +225,30 @@ security, and how it's built.
 
 ## Two kinds of `.await`
 
-In the injector's loop, these two lines look the same and mean different
-things:
+In the demo injector's loop, ordinary Tokio futures and Butler enqueue
+futures use the same syntax:
 
 ```rust
 tokio::time::sleep(Duration::from_millis(200)).await;          // (1) async/await
-let id = demo::process_tick(tick, now_ms(), pid).await?;       // (2) enqueue a job
+let job = demo::process_tick(tick, now_ms(), pid).await?;      // (2) enqueue a job
+let report: Option<demo::TickReport> = job.result().await?;   // (3) check the result
 ```
 
 1. **Regular async/await.** The future runs right here, in this process, on the
    tokio runtime. The line finishes once the 200ms have passed.
-2. **Enqueuing a butler job.** The future serializes the arguments, writes a
-   job to the queue and finishes within a millisecond. The function body
-   does not run here. A worker process picks up the job and runs it,
-   possibly on another machine and possibly much later.
+2. **Enqueuing a butler job.** Calling the function converts and serializes
+   its arguments; awaiting the returned future writes the job to the queue
+   and returns a typed handle. It doesn't wait for the job body to run. A
+   worker picks up the job, possibly on another machine and possibly later.
+3. **Reading the result.** `job.result().await?` asks the backend for the
+   worker's result. It returns `Some(report)` once the job succeeds, or `None`
+   while pending or running, or if it failed or was cancelled. Use
+   `job.wait_result(interval).await?` to wait and distinguish success from
+   failure or cancellation.
+
+These are ordinary Rust futures: enqueue calls can also be used with
+`tokio::join!` or `tokio::spawn`. That composes the enqueue operations in the
+caller; the job bodies still execute independently in workers.
 
 ### How Rust tells them apart
 
@@ -374,7 +393,7 @@ sequenceDiagram
 Inside the worker, the job body is ordinary async code. Its `.await`s are
 regular tokio awaits on the worker's runtime, like (1) above: timers, HTTP
 clients, database pools all work. If the body calls another `#[butler::job]`
-function, that call enqueues a new job, as in Sidekiq and ActiveJob.
+function, that call enqueues a new job.
 
 ## Architecture
 
@@ -497,7 +516,7 @@ pub async fn resize_image(path: String, width: u32) -> Result<(), ImageError> { 
 #[butler::job(name = "billing.charge")]      // stable name, survives renames
 pub async fn charge(customer_id: u64, cents: i64) { ... }
 
-#[butler::job(queue = "mailers")]             // like ActiveJob's queue_as :mailers
+#[butler::job(queue = "mailers")]             // route to a named queue
 pub async fn send_digest(user_id: u64) { ... }
 
 #[butler::job]                                // a plain fn: CPU-bound work
@@ -555,9 +574,9 @@ job.wait_result(Duration::from_millis(100)).await?; // T, or the failure
 
 ### Bulk enqueuing
 
-Like ActiveJob's `perform_all_later`: build the jobs first, then enqueue them
-all at once. Every `#[job]` also gets a `prepare` function, with the same
-type-checked arguments, that builds the job without enqueueing it:
+Build the jobs first, then enqueue them all at once. Every `#[job]` also gets
+a `prepare` function, with the same type-checked arguments, that builds the
+job without enqueueing it:
 
 ```rust
 let emails = users
@@ -568,8 +587,7 @@ let emails = users
 let handles: Vec<JobHandle<MessageId>> = butler::enqueue_all(emails).await?;
 ```
 
-Jobs of different kinds can share a batch, like `perform_all_later` with
-several job classes: `.untyped()` erases the output type, and
+Jobs of different kinds can share a batch: `.untyped()` erases the output type, and
 `handle.with_output::<T>()` brings it back.
 
 ```rust
@@ -659,16 +677,16 @@ its automatic registration.
 Without tokio, `Worker::run()` runs jobs on plain threads using butler's own
 `block_on`. Job bodies then can't use tokio timers or I/O.
 
-In tests, `worker.drain()` runs everything queued, including retries, and
-returns, like Sidekiq's `drain_all`.
+In tests, `worker.drain()` runs the work on its configured queues, including
+retries, and returns when those queues are empty.
 
 ### Job continuations
 
-Like ActiveJob's `Continuable`: a long job saves its progress at checkpoints,
-and resumes from the last one instead of starting over, whether it stopped
-because the worker was shutting down (a deploy), crashed, or the attempt
-failed. Progress is a type you define, typically an enum of steps with a
-cursor in each, and the compiler checks every step:
+A long job saves its progress at checkpoints and resumes from the last saved
+one instead of starting over, whether it stopped because the worker was
+shutting down (a deploy), crashed, or the attempt failed. Progress is a type
+you define, typically an enum of steps with a cursor in each, and the compiler
+checks every step:
 
 ```rust
 use butler::{Interrupted, Progress};
@@ -726,25 +744,17 @@ process_import(42).await?;   // callers don't pass the Progress: the worker does
   isn't counted as a failed attempt. Jobs without a `Progress` are still
   waited for, as before. So a two-hour import no longer holds up a deploy for
   two hours.
-- **Crashes:** because progress is saved periodically, a `kill -9` doesn't
-  send the job back to the start. [Crash recovery](#crashed-workers-dont-lose-jobs)
-  requeues it, and it resumes from its last saved checkpoint, at most
-  `checkpoint_interval_ms` old. Rails keeps progress only on a clean
-  interruption; the test suite kills a real worker process mid-job and checks
-  that the next one resumes without redoing anything.
+- **Crashes:** [crash recovery](#crashed-workers-dont-lose-jobs) requeues the
+  job with its last persisted progress. Work since that checkpoint may repeat;
+  without a saved checkpoint, it starts from the beginning. Saves happen when
+  the job calls a checkpoint, subject to `checkpoint_interval_ms` throttling,
+  so that interval is not a maximum age for saved progress. A real-process
+  test aborts a worker and checks that the next worker resumes saved progress.
 - **Retries:** a job that fails at record 900,000 retries from its last
   checkpoint, not from zero.
 - **Changed types:** if a deploy changes `S` so saved progress no longer
   deserializes, the job fails with a clear error (`JobError::BadProgress`)
   rather than guessing.
-
-| ActiveJob | butler |
-|---|---|
-| `include ActiveJob::Continuable` | add a `mut progress: Progress<S>` parameter |
-| `step :name do ... end` | a variant of your `S` enum, handled in a `match` |
-| `step.cursor` / `step.advance!` / `step.set!` | fields in the variant, `progress.set(..).await?` |
-| interrupted when the adapter stops | `Err(Interrupted)` at the next checkpoint, carried by `?` |
-| test helper to interrupt during a step | `InlineJobs::new().interrupt_at_checkpoint(n)` |
 
 To test resumption, `InlineJobs::new().interrupt_at_checkpoint(n)` interrupts
 each job's first run at its `n`-th checkpoint and resumes it at once from its
@@ -752,9 +762,9 @@ saved progress; `jobs.interruptions()` counts how often that happened.
 
 ### Testing
 
-The same helpers as ActiveJob's `TestHelper`, in `butler::testing`. Inside
-`perform_enqueued_jobs`, awaiting a job function runs the job right there,
-before the `.await` returns: no queue, no worker, no configuration.
+`butler::testing` provides an explicit inline mode. Inside
+`perform_enqueued_jobs`, awaiting a job function runs its body before the
+`.await` returns: no queue, no worker, no configuration.
 
 ```rust
 use butler::testing::perform_enqueued_jobs;
@@ -762,7 +772,7 @@ use butler::testing::perform_enqueued_jobs;
 #[tokio::test]
 async fn it_processes_the_job_immediately() {
     perform_enqueued_jobs(async {
-        process_user(user_id).await.unwrap();    // runs now, like perform_later in the block
+        process_user(user_id).await.unwrap();    // runs now inside inline mode
     })
     .await;
 
@@ -780,12 +790,12 @@ assert_eq!(jobs.performed_names(), ["process_user", "signup"]); // jobs that job
 assert_eq!(handle.result().await?, Some(()));                   // results are there at once
 ```
 
-| ActiveJob | butler |
+| What to test | Helper |
 |---|---|
-| `perform_enqueued_jobs { ... }` | `perform_enqueued_jobs(async { ... }).await` |
-| `perform_enqueued_jobs` (no block: run what's queued) | `Worker::new(queue).drain()` |
-| `assert_performed_jobs 2 { ... }` | `jobs.perform(...)`, then `jobs.performed().len()` |
-| `assert_enqueued_with(job: MyJob)` | enqueue outside the block, then `handle.job().await` |
+| Run job calls immediately | `perform_enqueued_jobs(async { ... }).await` |
+| Execute work already queued | `Worker::new(queue).drain()` |
+| Assert which jobs ran | `jobs.perform(...)`, then `jobs.performed()` or `jobs.performed_names()` |
+| Inspect an enqueued job | Enqueue outside inline mode, then `handle.job().await` |
 
 How it behaves:
 
@@ -793,8 +803,7 @@ How it behaves:
   deserialized as a worker would, so a type mismatch shows up in tests too.
 - `result()` and `wait_result()` work and return at once. A failing job is
   not retried: it is dead after one attempt, and `wait_result` returns
-  `Error::JobFailed` with its error. A panic in a job fails the test, like an
-  exception in Rails' block.
+  `Error::JobFailed` with its error. A panic in a job fails the test.
 - Plain `fn` jobs run inline too (on the blocking pool under tokio).
 - It needs no runtime: `butler::block_on(perform_enqueued_jobs(...))` works
   in a plain `#[test]`.
@@ -805,8 +814,8 @@ How it behaves:
 ### Queues and priority
 
 Every job goes on a named queue: `"default"` unless the job says otherwise with
-`#[butler::job(queue = "...")]`, as ActiveJob's `queue_as` does. Each worker
-chooses which queues it serves and how it prioritizes them, as in Sidekiq:
+`#[butler::job(queue = "...")]`. Each worker chooses which queues it serves
+and how it prioritizes them:
 
 ```toml
 [worker]
@@ -822,13 +831,13 @@ queues = [["critical", 6], ["default", 3], ["low", 1]]
 Or in code: `worker.queues(QueuePriority::strict(["critical", "default"]))`, or
 `QueuePriority::weighted([("critical", 6), ("default", 3), ("low", 1)])`.
 
-To send one call to another queue than the job's own, like ActiveJob's
-`MyJob.set(queue: :low).perform_later`, prepare it and pick the queue:
+To override a job's queue for one call, prepare it and pick the queue:
 `report::prepare(3)?.on_queue("low")?.enqueue().await?`.
 
 - **Strict** is simplest, but a busy first queue starves the others.
-- **Weighted** never starves a queue; it only changes how often each one is
-  checked first. When "critical" is empty, its turns go to the others.
+- **Weighted** gives each queue a chance to be checked first, in proportion
+  to its weight. It avoids strict-priority starvation, but does not guarantee
+  a maximum wait time. When "critical" is empty, its turns go to the others.
 - A worker never runs jobs from queues it doesn't list, and the default is
   just `"default"`. A job on a queue no worker serves waits forever, so the
   worker prints the queues it serves at startup. Dedicated workers are a
@@ -842,10 +851,10 @@ To send one call to another queue than the job's own, like ActiveJob's
 `run_async` keeps up to `concurrency` jobs running at once (default: the number
 of CPUs), each on the multi-threaded tokio runtime:
 
-- **I/O-bound `async fn` jobs** are tokio tasks, a few hundred bytes each rather
-  than a thread. Where Sidekiq runs a few dozen jobs per process (one Ruby
-  thread each), a butler worker can run tens of thousands: set `concurrency`
-  to 10,000 or 100,000.
+- **I/O-bound `async fn` jobs** are tokio tasks rather than one thread per job.
+  A worker can keep many jobs waiting on I/O concurrently. Choose `concurrency`
+  based on memory use and downstream capacity; the in-memory benchmark
+  exercises up to 100,000 small waiting jobs.
 - **CPU-bound plain `fn` jobs** run on tokio's blocking pool, one thread each,
   spread across cores. Keep `concurrency` near the CPU count.
 
@@ -861,8 +870,8 @@ reports = 2               # heavy jobs that shouldn't pile up
 
 - **`concurrency`** caps every queue together. It is a tokio `Semaphore`: each
   running job holds a permit until it finishes.
-- **`[worker.queue_limits]`** caps single queues on top of that, like Sidekiq
-  Enterprise's per-queue limits. Each limited queue is a lock-free counting
+- **`[worker.queue_limits]`** caps single queues within each worker on top of
+  its global limit. Each limited queue is a lock-free counting
   semaphore. Before claiming, the worker reserves a slot in every queue it is
   about to check and skips the ones already full, so it never takes a job it
   can't start, and **a full queue never holds back the others**: in the test, a
@@ -965,12 +974,11 @@ its worker look dead.
 
 If a worker is killed or hangs, its heartbeat expires. The next recovery pass
 (when any worker starts, and every `recover_interval_secs`) moves that
-worker's jobs back to pending, and another worker runs them. This is the same
-design as Sidekiq Pro's `super_fetch`.
+worker's jobs back to pending, and another worker can claim them.
 
-So delivery is **at least once**: a job interrupted by a crash runs again from
-the start. Write job bodies so that running them twice is safe, as with any
-Sidekiq or ActiveJob backend. A worker that stalls for longer than its TTL
+So delivery is **at least once**: a job interrupted by a crash runs again,
+from its saved checkpoint if it has one, otherwise from the start. Write job
+bodies so repeated work is safe. A worker that stalls for longer than its TTL
 without crashing can also see its job run a second time elsewhere.
 
 ### File
@@ -990,7 +998,7 @@ time. The file backend can't block waiting for a job, so idle workers sleep
 
 ### Redis
 
-`crates/butler/src/backend/redis.rs`. Uses lists, like Sidekiq:
+`crates/butler/src/backend/redis.rs`. Stores queued job ids in Redis lists:
 
 | Key | Type | Purpose |
 |---|---|---|
@@ -1001,7 +1009,7 @@ time. The file backend can't block waiting for a job, so idle workers sleep
 | `butler:dead` | LIST | ids that exhausted their retries |
 | `butler:wake` | pub/sub channel | a message per push, retry and recovery; wakes idle workers |
 | `butler:done` | pub/sub channel | a message per job done, dead or cancelled; wakes `wait_result` |
-| `butler:job:<id>` | HASH | `state`, `queue`, and `data` (job JSON); expires 24h after it finishes |
+| `butler:job:<id>` | HASH | `state`, `queue`, and `data` (job JSON); done and cancelled jobs expire after 24h |
 
 A claim is an `LMOVE queue:<queue> processing:<worker>` for each queue the
 worker serves, in its priority order. Redis runs each one atomically, so only
@@ -1023,10 +1031,10 @@ pool, so concurrent claims don't wait on each other.
 
 The job's return value goes into the job hash's `data`, next to its arguments.
 
-It doesn't use Redis `PUBLISH`/`SUBSCRIBE`, for two reasons. Pub/sub sends each
-message to every subscriber, so each job would run once per worker. And it
-drops messages sent while no worker is connected. A list keeps each job until
-exactly one worker takes it.
+Job delivery uses lists, not `PUBLISH`/`SUBSCRIBE`. Pub/sub broadcasts to every
+subscriber and drops messages sent while nobody is connected, so it is used
+only for wake-ups. Lists retain job ids and move each claim to one worker's
+processing area atomically.
 
 ### SQLite
 
@@ -1083,11 +1091,12 @@ four backends.
 - **At-least-once delivery.** A job interrupted by a crash runs again (see
   "Crashed workers don't lose jobs"), so job bodies should be safe to repeat.
 - **Retries.** Failed jobs are retried right away, with no delay between
-  attempts. There are no scheduled jobs (`perform_in`) and no named queues or
-  priorities.
+  attempts. There is no retry backoff or delayed/scheduled enqueueing.
 - **Polling on the file backend.** Idle file-backed workers check every
-  `poll_interval_ms`, and `wait_result` every interval it is given. Redis and
-  memory notify both at once.
+  `poll_interval_ms`, and `wait_result` every interval it is given. Redis,
+  SQLite, and memory support wake-ups, with polling as a fallback.
+- **Worker-local limits.** Concurrency and per-queue limits apply to each
+  worker, not across a fleet. They are not global rate limits.
 - **Job names are the contract.** Renaming a function strands jobs already
   queued under the old name. Use `#[job(name = "...")]` for names that need to
   stay stable.
@@ -1128,7 +1137,7 @@ tasks are in the `justfile`:
 
 ```sh
 just format        # cargo fmt + taplo fmt
-just ci            # format check, clippy on every feature combination, tests
+just ci            # format check, feature-matrix clippy, workspace and no-default tests
 just audit-deps    # cargo deny: advisories, bans, sources
 just web           # the web dashboard on http://127.0.0.1:9090
 just web-css       # rebuild its stylesheet after changing templates
@@ -1136,7 +1145,7 @@ just redis         # throwaway Redis for the demo and the Redis test
 just worker        # demo worker
 just injector      # demo injector
 just bench         # multi-core benchmark, in memory
-just publish-dry-run  # package and verify both crates as crates.io would
+just publish-dry-run  # package and verify publishable workspace crates
 ```
 
 Workspace lints deny `unsafe_code`, `unused_qualifications`, `unwrap_used` and

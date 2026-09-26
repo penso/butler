@@ -1,9 +1,9 @@
 # butler-web
 
-A web dashboard for [butler](https://crates.io/crates/butler), like Sidekiq's
-Web UI or Rails' Mission Control: live counts over server-sent events,
-throughput and duration charts, and every job, with retry and discard for
-failed ones.
+A web dashboard for [butler](https://crates.io/crates/butler)'s background jobs:
+live counts over server-sent events, throughput and duration charts, queues,
+workers, and job details. Retry or discard failed jobs, cancel pending work,
+and inspect arguments, results, errors, and saved progress.
 
 ![The dashboard](https://raw.githubusercontent.com/penso/butler/main/docs/images/dashboard-dark.png)
 

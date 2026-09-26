@@ -335,7 +335,7 @@ tasks are in the `justfile`:
 ```sh
 just format        # cargo fmt + taplo fmt
 just ci            # format check, clippy on every feature combination, tests
-just audit-deps    # cargo deny: advisories, licenses, sources
+just audit-deps    # cargo deny: advisories, bans, sources
 just redis         # throwaway Redis for the demo and the Redis test
 just worker        # demo worker
 just injector      # demo injector

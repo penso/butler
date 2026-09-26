@@ -1,7 +1,6 @@
 [package]
 edition.workspace      = true
 name                   = "butler-macros"
-publish.workspace      = true
 rust-version.workspace = true
 version.workspace      = true
 

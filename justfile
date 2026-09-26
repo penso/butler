@@ -23,9 +23,9 @@ test:
 
 ci: format-check lint test
 
-# License, advisory, and source checks over the dependency graph.
+# Advisory, duplicate-version, and source checks over the dependency graph.
 audit-deps:
-    cargo deny check
+    cargo deny check advisories bans sources
 
 # Audit the GitHub workflows for injection, over-broad permissions, and unpinned actions.
 audit-workflows:

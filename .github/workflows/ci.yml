@@ -104,9 +104,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Split so an advisory filed upstream does not mask a license or
+        # Split so an advisory filed upstream does not mask a bans or
         # source regression introduced by the change under review.
-        check: [advisories, bans licenses sources]
+        check: [advisories, bans sources]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

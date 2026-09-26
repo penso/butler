@@ -7,8 +7,13 @@ use std::time::{Duration, Instant};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().with_target(false).init();
     let queue = butler::Config::load()?.connect()?;
-    println!("[injector {}] queue: {}", std::process::id(), queue.describe());
+    println!(
+        "[injector {}] queue: {}",
+        std::process::id(),
+        queue.describe()
+    );
     butler::configure(queue);
 
     // An ordinary background tokio task that runs alongside the enqueues.

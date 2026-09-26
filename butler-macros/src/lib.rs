@@ -46,17 +46,26 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
 fn expand(func: ItemFn, job_name: Option<LitStr>) -> syn::Result<proc_macro2::TokenStream> {
     let sig = &func.sig;
     if sig.asyncness.is_none() {
-        return Err(syn::Error::new(sig.fn_token.span(), "#[job] functions must be async"));
+        return Err(syn::Error::new(
+            sig.fn_token.span(),
+            "#[job] functions must be async",
+        ));
     }
     if !sig.generics.params.is_empty() {
-        return Err(syn::Error::new(sig.generics.span(), "#[job] functions cannot be generic"));
+        return Err(syn::Error::new(
+            sig.generics.span(),
+            "#[job] functions cannot be generic",
+        ));
     }
 
     let mut idents = Vec::new();
     let mut types = Vec::new();
     for input in &sig.inputs {
         let FnArg::Typed(pat_type) = input else {
-            return Err(syn::Error::new(input.span(), "#[job] functions cannot take self"));
+            return Err(syn::Error::new(
+                input.span(),
+                "#[job] functions cannot take self",
+            ));
         };
         let Pat::Ident(pat_ident) = &*pat_type.pat else {
             return Err(syn::Error::new(

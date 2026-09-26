@@ -5,7 +5,10 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Takes ~1.5s of async work on the tokio timer. The injector sends one per
@@ -23,6 +26,9 @@ pub async fn process_tick(tick: u64, enqueued_at_ms: u64, from_pid: u32) -> anyh
     if tick.is_multiple_of(7) {
         anyhow::bail!("tick #{tick} is divisible by 7, failing on purpose");
     }
-    println!("[worker {}] tick #{tick}: done after 1.5s of tokio::time::sleep", std::process::id());
+    println!(
+        "[worker {}] tick #{tick}: done after 1.5s of tokio::time::sleep",
+        std::process::id()
+    );
     Ok(())
 }

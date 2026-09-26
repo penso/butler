@@ -1,9 +1,15 @@
 [package]
-name = "demo"
-version = "0.1.0"
-edition = "2024"
+edition.workspace      = true
+name                   = "demo"
+publish.workspace      = true
+rust-version.workspace = true
+version.workspace      = true
+
+[lints]
+workspace = true
 
 [dependencies]
-anyhow = "1.0.104"
-butler = { version = "0.1.0", path = ".." }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+anyhow.workspace             = true
+butler.workspace             = true
+tokio                        = { features = ["macros", "rt-multi-thread", "signal", "time"], workspace = true }
+tracing-subscriber.workspace = true

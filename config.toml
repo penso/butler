@@ -2,16 +2,16 @@
 # Environment variables override any key, e.g. BUTLER_QUEUE__BACKEND=file.
 
 [queue]
-backend = "redis"   # "file" or "redis"
+backend = "redis" # "file" or "redis"
 
 [queue.file]
 dir = ".butler"
 
 [queue.redis]
-url = "redis://127.0.0.1:6379/"
 prefix = "butler"
+url    = "redis://127.0.0.1:6379/"
 
 [worker]
-concurrency = 4
-max_retries = 1
+concurrency      = 4
+max_retries      = 1
 poll_interval_ms = 50

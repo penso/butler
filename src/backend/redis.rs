@@ -18,7 +18,9 @@ use redis::{Client, Connection, RedisResult};
 use serde_json::Value;
 
 use super::{Backend, record_failure};
-use crate::{Error, Job, JobId, JobState};
+use crate::{Error, Job, JobId, JobState, Result};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long finished jobs stay queryable before Redis expires them.
 const DONE_TTL_SECS: u64 = 24 * 60 * 60;
@@ -34,9 +36,9 @@ pub struct RedisQueue {
 
 impl RedisQueue {
     /// Connects right away, so a bad URL or unreachable server fails at startup.
-    pub fn connect(url: &str, prefix: &str) -> Result<Self, Error> {
+    pub fn connect(url: &str, prefix: &str) -> Result<Self> {
         let client = Client::open(url)?;
-        let conn = client.get_connection_with_timeout(Duration::from_secs(5))?;
+        let conn = client.get_connection_with_timeout(CONNECT_TIMEOUT)?;
         Ok(Self {
             client,
             conn: Mutex::new(Some(conn)),
@@ -53,12 +55,24 @@ impl RedisQueue {
         format!("{}:job:{id}", self.prefix)
     }
 
-    fn with_conn<T>(&self, f: impl FnOnce(&mut Connection) -> RedisResult<T>) -> Result<T, Error> {
-        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_none() {
-            *guard = Some(self.client.get_connection_with_timeout(Duration::from_secs(5))?);
-        }
-        let result = f(guard.as_mut().expect("connection was just set"));
+    fn with_conn<T>(&self, f: impl FnOnce(&mut Connection) -> RedisResult<T>) -> Result<T> {
+        let mut guard = match self.conn.lock() {
+            Ok(guard) => guard,
+            // A panic inside `f` may have left the connection mid-reply, so
+            // it can't be trusted: drop it and reconnect below.
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = None;
+                self.conn.clear_poison();
+                guard
+            }
+        };
+        let conn = match guard.take() {
+            Some(conn) => conn,
+            None => self.client.get_connection_with_timeout(CONNECT_TIMEOUT)?,
+        };
+        let conn = guard.insert(conn);
+        let result = f(conn);
         if let Err(e) = &result
             && (e.is_io_error() || e.is_connection_dropped() || e.is_unrecoverable_error())
         {
@@ -69,22 +83,29 @@ impl RedisQueue {
 }
 
 impl Backend for RedisQueue {
-    fn push(&self, name: &str, args: Vec<Value>) -> Result<JobId, Error> {
+    fn push(&self, name: &str, args: Vec<Value>) -> Result<JobId> {
         let job = Job::new(name, args);
         let data = serde_json::to_string(&job)?;
         self.with_conn(|con| {
             redis::pipe()
                 .atomic()
-                .cmd("HSET").arg(self.job_key(&job.id))
-                    .arg("state").arg(JobState::Pending.as_str())
-                    .arg("data").arg(&data).ignore()
-                .cmd("LPUSH").arg(self.key("pending")).arg(&job.id).ignore()
+                .cmd("HSET")
+                .arg(self.job_key(&job.id))
+                .arg("state")
+                .arg(JobState::Pending.as_str())
+                .arg("data")
+                .arg(&data)
+                .ignore()
+                .cmd("LPUSH")
+                .arg(self.key("pending"))
+                .arg(&job.id)
+                .ignore()
                 .exec(con)
         })?;
         Ok(job.id)
     }
 
-    fn claim(&self) -> Result<Option<Job>, Error> {
+    fn claim(&self) -> Result<Option<Job>> {
         loop {
             let id: Option<String> = self.with_conn(|con| {
                 redis::cmd("LMOVE")
@@ -98,9 +119,14 @@ impl Backend for RedisQueue {
 
             let data: Option<String> = self.with_conn(|con| {
                 redis::pipe()
-                    .cmd("HSET").arg(self.job_key(&id))
-                        .arg("state").arg(JobState::Processing.as_str()).ignore()
-                    .cmd("HGET").arg(self.job_key(&id)).arg("data")
+                    .cmd("HSET")
+                    .arg(self.job_key(&id))
+                    .arg("state")
+                    .arg(JobState::Processing.as_str())
+                    .ignore()
+                    .cmd("HGET")
+                    .arg(self.job_key(&id))
+                    .arg("data")
                     .query::<(Option<String>,)>(con)
                     .map(|(data,)| data)
             })?;
@@ -109,54 +135,92 @@ impl Backend for RedisQueue {
                 // An id without job data can't run: drop it and try the next one.
                 None => self.with_conn(|con| {
                     redis::pipe()
-                        .cmd("LREM").arg(self.key("processing")).arg(1).arg(&id).ignore()
-                        .cmd("DEL").arg(self.job_key(&id)).ignore()
+                        .cmd("LREM")
+                        .arg(self.key("processing"))
+                        .arg(1)
+                        .arg(&id)
+                        .ignore()
+                        .cmd("DEL")
+                        .arg(self.job_key(&id))
+                        .ignore()
                         .exec(con)
                 })?,
             }
         }
     }
 
-    fn complete(&self, job: &Job) -> Result<(), Error> {
+    fn complete(&self, job: &Job) -> Result<()> {
         let data = serde_json::to_string(job)?;
         self.with_conn(|con| {
             redis::pipe()
                 .atomic()
-                .cmd("LREM").arg(self.key("processing")).arg(1).arg(&job.id).ignore()
-                .cmd("HSET").arg(self.job_key(&job.id))
-                    .arg("state").arg(JobState::Done.as_str())
-                    .arg("data").arg(&data).ignore()
-                .cmd("EXPIRE").arg(self.job_key(&job.id)).arg(DONE_TTL_SECS).ignore()
+                .cmd("LREM")
+                .arg(self.key("processing"))
+                .arg(1)
+                .arg(&job.id)
+                .ignore()
+                .cmd("HSET")
+                .arg(self.job_key(&job.id))
+                .arg("state")
+                .arg(JobState::Done.as_str())
+                .arg("data")
+                .arg(&data)
+                .ignore()
+                .cmd("EXPIRE")
+                .arg(self.job_key(&job.id))
+                .arg(DONE_TTL_SECS)
+                .ignore()
                 .exec(con)
         })
     }
 
-    fn fail(&self, mut job: Job, error: String, max_retries: u32) -> Result<JobState, Error> {
+    fn fail(&self, mut job: Job, error: String, max_retries: u32) -> Result<JobState> {
         let state = record_failure(&mut job, error, max_retries);
         let data = serde_json::to_string(&job)?;
-        let target = if state == JobState::Dead { "dead" } else { "pending" };
+        let target = if state == JobState::Dead {
+            "dead"
+        } else {
+            "pending"
+        };
         self.with_conn(|con| {
             redis::pipe()
                 .atomic()
-                .cmd("LREM").arg(self.key("processing")).arg(1).arg(&job.id).ignore()
-                .cmd("HSET").arg(self.job_key(&job.id))
-                    .arg("state").arg(state.as_str())
-                    .arg("data").arg(&data).ignore()
-                .cmd("LPUSH").arg(self.key(target)).arg(&job.id).ignore()
+                .cmd("LREM")
+                .arg(self.key("processing"))
+                .arg(1)
+                .arg(&job.id)
+                .ignore()
+                .cmd("HSET")
+                .arg(self.job_key(&job.id))
+                .arg("state")
+                .arg(state.as_str())
+                .arg("data")
+                .arg(&data)
+                .ignore()
+                .cmd("LPUSH")
+                .arg(self.key(target))
+                .arg(&job.id)
+                .ignore()
                 .exec(con)
         })?;
         Ok(state)
     }
 
-    fn get(&self, id: &str) -> Result<Option<(JobState, Job)>, Error> {
+    fn get(&self, id: &str) -> Result<Option<(JobState, Job)>> {
         let (state, data): (Option<String>, Option<String>) = self.with_conn(|con| {
-            redis::cmd("HMGET").arg(self.job_key(id)).arg("state").arg("data").query(con)
+            redis::cmd("HMGET")
+                .arg(self.job_key(id))
+                .arg("state")
+                .arg("data")
+                .query(con)
         })?;
         let (Some(state), Some(data)) = (state, data) else {
             return Ok(None);
         };
-        let state = JobState::parse(&state)
-            .ok_or_else(|| Error::UnknownState { id: id.to_string(), state })?;
+        let state = JobState::parse(&state).ok_or_else(|| Error::UnknownState {
+            id: id.to_string(),
+            state,
+        })?;
         Ok(Some((state, serde_json::from_str(&data)?)))
     }
 
@@ -179,7 +243,10 @@ fn redact(url: &str) -> String {
 mod tests {
     #[test]
     fn redacts_credentials() {
-        assert_eq!(super::redact("redis://:secret@h:6379/0"), "redis://***@h:6379/0");
+        assert_eq!(
+            super::redact("redis://:secret@h:6379/0"),
+            "redis://***@h:6379/0"
+        );
         assert_eq!(super::redact("redis://127.0.0.1/"), "redis://127.0.0.1/");
     }
 }

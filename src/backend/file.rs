@@ -19,12 +19,16 @@ use std::{
 use serde_json::Value;
 
 use super::{Backend, record_failure};
-use crate::{Error, Job, JobId, JobState};
+use crate::{Job, JobId, JobState, Result};
 
 /// Checked in this order. During a retry, a job is briefly in both
 /// `processing/` and `pending/`, and `processing/` wins.
-const LOOKUP_ORDER: [JobState; 4] =
-    [JobState::Done, JobState::Dead, JobState::Processing, JobState::Pending];
+const LOOKUP_ORDER: [JobState; 4] = [
+    JobState::Done,
+    JobState::Dead,
+    JobState::Processing,
+    JobState::Pending,
+];
 
 #[derive(Debug, Clone)]
 pub struct FileQueue {
@@ -58,7 +62,7 @@ impl FileQueue {
 
     /// Writes the file under `tmp/` and then renames it, so workers never see
     /// a half-written job.
-    fn write(&self, state: JobState, job: &Job) -> Result<(), Error> {
+    fn write(&self, state: JobState, job: &Job) -> Result<()> {
         let file = format!("{}.json", job.id);
         let tmp = self.root.join("tmp").join(&file);
         fs::write(&tmp, serde_json::to_vec_pretty(job)?)?;
@@ -66,8 +70,11 @@ impl FileQueue {
         Ok(())
     }
 
-    fn remove_processing(&self, job: &Job) -> Result<(), Error> {
-        match fs::remove_file(self.dir(JobState::Processing).join(format!("{}.json", job.id))) {
+    fn remove_processing(&self, job: &Job) -> Result<()> {
+        match fs::remove_file(
+            self.dir(JobState::Processing)
+                .join(format!("{}.json", job.id)),
+        ) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
             _ => Ok(()),
         }
@@ -75,13 +82,13 @@ impl FileQueue {
 }
 
 impl Backend for FileQueue {
-    fn push(&self, name: &str, args: Vec<Value>) -> Result<JobId, Error> {
+    fn push(&self, name: &str, args: Vec<Value>) -> Result<JobId> {
         let job = Job::new(name, args);
         self.write(JobState::Pending, &job)?;
         Ok(job.id)
     }
 
-    fn claim(&self) -> Result<Option<Job>, Error> {
+    fn claim(&self) -> Result<Option<Job>> {
         let mut names: Vec<_> = fs::read_dir(self.dir(JobState::Pending))?
             .filter_map(|e| e.ok())
             .map(|e| e.file_name())
@@ -101,19 +108,19 @@ impl Backend for FileQueue {
         Ok(None)
     }
 
-    fn complete(&self, job: &Job) -> Result<(), Error> {
+    fn complete(&self, job: &Job) -> Result<()> {
         self.write(JobState::Done, job)?;
         self.remove_processing(job)
     }
 
-    fn fail(&self, mut job: Job, error: String, max_retries: u32) -> Result<JobState, Error> {
+    fn fail(&self, mut job: Job, error: String, max_retries: u32) -> Result<JobState> {
         let state = record_failure(&mut job, error, max_retries);
         self.write(state, &job)?;
         self.remove_processing(&job)?;
         Ok(state)
     }
 
-    fn get(&self, id: &str) -> Result<Option<(JobState, Job)>, Error> {
+    fn get(&self, id: &str) -> Result<Option<(JobState, Job)>> {
         let Some((state, path)) = self.find(id) else {
             return Ok(None);
         };

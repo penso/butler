@@ -1,4 +1,5 @@
 #![cfg(all(feature = "redis", feature = "tokio"))]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 //! Runs a job through Redis with the tokio worker, including a retry that ends
 //! in the dead list. Needs a Redis server: `$BUTLER_TEST_REDIS_URL`, or
@@ -41,7 +42,9 @@ async fn redis_roundtrip_with_retry() {
     assert_eq!(queue.state(&ok), Some(JobState::Pending));
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let worker = Worker::new(queue.clone()).max_retries(1).poll_interval(Duration::from_millis(10));
+    let worker = Worker::new(queue.clone())
+        .max_retries(1)
+        .poll_interval(Duration::from_millis(10));
     let handle = tokio::spawn(worker.run_async(async {
         let _ = stop_rx.await;
     }));

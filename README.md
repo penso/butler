@@ -323,8 +323,25 @@ src/executor.rs          minimal block_on for runtime-free use
 butler-macros/           #[job] attribute macro
 demo/                    injector + worker binaries
 tests/                   end-to-end tests (file, tokio, redis, retries)
+justfile                 format, lint, test, audit and demo tasks
+deny.toml, taplo.toml    dependency policy, TOML formatting
 ```
 
-Tests: `cargo test --workspace`. The Redis test needs a server at
-`$BUTLER_TEST_REDIS_URL` or `redis://127.0.0.1:6379/`, and is skipped when none
-is reachable.
+## Development
+
+The toolchain is pinned in `rust-toolchain.toml` (and `mise.toml`). Common
+tasks are in the `justfile`:
+
+```sh
+just format        # cargo fmt + taplo fmt
+just ci            # format check, clippy on every feature combination, tests
+just audit-deps    # cargo deny: advisories, licenses, sources
+just redis         # throwaway Redis for the demo and the Redis test
+just worker        # demo worker
+just injector      # demo injector
+```
+
+Workspace lints deny `unsafe_code`, `unused_qualifications`, `unwrap_used` and
+`expect_used`; tests opt out with a file-level `#![allow(...)]`. The Redis test
+needs a server at `$BUTLER_TEST_REDIS_URL` or `redis://127.0.0.1:6379/`, and is
+skipped when none is reachable. Code conventions are in `AGENTS.md`.

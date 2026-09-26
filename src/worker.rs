@@ -9,11 +9,9 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, anyhow};
-
 use crate::{
-    Config, Job, JobDef, JobState, Queue, WorkerConfig, block_on,
-    __private::BoxFuture,
+    __private::BoxFuture, Config, Job, JobDef, JobError, JobState, Queue, Result, WorkerConfig,
+    block_on, error::Chain,
 };
 
 type Handler = fn(Vec<serde_json::Value>) -> BoxFuture;
@@ -31,10 +29,14 @@ pub struct Worker {
 
 impl Worker {
     /// Opens the configured backend and applies the `[worker]` settings.
-    pub fn from_config(config: &Config) -> Result<Self, crate::Error> {
+    pub fn from_config(config: &Config) -> Result<Self> {
         Ok(Self::new(config.connect()?).with_config(&config.worker))
     }
 
+    /// # Panics
+    ///
+    /// If two `#[job]` functions in this binary share a name. That is a
+    /// build-time mistake, and a worker running either one would be wrong.
     pub fn new(queue: impl Into<Queue>) -> Self {
         let defaults = WorkerConfig::default();
         let mut handlers = HashMap::new();
@@ -88,7 +90,7 @@ impl Worker {
 
     pub fn job_names(&self) -> Vec<&'static str> {
         let mut names: Vec<_> = self.handlers.keys().copied().collect();
-        names.sort();
+        names.sort_unstable();
         names
     }
 
@@ -104,14 +106,14 @@ impl Worker {
         let threads: Vec<_> = (0..self.concurrency)
             .map(|_| {
                 let worker = self.clone();
-                let stop = stop.clone();
+                let stop = Arc::clone(&stop);
                 thread::spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
                         match worker.work_one() {
                             Ok(true) => {}
                             Ok(false) => thread::sleep(worker.poll_interval),
-                            Err(e) => {
-                                eprintln!("butler: queue error: {:#}", anyhow::Error::from(e));
+                            Err(err) => {
+                                tracing::error!(error = %Chain(&err), "queue error");
                                 thread::sleep(worker.poll_interval);
                             }
                         }
@@ -119,15 +121,17 @@ impl Worker {
                 })
             })
             .collect();
-        for t in threads {
-            let _ = t.join();
+        for thread in threads {
+            if thread.join().is_err() {
+                tracing::error!("a worker thread panicked outside of a job");
+            }
         }
     }
 
     /// Runs jobs on the current thread until the queue is empty, and returns
     /// how many ran. This includes retries, so a job that always fails
     /// runs `max_retries + 1` times. Similar to `Sidekiq::Worker.drain_all`.
-    pub fn drain(&self) -> Result<usize, crate::Error> {
+    pub fn drain(&self) -> Result<usize> {
         let mut n = 0;
         while self.work_one()? {
             n += 1;
@@ -136,43 +140,46 @@ impl Worker {
     }
 
     /// Claims and runs one job. Returns `Ok(false)` if the queue was empty.
-    pub fn work_one(&self) -> Result<bool, crate::Error> {
+    pub fn work_one(&self) -> Result<bool> {
         let Some(job) = self.queue.claim()? else {
             return Ok(false);
         };
-        let result = match self.handler(&job) {
-            Ok(handler) => {
-                let fut = handler(job.args.clone());
-                catch_unwind(AssertUnwindSafe(|| block_on(fut)))
-                    .unwrap_or_else(|panic| Err(anyhow!("job panicked: {}", panic_message(&*panic))))
-            }
-            Err(e) => Err(e),
-        };
+        let result = self.handler(&job).and_then(|handler| {
+            let fut = handler(job.args.clone());
+            catch_unwind(AssertUnwindSafe(|| block_on(fut))).unwrap_or_else(|panic| {
+                Err(JobError::Panicked {
+                    message: panic_message(&*panic),
+                })
+            })
+        });
         self.finish(job, result)?;
         Ok(true)
     }
 
-    fn handler(&self, job: &Job) -> anyhow::Result<Handler> {
+    fn handler(&self, job: &Job) -> Result<Handler, JobError> {
         self.handlers
             .get(job.name.as_str())
             .copied()
-            .with_context(|| format!("no job named `{}` is registered in this worker", job.name))
+            .ok_or_else(|| JobError::UnknownJob {
+                name: job.name.clone(),
+            })
     }
 
-    /// Stores the outcome: `done/` on success, otherwise a retry or `dead/`.
-    /// The error's full chain (`{:#}`) becomes the job's `last_error`.
-    fn finish(&self, job: Job, result: anyhow::Result<()>) -> Result<(), crate::Error> {
-        match result {
-            Ok(()) => self.queue.complete(&job),
-            Err(err) => {
-                let err = format!("{err:#}");
-                let (name, id) = (job.name.clone(), job.id.clone());
-                let state = self.queue.fail(job, err.clone(), self.max_retries)?;
-                let verb = if state == JobState::Dead { "is dead" } else { "will retry" };
-                eprintln!("butler: job {name} ({id}) failed and {verb}: {err}");
-                Ok(())
+    /// Stores the outcome: `done` on success, otherwise a retry or `dead`. The
+    /// error's full cause chain becomes the job's `last_error`.
+    fn finish(&self, job: Job, result: Result<(), JobError>) -> Result<()> {
+        let Err(err) = result else {
+            return self.queue.complete(&job);
+        };
+        let (name, id) = (job.name.clone(), job.id.clone());
+        let error = Chain(&err).to_string();
+        match self.queue.fail(job, error, self.max_retries)? {
+            JobState::Dead => {
+                tracing::error!(job = name, id, error = %Chain(&err), "job failed and is dead")
             }
+            _ => tracing::warn!(job = name, id, error = %Chain(&err), "job failed and will retry"),
         }
+        Ok(())
     }
 }
 
@@ -182,7 +189,7 @@ impl Worker {
     /// completes. Each job is a tokio task, so job bodies can use tokio timers
     /// and I/O. At most `concurrency` jobs run at once. On shutdown, the worker
     /// stops claiming jobs and waits for the running ones to finish.
-    pub async fn run_async(self, shutdown: impl std::future::Future<Output = ()>) {
+    pub async fn run_async(self, shutdown: impl Future<Output = ()>) {
         use tokio::{sync::Semaphore, task::JoinSet};
 
         let permits = Arc::new(Semaphore::new(self.concurrency));
@@ -190,13 +197,17 @@ impl Worker {
         let mut shutdown = std::pin::pin!(shutdown);
 
         loop {
+            // The semaphore is never closed, so acquiring only fails if that changes.
             let permit = tokio::select! {
                 _ = &mut shutdown => break,
-                permit = permits.clone().acquire_owned() => permit.expect("semaphore is never closed"),
+                permit = Arc::clone(&permits).acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                },
             };
 
             // Not raced against `shutdown`: once a claim has started, it must
-            // finish, or the job would be stranded in `processing/`.
+            // finish, or the job would be stranded in `processing`.
             let queue = self.queue.clone();
             let claimed = tokio::task::spawn_blocking(move || queue.claim())
                 .await
@@ -211,8 +222,8 @@ impl Worker {
                     });
                 }
                 Ok(None) | Err(_) => {
-                    if let Err(e) = claimed {
-                        eprintln!("butler: queue error: {:#}", anyhow::Error::from(e));
+                    if let Err(err) = claimed {
+                        tracing::error!(error = %Chain(&err), "queue error");
                     }
                     drop(permit);
                     tokio::select! {
@@ -232,10 +243,10 @@ impl Worker {
             // A separate task, so a panic in the job surfaces as a JoinError.
             Ok(handler) => match tokio::spawn(handler(job.args.clone())).await {
                 Ok(result) => result,
-                Err(e) if e.is_panic() => {
-                    Err(anyhow!("job panicked: {}", panic_message(&*e.into_panic())))
-                }
-                Err(e) => Err(anyhow::Error::from(e).context("job task was cancelled")),
+                Err(e) if e.is_panic() => Err(JobError::Panicked {
+                    message: panic_message(&*e.into_panic()),
+                }),
+                Err(e) => Err(JobError::Cancelled(e)),
             },
             Err(e) => Err(e),
         };
@@ -244,9 +255,9 @@ impl Worker {
         let stored = tokio::task::spawn_blocking(move || worker.finish(job, result))
             .await
             .map_err(crate::Error::from)
-            .and_then(|r| r);
-        if let Err(e) = stored {
-            eprintln!("butler: could not store job result: {:#}", anyhow::Error::from(e));
+            .and_then(|stored| stored);
+        if let Err(err) = stored {
+            tracing::error!(error = %Chain(&err), "could not store job result");
         }
     }
 }
@@ -254,7 +265,7 @@ impl Worker {
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
     panic
         .downcast_ref::<&str>()
-        .map(|s| s.to_string())
+        .map(|s| (*s).to_string())
         .or_else(|| panic.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "unknown panic".into())
 }

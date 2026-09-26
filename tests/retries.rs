@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Failed and panicking jobs are retried and end up in `dead/`.
 
 mod common;
@@ -31,7 +33,10 @@ async fn boom() {
 fn retries_then_succeeds_or_dies() {
     let (queue, _dir) = common::temp_queue("retries");
     let worker = Worker::new(queue.clone()).max_retries(2);
-    assert_eq!(worker.job_names(), ["always_panics", "flaky", "read_missing"]);
+    assert_eq!(
+        worker.job_names(),
+        ["always_panics", "flaky", "read_missing"]
+    );
 
     let ok = butler::block_on(flaky(3)).unwrap();
     let dead = butler::block_on(boom()).unwrap();

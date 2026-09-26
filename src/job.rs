@@ -21,7 +21,9 @@ pub struct Job {
 
 impl Job {
     pub fn new(name: &str, args: Vec<Value>) -> Self {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
         Job {
             id: new_id(now.as_nanos()),
             name: name.to_string(),
@@ -53,9 +55,14 @@ impl JobState {
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        [JobState::Pending, JobState::Processing, JobState::Done, JobState::Dead]
-            .into_iter()
-            .find(|state| state.as_str() == s)
+        [
+            JobState::Pending,
+            JobState::Processing,
+            JobState::Done,
+            JobState::Dead,
+        ]
+        .into_iter()
+        .find(|state| state.as_str() == s)
     }
 }
 

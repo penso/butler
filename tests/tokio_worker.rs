@@ -1,4 +1,5 @@
 #![cfg(feature = "tokio")]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 //! Enqueue from a tokio runtime, run the job with `Worker::run_async`, and
 //! check that the job body could use tokio's timer.

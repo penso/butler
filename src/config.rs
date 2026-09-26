@@ -23,11 +23,14 @@
 //! using `__` between levels: `BUTLER_QUEUE__BACKEND=redis`,
 //! `BUTLER_QUEUE__REDIS__URL=redis://host/`, `BUTLER_WORKER__CONCURRENCY=8`.
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use serde::Deserialize;
 
-use crate::{Error, FileQueue, Queue};
+use crate::{FileQueue, Queue, Result};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -60,7 +63,9 @@ pub struct FileConfig {
 
 impl Default for FileConfig {
     fn default() -> Self {
-        Self { dir: ".butler".into() }
+        Self {
+            dir: ".butler".into(),
+        }
     }
 }
 
@@ -74,7 +79,10 @@ pub struct RedisConfig {
 
 impl Default for RedisConfig {
     fn default() -> Self {
-        Self { url: "redis://127.0.0.1:6379/".into(), prefix: "butler".into() }
+        Self {
+            url: "redis://127.0.0.1:6379/".into(),
+            prefix: "butler".into(),
+        }
     }
 }
 
@@ -89,7 +97,11 @@ pub struct WorkerConfig {
 
 impl Default for WorkerConfig {
     fn default() -> Self {
-        Self { concurrency: 1, max_retries: 3, poll_interval_ms: 100 }
+        Self {
+            concurrency: 1,
+            max_retries: 3,
+            poll_interval_ms: 100,
+        }
     }
 }
 
@@ -101,18 +113,18 @@ impl WorkerConfig {
 
 impl Config {
     /// Loads from `$BUTLER_CONFIG`, or `./config.toml`, plus `BUTLER_*` env vars.
-    pub fn load() -> Result<Self, Error> {
+    pub fn load() -> Result<Self> {
         match std::env::var_os("BUTLER_CONFIG") {
-            Some(path) => Self::load_from(PathBuf::from(path), true),
+            Some(path) => Self::load_from(path, true),
             None => Self::load_from("config.toml", false),
         }
     }
 
     /// Loads from `path` plus `BUTLER_*` env vars. A missing file is an error
     /// only if `required` is set.
-    pub fn load_from(path: impl Into<PathBuf>, required: bool) -> Result<Self, Error> {
+    pub fn load_from(path: impl AsRef<Path>, required: bool) -> Result<Self> {
         let config = config::Config::builder()
-            .add_source(config::File::from(path.into()).required(required))
+            .add_source(config::File::from(path.as_ref()).required(required))
             .add_source(
                 config::Environment::with_prefix("BUTLER")
                     .prefix_separator("_")
@@ -124,7 +136,7 @@ impl Config {
     }
 
     /// Opens the configured backend.
-    pub fn connect(&self) -> Result<Queue, Error> {
+    pub fn connect(&self) -> Result<Queue> {
         match self.queue.backend {
             BackendKind::File => Ok(FileQueue::new(&self.queue.file.dir)?.into()),
             #[cfg(feature = "redis")]
@@ -133,13 +145,15 @@ impl Config {
                 Ok(crate::RedisQueue::connect(&redis.url, &redis.prefix)?.into())
             }
             #[cfg(not(feature = "redis"))]
-            BackendKind::Redis => Err(Error::BackendDisabled("redis")),
+            BackendKind::Redis => Err(crate::Error::BackendDisabled("redis")),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     #[test]

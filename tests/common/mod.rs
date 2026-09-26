@@ -1,5 +1,6 @@
 // Each test binary uses a different subset of these helpers.
 #![allow(dead_code)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::{
     path::PathBuf,
@@ -19,7 +20,11 @@ pub fn temp_queue(name: &str) -> (Queue, PathBuf) {
 pub fn wait_for(queue: &Queue, id: &str, state: JobState) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while queue.state(id) != Some(state) {
-        assert!(Instant::now() < deadline, "job {id} never reached {state:?}, now {:?}", queue.state(id));
+        assert!(
+            Instant::now() < deadline,
+            "job {id} never reached {state:?}, now {:?}",
+            queue.state(id)
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }

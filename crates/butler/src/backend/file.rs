@@ -5,7 +5,9 @@
 //!
 //! ```text
 //! <dir>/tmp/                   files being written; never read by workers
-//! <dir>/pending/<queue>/       waiting to run (includes jobs waiting for a retry)
+//! <dir>/pending/<queue>/       waiting to run
+//! <dir>/scheduled/             waiting for their run time (retries included),
+//!                              named `<run time in ms>_<id>.json`, so name order is run order
 //! <dir>/processing/<worker>/   claimed by that worker
 //! <dir>/workers/<worker>       that worker's heartbeat: when it expires, in ms
 //! <dir>/done/                  succeeded
@@ -13,13 +15,15 @@
 //! <dir>/cancelled/             removed from pending/ before a worker claimed it
 //! ```
 //!
-//! Cancelling is a rename from `pending/<queue>/` to `cancelled/`, and
-//! recovering a crashed worker's job is a rename from its
-//! `processing/<worker>/` back to `pending/<queue>/`. Both race with other renames the way two claims do: exactly
-//! one succeeds.
+//! Cancelling is a rename from `pending/<queue>/` or `scheduled/` to
+//! `cancelled/`, promoting a due job is a rename from `scheduled/` to
+//! `pending/<queue>/`, and recovering a crashed worker's job is a rename from
+//! its `processing/<worker>/` back to `pending/<queue>/`. They all race with
+//! other renames the way two claims do: exactly one succeeds.
 
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -27,20 +31,21 @@ use std::{
 
 use serde_json::Value;
 
-use super::{Monitor, Store, Watch};
+use super::{Monitor, Promoted, Store, Watch};
 use crate::{
     JobId, JobRecord, JobState, Result,
-    job::DEFAULT_QUEUE,
+    job::{DEFAULT_QUEUE, from_millis, millis},
     monitor::{ListFilter, QueueStats, Stats, WorkerStats},
 };
 
 /// Checked in this order. During a retry, a job is briefly in both
-/// `processing/` and `pending/`, and `processing/` wins.
-const LOOKUP_ORDER: [JobState; 5] = [
+/// `processing/` and `pending/` (or `scheduled/`), and `processing/` wins.
+const LOOKUP_ORDER: [JobState; 6] = [
     JobState::Cancelled,
     JobState::Done,
     JobState::Dead,
     JobState::Processing,
+    JobState::Scheduled,
     JobState::Pending,
 ];
 
@@ -115,9 +120,61 @@ impl FileQueue {
         self.root.join(WORKERS).join(worker)
     }
 
+    /// The file of scheduled job `id`, if it is scheduled.
+    fn find_scheduled(&self, id: &str) -> Result<Option<PathBuf>> {
+        let suffix = format!("_{id}.json");
+        for entry in fs::read_dir(self.dir(JobState::Scheduled))? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(&suffix))
+            {
+                return Ok(Some(entry.path()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Scheduled job files with their run times, soonest first.
+    fn scheduled_files(&self) -> Result<Vec<(u64, OsString)>> {
+        let mut files = Vec::new();
+        for entry in fs::read_dir(self.dir(JobState::Scheduled))? {
+            let name = entry?.file_name();
+            if let Some(at) = name.to_str().and_then(scheduled_run_at) {
+                files.push((at, name));
+            }
+        }
+        files.sort();
+        Ok(files)
+    }
+
+    /// Moves a scheduled job's file onto its queue. `Ok(false)` if another
+    /// rename (a cancel, another promotion) took it first.
+    fn enqueue_scheduled(&self, path: &Path) -> Result<bool> {
+        let job: JobRecord = match fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let dir = self.pending(&job.queue);
+        fs::create_dir_all(&dir)?;
+        match fs::rename(path, dir.join(format!("{}.json", job.id))) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     fn find(&self, id: &str) -> Result<Option<(JobState, PathBuf)>> {
         let file = format!("{id}.json");
         for state in LOOKUP_ORDER {
+            if state == JobState::Scheduled {
+                if let Some(path) = self.find_scheduled(id)? {
+                    return Ok(Some((state, path)));
+                }
+                continue;
+            }
             // One level of subdirectories: per worker, or per queue.
             if matches!(state, JobState::Processing | JobState::Pending) {
                 for sub in fs::read_dir(self.dir(state))? {
@@ -147,14 +204,19 @@ impl FileQueue {
     }
 
     fn write(&self, state: JobState, job: &JobRecord) -> Result<()> {
-        let dir = if state == JobState::Pending {
-            let dir = self.pending(&job.queue);
-            fs::create_dir_all(&dir)?;
-            dir
-        } else {
-            self.dir(state)
+        let to = match state {
+            JobState::Pending => {
+                let dir = self.pending(&job.queue);
+                fs::create_dir_all(&dir)?;
+                dir.join(format!("{}.json", job.id))
+            }
+            JobState::Scheduled => self.dir(state).join(format!(
+                "{:020}_{}.json",
+                job.run_at_ms.unwrap_or_default(),
+                job.id
+            )),
+            _ => self.dir(state).join(format!("{}.json", job.id)),
         };
-        let to = dir.join(format!("{}.json", job.id));
         self.write_atomic(&to, &serde_json::to_vec_pretty(job)?)
     }
 
@@ -179,6 +241,35 @@ impl Store for FileQueue {
         let job = JobRecord::new(name, queue, args);
         self.write(JobState::Pending, &job)?;
         Ok(job.id)
+    }
+
+    fn schedule(
+        &self,
+        name: &str,
+        queue: &str,
+        args: Vec<Value>,
+        run_at: SystemTime,
+    ) -> Result<JobId> {
+        let mut job = JobRecord::new(name, queue, args);
+        job.run_at_ms = Some(millis(run_at));
+        self.write(JobState::Scheduled, &job)?;
+        Ok(job.id)
+    }
+
+    fn promote(&self, now: SystemTime) -> Result<Promoted> {
+        let now = millis(now);
+        let mut promoted = Promoted::default();
+        let dir = self.dir(JobState::Scheduled);
+        for (at, name) in self.scheduled_files()? {
+            if at > now {
+                promoted.next = Some(from_millis(at));
+                break;
+            }
+            if self.enqueue_scheduled(&dir.join(name))? {
+                promoted.moved += 1;
+            }
+        }
+        Ok(promoted)
     }
 
     /// Never blocks: there is nothing to wait on, so the worker sleeps instead.
@@ -239,6 +330,15 @@ impl Store for FileQueue {
 
     fn cancel(&self, id: &str) -> Result<bool> {
         let file = format!("{id}.json");
+        // Scheduled first: promotion only moves jobs from there to pending/,
+        // so checking in that order can't miss a job moving in between.
+        if let Some(path) = self.find_scheduled(id)? {
+            match fs::rename(path, self.dir(JobState::Cancelled).join(&file)) {
+                Ok(()) => return Ok(true),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         for queue in fs::read_dir(self.dir(JobState::Pending))? {
             match fs::rename(
                 queue?.path().join(&file),
@@ -321,6 +421,7 @@ impl Monitor for FileQueue {
             });
         }
         stats.queues.sort_by(|a, b| a.name.cmp(&b.name));
+        stats.scheduled = self.job_files(&self.dir(JobState::Scheduled))?.len() as u64;
         stats.dead = self.job_files(&self.dir(JobState::Dead))?.len() as u64;
         stats.done = self.job_files(&self.dir(JobState::Done))?.len() as u64;
         stats.cancelled = self.job_files(&self.dir(JobState::Cancelled))?.len() as u64;
@@ -384,7 +485,7 @@ impl Monitor for FileQueue {
         for dir in dirs {
             files.extend(self.job_files(&dir)?);
         }
-        // File names start with the enqueue time.
+        // File names start with the enqueue time (the run time, if scheduled).
         files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
         if filter.state.is_finished() {
             files.reverse();
@@ -433,6 +534,13 @@ impl Monitor for FileQueue {
         Ok(true)
     }
 
+    fn run_now(&self, id: &str) -> Result<bool> {
+        match self.find_scheduled(id)? {
+            Some(path) => self.enqueue_scheduled(&path),
+            None => Ok(false),
+        }
+    }
+
     fn discard(&self, id: &str) -> Result<bool> {
         let file = format!("{id}.json");
         for state in [JobState::Done, JobState::Dead, JobState::Cancelled] {
@@ -447,6 +555,12 @@ impl Monitor for FileQueue {
 }
 
 impl Watch for FileQueue {}
+
+/// The run time in a scheduled file's name, `<run time in ms>_<id>.json`.
+fn scheduled_run_at(name: &str) -> Option<u64> {
+    let (at, _) = name.strip_suffix(".json")?.split_once('_')?;
+    at.parse().ok()
+}
 
 fn ignore_missing(result: io::Result<()>) -> Result<()> {
     match result {

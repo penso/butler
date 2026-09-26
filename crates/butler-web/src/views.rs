@@ -28,12 +28,25 @@ pub(crate) fn now_ms() -> u64 {
 
 /// "4s ago", "3m ago", "2h ago", "5d ago". Refreshed in the browser.
 pub(crate) fn ago(ms: u64) -> String {
-    let seconds = now_ms().saturating_sub(ms) / 1000;
+    format!("{} ago", span(now_ms().saturating_sub(ms) / 1000))
+}
+
+/// "in 4s", "in 3m", "in 2h", "in 5d", or "due now" once it has passed.
+/// Refreshed in the browser.
+pub(crate) fn until(ms: u64) -> String {
+    match ms.saturating_sub(now_ms()) / 1000 {
+        0 => "due now".to_owned(),
+        seconds => format!("in {}", span(seconds)),
+    }
+}
+
+/// "4s", "3m", "2h", "5d".
+fn span(seconds: u64) -> String {
     match seconds {
-        0..60 => format!("{seconds}s ago"),
-        60..3_600 => format!("{}m ago", seconds / 60),
-        3_600..86_400 => format!("{}h ago", seconds / 3_600),
-        _ => format!("{}d ago", seconds / 86_400),
+        0..60 => format!("{seconds}s"),
+        60..3_600 => format!("{}m", seconds / 60),
+        3_600..86_400 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
     }
 }
 
@@ -67,6 +80,9 @@ pub(crate) struct JobRow {
     pub attempts: u32,
     pub enqueued_ms: u64,
     pub enqueued_ago: String,
+    /// When a scheduled job runs, in ms since the epoch, and as "in 5m".
+    pub run_at_ms: u64,
+    pub runs_in: String,
     /// First line of the last error.
     pub error: Option<String>,
 }
@@ -82,6 +98,8 @@ impl JobRow {
             attempts: record.attempts,
             enqueued_ms: record.enqueued_at_ms,
             enqueued_ago: ago(record.enqueued_at_ms),
+            run_at_ms: record.run_at_ms.unwrap_or_default(),
+            runs_in: until(record.run_at_ms.unwrap_or_default()),
             error: record
                 .last_error
                 .as_deref()
@@ -146,8 +164,9 @@ pub(crate) fn summarize(buckets: &[MetricBucket]) -> Vec<JobSummary> {
     rows
 }
 
-pub(crate) const STATES: [JobState; 5] = [
+pub(crate) const STATES: [JobState; 6] = [
     JobState::Pending,
+    JobState::Scheduled,
     JobState::Processing,
     JobState::Done,
     JobState::Dead,
@@ -157,6 +176,7 @@ pub(crate) const STATES: [JobState; 5] = [
 pub(crate) fn state_label(state: JobState) -> &'static str {
     match state {
         JobState::Pending => "Pending",
+        JobState::Scheduled => "Scheduled",
         JobState::Processing => "Running",
         JobState::Done => "Done",
         JobState::Dead => "Dead",

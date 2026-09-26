@@ -1,5 +1,6 @@
 //! What the dashboard changes: retry and discard failed jobs, cancel pending
-//! ones. Every action is a POST and redirects back to the page it came from.
+//! and scheduled ones, run scheduled ones now. Every action is a POST and
+//! redirects back to the page it came from.
 
 use std::sync::Arc;
 
@@ -72,6 +73,15 @@ pub(crate) async fn cancel(
     Form(form): Form<Back>,
 ) -> Result<Redirect, WebError> {
     act(&state, move |queue| queue.cancel(&id)).await?;
+    Ok(back(&state, form.return_to.as_deref()))
+}
+
+pub(crate) async fn run_now(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Form(form): Form<Back>,
+) -> Result<Redirect, WebError> {
+    act(&state, move |queue| queue.run_now(&id)).await?;
     Ok(back(&state, form.return_to.as_deref()))
 }
 

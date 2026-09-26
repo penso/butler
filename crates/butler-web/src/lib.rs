@@ -1,7 +1,8 @@
 //! A web dashboard for [butler](https://crates.io/crates/butler), like
 //! Sidekiq's Web UI or Rails' Mission Control: live counts over server-sent
 //! events, throughput and duration charts, and the jobs themselves, with
-//! retry and discard for failed ones.
+//! retry and discard for failed ones, and run now or cancel for scheduled
+//! ones.
 //!
 //! Mount it in your own axum app, behind your own authentication:
 //!
@@ -14,7 +15,7 @@
 //! or run the `butler-web` binary, which reads `butler.toml` like a worker.
 //!
 //! The dashboard has no authentication of its own. Actions (retry, discard,
-//! cancel) are POSTs, and cross-site POSTs are rejected, so another site
+//! cancel, run now) are POSTs, and cross-site POSTs are rejected, so another site
 //! can't trigger them through a logged-in browser.
 
 mod actions;
@@ -82,6 +83,7 @@ impl Dashboard {
             .route("/jobs/{id}/retry", post(actions::retry))
             .route("/jobs/{id}/discard", post(actions::discard))
             .route("/jobs/{id}/cancel", post(actions::cancel))
+            .route("/jobs/{id}/run-now", post(actions::run_now))
             .route("/jobs/retry-all", post(actions::retry_all))
             .route("/jobs/discard-all", post(actions::discard_all))
             .route("/workers", get(pages::workers))

@@ -27,12 +27,20 @@
     return n >= 100 ? formatCount(n) : n.toFixed(1);
   }
 
+  function span(s) {
+    if (s < 60) return s + "s";
+    if (s < 3600) return Math.floor(s / 60) + "m";
+    if (s < 86400) return Math.floor(s / 3600) + "h";
+    return Math.floor(s / 86400) + "d";
+  }
+
   function ago(ms) {
-    var s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
-    if (s < 60) return s + "s ago";
-    if (s < 3600) return Math.floor(s / 60) + "m ago";
-    if (s < 86400) return Math.floor(s / 3600) + "h ago";
-    return Math.floor(s / 86400) + "d ago";
+    return span(Math.max(0, Math.floor((Date.now() - ms) / 1000))) + " ago";
+  }
+
+  function until(ms) {
+    var s = Math.floor((ms - Date.now()) / 1000);
+    return s > 0 ? "in " + span(s) : "due now";
   }
 
   // Theme: dark by default, remembered per browser.
@@ -59,6 +67,9 @@
   function refreshTimes() {
     document.querySelectorAll("[data-ms]").forEach(function (el) {
       el.textContent = ago(Number(el.dataset.ms));
+    });
+    document.querySelectorAll("[data-until-ms]").forEach(function (el) {
+      el.textContent = until(Number(el.dataset.untilMs));
     });
   }
   setInterval(refreshTimes, 5000);
@@ -239,7 +250,7 @@
   }
 
   function apply(snapshot) {
-    ["processed_total", "failed_total", "processing", "pending", "dead", "workers_alive"].forEach(function (key) {
+    ["processed_total", "failed_total", "processing", "pending", "scheduled", "dead", "workers_alive"].forEach(function (key) {
       document.querySelectorAll('[data-stat="' + key + '"]').forEach(function (el) {
         el.textContent = formatCount(snapshot[key] || 0);
       });

@@ -13,6 +13,9 @@ use crate::JobState;
 pub struct Stats {
     /// One entry per queue that has ever had a job, sorted by name.
     pub queues: Vec<QueueStats>,
+    /// Jobs waiting for their run time, retries included.
+    #[serde(default)]
+    pub scheduled: u64,
     pub processing: u64,
     pub dead: u64,
     /// Finished jobs the backend still keeps (Redis: the most recent ones).

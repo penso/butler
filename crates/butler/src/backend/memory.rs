@@ -4,21 +4,23 @@
 //! jobs are kept until the process exits.
 //!
 //! It follows the same contract as the other backends: per-worker processing,
-//! heartbeats and recovery, atomic claim and cancel (here, under one lock). A
-//! claim with a `wait` sleeps on a condition variable and wakes as soon as a
-//! job is pushed.
+//! heartbeats and recovery, atomic claim, cancel and promotion (here, under
+//! one lock). A claim with a `wait` sleeps on a condition variable and wakes
+//! as soon as a job is pushed. Scheduled jobs wait in a set ordered by run
+//! time until they are promoted onto their queue.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use serde_json::Value;
 
-use super::{Monitor, NewJob, Store, Watch};
+use super::{Monitor, NewJob, Promoted, Store, Watch};
 use crate::{
     JobId, JobRecord, JobState, Result, Signal,
+    job::{from_millis, millis},
     monitor::{
         JobMetric, ListFilter, METRICS_RETENTION_MINUTES, MetricBucket, QueueStats, Stats,
         WorkerStats,
@@ -43,6 +45,9 @@ struct Inner {
 struct State {
     /// Per queue, oldest first.
     pending: HashMap<String, VecDeque<JobId>>,
+    /// Scheduled jobs by run time (milliseconds since the epoch), soonest
+    /// first; the id keeps jobs due at the same time apart.
+    scheduled: BTreeSet<(u64, JobId)>,
     jobs: HashMap<JobId, (JobState, JobRecord)>,
     /// Per worker. A set: a worker can hold a great many jobs at once, and
     /// finishing one must not scan the others.
@@ -87,6 +92,34 @@ impl State {
             held.remove(id);
         }
     }
+
+    fn insert_scheduled(&mut self, job: JobRecord) -> JobId {
+        let id = job.id.clone();
+        self.scheduled
+            .insert((job.run_at_ms.unwrap_or_default(), id.clone()));
+        self.jobs.insert(id.clone(), (JobState::Scheduled, job));
+        id
+    }
+
+    /// Moves a job out of the scheduled set onto the back of its queue.
+    fn enqueue_scheduled(&mut self, id: JobId) {
+        let Some((job_state, job)) = self.jobs.get_mut(&id) else {
+            return;
+        };
+        *job_state = JobState::Pending;
+        let queue = job.queue.clone();
+        self.pending.entry(queue).or_default().push_back(id);
+    }
+
+    fn next_run_at(&self) -> Option<SystemTime> {
+        self.scheduled.first().map(|(at, _)| from_millis(*at))
+    }
+}
+
+fn scheduled_record(name: &str, queue: &str, args: Vec<Value>, run_at: SystemTime) -> JobRecord {
+    let mut job = JobRecord::new(name, queue, args);
+    job.run_at_ms = Some(millis(run_at));
+    job
 }
 
 impl Store for MemoryQueue {
@@ -105,11 +138,26 @@ impl Store for MemoryQueue {
         Ok(id)
     }
 
+    fn schedule(
+        &self,
+        name: &str,
+        queue: &str,
+        args: Vec<Value>,
+        run_at: SystemTime,
+    ) -> Result<JobId> {
+        let job = scheduled_record(name, queue, args, run_at);
+        Ok(self.lock().insert_scheduled(job))
+    }
+
     fn push_many(&self, jobs: Vec<NewJob>) -> Result<Vec<JobId>> {
         let mut state = self.lock();
         let ids = jobs
             .into_iter()
             .map(|new| {
+                if let Some(run_at) = new.run_at {
+                    let job = scheduled_record(&new.name, &new.queue, new.args, run_at);
+                    return state.insert_scheduled(job);
+                }
                 let job = JobRecord::new(&new.name, &new.queue, new.args);
                 let id = job.id.clone();
                 state.jobs.insert(id.clone(), (JobState::Pending, job));
@@ -123,6 +171,25 @@ impl Store for MemoryQueue {
             .collect();
         self.inner.pushed.notify_all();
         Ok(ids)
+    }
+
+    fn promote(&self, now: SystemTime) -> Result<Promoted> {
+        let now = millis(now);
+        let mut state = self.lock();
+        let mut moved = 0;
+        while state.scheduled.first().is_some_and(|(at, _)| *at <= now) {
+            if let Some((_, id)) = state.scheduled.pop_first() {
+                state.enqueue_scheduled(id);
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            self.inner.pushed.notify_all();
+        }
+        Ok(Promoted {
+            moved,
+            next: state.next_run_at(),
+        })
     }
 
     fn claim(&self, worker: &str, queues: &[&str], wait: Duration) -> Result<Option<JobRecord>> {
@@ -170,6 +237,10 @@ impl Store for MemoryQueue {
     fn fail(&self, worker: &str, job: &JobRecord, next: JobState) -> Result<()> {
         let mut state = self.lock();
         state.release(worker, &job.id);
+        if next == JobState::Scheduled {
+            state.insert_scheduled(job.clone());
+            return Ok(());
+        }
         if next == JobState::Pending {
             state
                 .pending
@@ -205,16 +276,28 @@ impl Store for MemoryQueue {
 
     fn cancel(&self, id: &str) -> Result<bool> {
         let mut state = self.lock();
-        let Some(queue) = state.jobs.get(id).map(|(_, job)| job.queue.clone()) else {
+        let Some((job_state, job)) = state.jobs.get(id) else {
             return Ok(false);
         };
-        let Some(pending) = state.pending.get_mut(&queue) else {
-            return Ok(false);
-        };
-        let Some(position) = pending.iter().position(|pending| pending == id) else {
-            return Ok(false);
-        };
-        pending.remove(position);
+        match job_state {
+            JobState::Scheduled => {
+                let key = (job.run_at_ms.unwrap_or_default(), id.to_owned());
+                if !state.scheduled.remove(&key) {
+                    return Ok(false);
+                }
+            }
+            JobState::Pending => {
+                let queue = job.queue.clone();
+                let Some(pending) = state.pending.get_mut(&queue) else {
+                    return Ok(false);
+                };
+                let Some(position) = pending.iter().position(|pending| pending == id) else {
+                    return Ok(false);
+                };
+                pending.remove(position);
+            }
+            _ => return Ok(false),
+        }
         if let Some((job_state, _)) = state.jobs.get_mut(id) {
             *job_state = JobState::Cancelled;
         }
@@ -305,6 +388,7 @@ impl Monitor for MemoryQueue {
                 JobState::Done => stats.done += 1,
                 JobState::Dead => stats.dead += 1,
                 JobState::Cancelled => stats.cancelled += 1,
+                JobState::Scheduled => stats.scheduled += 1,
                 JobState::Pending => {}
             }
         }
@@ -349,8 +433,12 @@ impl Monitor for MemoryQueue {
             })
             .map(|(_, job)| job)
             .collect();
-        // Ids start with the enqueue time.
-        jobs.sort_by(|a, b| a.id.cmp(&b.id));
+        if filter.state == JobState::Scheduled {
+            jobs.sort_by(|a, b| (a.run_at_ms, &a.id).cmp(&(b.run_at_ms, &b.id)));
+        } else {
+            // Ids start with the enqueue time.
+            jobs.sort_by(|a, b| a.id.cmp(&b.id));
+        }
         if filter.state.is_finished() {
             jobs.reverse();
         }
@@ -378,6 +466,20 @@ impl Monitor for MemoryQueue {
             .entry(queue)
             .or_default()
             .push_back(id.to_owned());
+        self.inner.pushed.notify_all();
+        Ok(true)
+    }
+
+    fn run_now(&self, id: &str) -> Result<bool> {
+        let mut state = self.lock();
+        let Some((JobState::Scheduled, job)) = state.jobs.get(id) else {
+            return Ok(false);
+        };
+        let key = (job.run_at_ms.unwrap_or_default(), id.to_owned());
+        if !state.scheduled.remove(&key) {
+            return Ok(false);
+        }
+        state.enqueue_scheduled(key.1);
         self.inner.pushed.notify_all();
         Ok(true)
     }

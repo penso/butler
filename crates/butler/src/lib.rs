@@ -44,7 +44,9 @@ use serde::{Serialize, de::DeserializeOwned};
 pub use arg::JobArg;
 #[cfg(feature = "redis")]
 pub use backend::RedisQueue;
-pub use backend::{Backend, FileQueue, MemoryQueue, Monitor, NewJob, Queue, Store, Watch};
+pub use backend::{
+    Backend, FileQueue, MemoryQueue, Monitor, NewJob, Promoted, Queue, Store, Watch,
+};
 #[cfg(feature = "sqlite")]
 pub use backend::{SQLITE_WATCH_TICK, SqliteQueue};
 pub use butler_macros::job;
@@ -191,24 +193,28 @@ pub mod __private {
         job: &'static crate::JobDef,
         args: Vec<serde_json::Value>,
     ) -> crate::Result<crate::JobHandle<T>> {
-        enqueue_on(job, job.queue, args).await
+        enqueue_on(job, job.queue, args, None).await
     }
 
-    /// Like [`enqueue`], on `queue` rather than the job's own.
+    /// Like [`enqueue`], on `queue` rather than the job's own, and scheduled
+    /// for `run_at` if given.
     pub async fn enqueue_on<T>(
         job: &'static crate::JobDef,
         queue_name: &str,
         args: Vec<serde_json::Value>,
+        run_at: Option<std::time::SystemTime>,
     ) -> crate::Result<crate::JobHandle<T>> {
-        // Inside `testing::perform_enqueued_jobs`: run it now, no queue.
+        // Inside `testing::perform_enqueued_jobs`: run it now, no queue, even
+        // if it was scheduled for later.
         if let Some(inline) = crate::testing::current() {
             return inline.run(job, queue_name, args).await;
         }
         let queue_name = queue_name.to_owned();
         let queue = crate::queue()?;
         let pushing = queue.clone();
-        let id = crate::executor::unblock(queue.blocks(), move || {
-            pushing.push(job.name, &queue_name, args)
+        let id = crate::executor::unblock(queue.blocks(), move || match run_at {
+            Some(run_at) => pushing.schedule(job.name, &queue_name, args, run_at),
+            None => pushing.push(job.name, &queue_name, args),
         })
         .await?;
         Ok(crate::JobHandle::new(queue, id))

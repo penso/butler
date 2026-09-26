@@ -43,7 +43,7 @@
 <div class="card overflow-hidden">
   <table class="table">
     <thead>
-      <tr><th>Job</th><th>Queue</th><th>Enqueued</th><th class="text-right">Attempts</th>{% if can_retry %}<th>Error</th>{% endif %}<th class="text-right">Actions</th></tr>
+      <tr><th>Job</th><th>Queue</th><th>Enqueued</th>{% if show_run_at %}<th>Runs</th>{% endif %}<th class="text-right">Attempts</th>{% if show_error %}<th>Error</th>{% endif %}<th class="text-right">Actions</th></tr>
     </thead>
     <tbody>
       {% for row in rows %}
@@ -54,14 +54,20 @@
         </td>
         <td class="mono text-[var(--muted)]">{{ row.queue }}</td>
         <td class="whitespace-nowrap text-[var(--muted)]" data-ms="{{ row.enqueued_ms }}">{{ row.enqueued_ago }}</td>
+        {% if show_run_at %}
+        <td class="whitespace-nowrap text-[var(--info)]" data-until-ms="{{ row.run_at_ms }}">{{ row.runs_in }}</td>
+        {% endif %}
         <td class="text-right tabular-nums">{{ row.attempts }}</td>
-        {% if can_retry %}
+        {% if show_error %}
         <td class="max-w-md truncate text-[var(--error)] mono text-xs" title="{% if let Some(error) = row.error %}{{ error }}{% endif %}">{% if let Some(error) = row.error %}{{ error }}{% endif %}</td>
         {% endif %}
         <td class="text-right">
           <div class="flex justify-end gap-1.5">
             {% if can_retry %}
             <form method="post" action="{{ base }}/jobs/{{ row.id }}/retry"><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn btn-accent">Retry</button></form>
+            {% endif %}
+            {% if can_run_now %}
+            <form method="post" action="{{ base }}/jobs/{{ row.id }}/run-now"><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn btn-accent">Run now</button></form>
             {% endif %}
             {% if can_cancel %}
             <form method="post" action="{{ base }}/jobs/{{ row.id }}/cancel"><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn">Cancel</button></form>
@@ -73,7 +79,7 @@
         </td>
       </tr>
       {% else %}
-      <tr><td colspan="6" class="py-10 text-center text-[var(--muted)]">No {{ label|lower }} jobs{% if !queue.is_empty() %} on {{ queue }}{% endif %}.</td></tr>
+      <tr><td colspan="7" class="py-10 text-center text-[var(--muted)]">No {{ label|lower }} jobs{% if !queue.is_empty() %} on {{ queue }}{% endif %}.</td></tr>
       {% endfor %}
     </tbody>
   </table>

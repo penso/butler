@@ -58,13 +58,15 @@ types, and the `reports` module belong to your application. See
   local processes, and an in-memory backend for tests and single-process apps.
 - **Recovery and retries.** Worker heartbeats recover abandoned jobs; failed
   attempts retry, then remain visible for inspection.
+- **Scheduled jobs.** Run a job in five minutes or at 03:00 with
+  `prepare(..)?.run_in(..)` or `.run_at(..)`, and cancel it while it waits.
 - **Resumable work.** Typed checkpoints let long jobs continue after a deploy,
   crash, or failed attempt.
 - **Controlled concurrency.** Named queues, strict or weighted priority,
   per-queue limits, and bulk enqueueing. Async jobs run as Tokio tasks;
   synchronous jobs use its blocking pool. A thread worker also runs without Tokio.
 - **Built-in visibility.** A live web dashboard for throughput, workers,
-  queues, job details, and retry/cancel/discard actions.
+  queues, job details, scheduled jobs, and retry/cancel/discard/run-now actions.
 
 Delivery is **at least once**: jobs must be safe to repeat, including work done
 since the last saved checkpoint. Durable backends recover work after worker
@@ -87,6 +89,7 @@ crashes; storage durability still depends on the backend's configuration.
   - [Defining jobs](#defining-jobs)
   - [Working with an enqueued job](#working-with-an-enqueued-job)
   - [Bulk enqueuing](#bulk-enqueuing)
+  - [Scheduling jobs](#scheduling-jobs)
   - [Results](#results)
   - [Running a worker](#running-a-worker)
   - [Job continuations](#job-continuations)
@@ -203,8 +206,8 @@ each. See [Concurrency and cores](#concurrency-and-cores) for tuning.
 
 `butler-web` shows live counts streamed over server-sent events, throughput and
 duration charts, queues, workers, and job details. Retry or discard failed
-jobs, cancel pending work, and inspect arguments, results, errors, and saved
-progress from one place.
+jobs, cancel pending work, run scheduled jobs now, and inspect arguments,
+results, errors, and saved progress from one place.
 
 ![butler-web dashboard, dark theme](https://raw.githubusercontent.com/penso/butler/main/docs/images/dashboard-dark.png)
 
@@ -434,6 +437,9 @@ Each job moves through these states:
 ```mermaid
 stateDiagram-v2
     [*] --> pending: job fn .await
+    [*] --> scheduled: run_in / run_at
+    scheduled --> pending: due, or run now
+    scheduled --> cancelled: cancel()
     pending --> processing: claimed
     processing --> done: Ok
     processing --> pending: retry, or crash recovery
@@ -448,7 +454,8 @@ stateDiagram-v2
 
 The same states exist in Rust's type system, so each one only offers what
 makes sense for it. A job's type is `Job<S>`, with `S` one of
-`butler::state::{Pending, Processing, Done, Dead, Cancelled}`:
+`butler::state::{Pending, Scheduled, Processing, Done, Dead, Cancelled}`. A
+`Job<Scheduled>` has a `run_at()`:
 
 ```rust
 // Only claim creates a Job<Processing>.
@@ -564,7 +571,7 @@ work from any process:
 let job = send_email("ada@example.com", "Welcome").await?;
 
 job.id();                                   // store it; queue.handle(id) rebuilds the handle
-job.state().await?;                         // Some(Pending | Processing | Done | Dead | Cancelled)
+job.state().await?;                         // Some(Pending | Scheduled | Processing | Done | Dead | Cancelled)
 job.job().await?;                           // the stored record: args, attempts, last_error, result
 job.cancel().await?;                        // true if removed before any worker claimed it
 job.wait(Duration::from_millis(100)).await?; // poll until Done, Dead or Cancelled
@@ -609,6 +616,35 @@ jobs, one at a time versus one `enqueue_all`:
 | File | 1.1 s | 1.2 s | one file per job either way |
 
 Inside `perform_enqueued_jobs`, a batch runs inline, in order.
+
+### Scheduling jobs
+
+To run a job later, like ActiveJob's `set(wait:)` and `set(wait_until:)`,
+prepare it, give it a delay or a time, then enqueue it:
+
+```rust
+use std::time::{Duration, SystemTime};
+
+let reminder = send_reminder::prepare(user_id)?
+    .run_in(Duration::from_secs(300))   // or .run_at(some_system_time)
+    .enqueue()
+    .await?;
+
+reminder.state().await?;                // Some(Scheduled) until it is due
+reminder.cancel().await?;               // works while it waits
+```
+
+`enqueue_all` takes scheduled jobs too, in the same single step as the rest
+of the batch. A time already past enqueues the job at once.
+
+Until its time comes, the job is `Scheduled`: no worker can claim it, and
+`cancel()` removes it. Then it is promoted onto the back of its own queue and
+runs like any other job. Workers promote due jobs in two ways: an idle claim
+promotes them itself and, when nothing is waiting, sleeps until the next one
+is due rather than a whole `poll_interval_ms`; and each worker's keeper
+promotes them every 250 ms, so they move even while every worker is busy. How
+each backend stores them is under [Backends](#backends). The dashboard lists
+them in a Scheduled tab, with "Run now" and "Cancel".
 
 ### Results
 
@@ -805,6 +841,7 @@ How it behaves:
   not retried: it is dead after one attempt, and `wait_result` returns
   `Error::JobFailed` with its error. A panic in a job fails the test.
 - Plain `fn` jobs run inline too (on the blocking pool under tokio).
+- Scheduled jobs (`run_in`, `run_at`) run at once too: the delay is ignored.
 - It needs no runtime: `butler::block_on(perform_enqueued_jobs(...))` works
   in a plain `#[test]`.
 - Inline mode is on while the future you pass is being polled. Work you
@@ -994,13 +1031,15 @@ without crashing can also see its job run a second time elsewhere.
 `crates/butler/src/backend/file.rs`. One JSON file per job:
 
 ```text
-pending/<queue>/  processing/<worker>/  workers/<worker>  done/  dead/  cancelled/
+pending/<queue>/  scheduled/  processing/<worker>/  workers/<worker>  done/  dead/  cancelled/
 ```
 
 Each write goes to `tmp/` first and is then renamed into place, so nothing ever
-reads a half-written file. Claiming, cancelling and recovering are all a
-`rename`, which is atomic: when several workers race for a job, exactly one
-rename succeeds. A heartbeat is the file `workers/<worker>` holding its expiry
+reads a half-written file. Claiming, cancelling, promoting and recovering are
+all a `rename`, which is atomic: when several workers race for a job, exactly
+one rename succeeds. Scheduled jobs are named `<run time in ms>_<id>.json`, so
+promotion reads the directory in run-time order and stops at the first one not
+yet due. A heartbeat is the file `workers/<worker>` holding its expiry
 time. The file backend can't block waiting for a job, so idle workers sleep
 `poll_interval_ms` between checks.
 
@@ -1014,6 +1053,7 @@ time. The file backend can't block waiting for a job, so idle workers sleep
 | `butler:processing:<worker>` | LIST | ids that worker claimed |
 | `butler:worker:<worker>` | STRING | the worker's heartbeat; expires after `heartbeat_ttl_secs` |
 | `butler:workers` | SET | worker ids that may hold jobs, checked by recovery |
+| `butler:scheduled` | ZSET | ids waiting for their run time; the score is the time in ms |
 | `butler:dead` | LIST | ids that exhausted their retries |
 | `butler:wake` | pub/sub channel | a message per push, retry and recovery; wakes idle workers |
 | `butler:done` | pub/sub channel | a message per job done, dead or cancelled; wakes `wait_result` |
@@ -1034,7 +1074,11 @@ again anyway.
 
 Recovery moves each id back to its own queue with a small Lua script, which
 reads the job's queue and moves the id as one atomic step, so two workers
-recovering at once can't requeue a job twice. Calls use a small connection
+recovering at once can't requeue a job twice. Promotion is a Lua script too:
+it takes the due ids from `butler:scheduled` (`ZRANGEBYSCORE`) and `LPUSH`es
+each onto its own queue, atomically, so a job moves exactly once. Cancelling a
+scheduled job is a `ZREM`, tried before the queue list: ids only move from the
+set to a queue, so a job can't slip past both checks. Calls use a small connection
 pool, so concurrent claims don't wait on each other.
 
 The job's return value goes into the job hash's `data`, next to its arguments.
@@ -1052,7 +1096,7 @@ processes on the same machine:
 
 | Table | Columns | Purpose |
 |---|---|---|
-| `butler_jobs` | `id, queue, state, worker, seq, data` | every job; `data` is the job JSON, `seq` the order in its queue |
+| `butler_jobs` | `id, queue, state, worker, seq, data, run_at` | every job; `data` is the job JSON, `seq` the order in its queue, `run_at` a scheduled job's time in ms |
 | `butler_workers` | `worker, expires_at_ms` | heartbeats, for crash recovery |
 
 A claim is one `UPDATE ... RETURNING` that moves the oldest pending row of a
@@ -1060,6 +1104,12 @@ queue to `processing` under the claiming worker. SQLite runs it under its write
 lock, so only one worker gets each job; recovery is a single `UPDATE` too. The
 database runs in WAL mode, so readers don't block the writer, with a 5 second
 busy timeout for concurrent processes.
+
+A scheduled job is a `scheduled` row. Claims only take `pending` rows, and
+promotion turns the due ones into `pending` rows at the back of their queue,
+in one transaction. It reads `MIN(run_at)` first (indexed), so it only takes
+the write lock when something is due. Databases created by earlier versions
+get the `run_at` column and its index when opened.
 
 **Waking waiters without a server.** SQLite has no pub/sub between processes:
 its hooks only see changes made through the same connection. butler combines
@@ -1086,20 +1136,26 @@ one lock: no Redis, no files, nothing to set up. `MemoryQueue::new()` gives an
 isolated queue (clones share it), and `backend = "memory"` in `butler.toml`
 gives one shared queue per process. It follows the same rules as the other
 backends, heartbeats and recovery included, and a waiting claim wakes as soon
-as a job is pushed. Use it for tests, benchmarks, and apps whose workers run
+as a job is pushed. Scheduled jobs wait in a `BTreeSet` ordered by run time. Use it for tests, benchmarks, and apps whose workers run
 in the same process. Nothing survives a restart, and finished jobs stay in
 memory until the process exits.
 
 `crates/butler/tests/backends.rs` runs the same contract checks (FIFO claims,
-waking on push, cancel against claim, results, retries, recovery) against all
-four backends.
+waking on push, cancel against claim, results, retries, recovery, scheduled
+jobs: not claimable early, claimable once due, promoted to their own queue,
+cancel against promotion) against all four backends.
+
+**Upgrading.** Scheduled jobs add a `scheduled` state. Deploy this version to
+every worker and dashboard before enqueueing scheduled jobs: older versions
+don't promote them, and reading one fails with `Error::UnknownState`. Jobs
+already queued need nothing: their records read as before.
 
 ## Limitations
 
 - **At-least-once delivery.** A job interrupted by a crash runs again (see
   "Crashed workers don't lose jobs"), so job bodies should be safe to repeat.
 - **Retries.** Failed jobs are retried right away, with no delay between
-  attempts. There is no retry backoff or delayed/scheduled enqueueing.
+  attempts.
 - **Polling on the file backend.** Idle file-backed workers check every
   `poll_interval_ms`, and `wait_result` every interval it is given. Redis,
   SQLite, and memory support wake-ups, with polling as a fallback.

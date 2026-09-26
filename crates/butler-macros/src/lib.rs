@@ -20,7 +20,7 @@
 //! job up by (default: the function name), and `#[job(queue = "mailers")]` the
 //! queue it is enqueued on (default: `"default"`).
 //! - `send_email::prepare(...)`, which builds the job without enqueueing it,
-//!   for `butler::enqueue_all` or `.on_queue(..)`.
+//!   for `butler::enqueue_all`, `.on_queue(..)`, or `.run_in(..)` to schedule it.
 //! - `send_email::JOB`, a handle for `Worker::register`. Jobs defined in another
 //!   crate need it: the linker drops that crate's automatic registration unless
 //!   the binary references something from it.
@@ -224,7 +224,7 @@ fn expand(
                 ::butler::JobDef { name: #job_name, queue: #queue, perform: super::#dispatch };
 
             /// Builds this job without enqueueing it, for `butler::enqueue_all`
-            /// (or `.on_queue(..)`, then `.enqueue()`).
+            /// (or `.on_queue(..)` or `.run_in(..)`, then `.enqueue()`).
             pub fn prepare(#(#idents: impl ::butler::JobArg<#types>),*)
                 -> ::core::result::Result<
                     ::butler::PreparedJob<<#returns as ::butler::IntoJobResult>::Output>,

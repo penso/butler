@@ -52,6 +52,11 @@ const LIMITED_RECHECK: Duration = Duration::from_millis(10);
 /// is due. The checks themselves are throttled; this only bounds the latency.
 const KEEPER_TICK: Duration = Duration::from_millis(250);
 
+/// How often the keeper promotes scheduled jobs that came due. Idle claims
+/// promote on their own, at the due time; this covers workers too busy to be
+/// idle, so a due job on a queue they serve first doesn't wait for a lull.
+const PROMOTE_INTERVAL: Duration = KEEPER_TICK;
+
 /// Pulls jobs from a [`Queue`] and runs them. It can run every `#[job]`
 /// function compiled into the current binary.
 ///
@@ -79,11 +84,13 @@ pub struct Worker {
     checkpoint_interval: Duration,
 }
 
-/// When this worker last refreshed its heartbeat and last recovered jobs.
+/// When this worker last refreshed its heartbeat, recovered jobs, and
+/// promoted scheduled jobs.
 #[derive(Default)]
 struct Upkeep {
     beat: Option<Instant>,
     recovered: Option<Instant>,
+    promoted: Option<Instant>,
 }
 
 impl Worker {
@@ -310,7 +317,8 @@ impl Worker {
     /// Runs jobs on the current thread until the queue is empty, and returns
     /// how many ran. This includes retries, so a job that always fails
     /// runs `max_retries + 1` times. Similar to `Sidekiq::Worker.drain_all`.
-    /// Recovers jobs from stopped workers first.
+    /// Recovers jobs from stopped workers first. Scheduled jobs run if they
+    /// are due; ones due later stay scheduled.
     pub fn drain(&self) -> Result<usize> {
         self.upkeep(true)?;
         let mut n = 0;
@@ -385,12 +393,13 @@ impl Worker {
         Ok(Claimed::Job(Box::new(job), permit))
     }
 
-    /// Refreshes the heartbeat and recovers stopped workers' jobs, each only
-    /// when due unless `force`. Timestamps move only after a success, so a
-    /// failed heartbeat is retried on the next call.
+    /// Refreshes the heartbeat, recovers stopped workers' jobs, and promotes
+    /// scheduled jobs that came due, each only when due unless `force`.
+    /// Timestamps move only after a success, so a failed heartbeat is retried
+    /// on the next call.
     fn upkeep(&self, force: bool) -> Result<()> {
         let now = Instant::now();
-        let (beat, recover) = {
+        let (beat, recover, promote) = {
             let last = self.upkeep.lock().unwrap_or_else(PoisonError::into_inner);
             let due = |at: Option<Instant>, every: Duration| {
                 force || at.is_none_or(|at| now.duration_since(at) >= every)
@@ -398,6 +407,7 @@ impl Worker {
             (
                 due(last.beat, self.heartbeat_ttl / 3),
                 due(last.recovered, self.recover_interval),
+                due(last.promoted, PROMOTE_INTERVAL),
             )
         };
         if beat {
@@ -420,6 +430,19 @@ impl Worker {
                 );
             }
         }
+        if promote {
+            let promoted = self.queue.promote(SystemTime::now())?;
+            self.upkeep
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .promoted = Some(now);
+            if promoted.moved > 0 {
+                tracing::debug!(
+                    moved = promoted.moved,
+                    "moved due scheduled jobs onto their queues"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -433,7 +456,7 @@ impl Worker {
 
     fn log_upkeep(&self, force: bool) {
         if let Err(err) = self.upkeep(force) {
-            tracing::error!(worker = %self.id, error = %Chain(&err), "heartbeat or recovery failed");
+            tracing::error!(worker = %self.id, error = %Chain(&err), "heartbeat, recovery or promotion failed");
         }
     }
 
@@ -649,7 +672,7 @@ impl Worker {
     }
 
     fn log_upkeep_error(&self, err: &crate::Error) {
-        tracing::error!(worker = %self.id, error = %Chain(err), "heartbeat or recovery failed");
+        tracing::error!(worker = %self.id, error = %Chain(err), "heartbeat, recovery or promotion failed");
     }
 
     async fn execute_async(&self, job: Job<Processing>) {

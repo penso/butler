@@ -175,6 +175,20 @@ impl Backend for MemoryQueue {
         Ok(self.lock().jobs.get(id).cloned())
     }
 
+    fn checkpoint(&self, worker: &str, job: &JobRecord) -> Result<()> {
+        let mut state = self.lock();
+        let holds = state
+            .processing
+            .get(worker)
+            .is_some_and(|held| held.contains(&job.id));
+        if holds {
+            state
+                .jobs
+                .insert(job.id.clone(), (JobState::Processing, job.clone()));
+        }
+        Ok(())
+    }
+
     fn cancel(&self, id: &str) -> Result<bool> {
         let mut state = self.lock();
         let Some(queue) = state.jobs.get(id).map(|(_, job)| job.queue.clone()) else {

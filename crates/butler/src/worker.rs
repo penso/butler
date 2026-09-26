@@ -15,10 +15,11 @@ use crate::{
     error::Chain,
     executor::panic_message,
     limits::{Permit, QueueLimits},
+    progress::{Checkpoints, Invocation},
     state::Processing,
 };
 
-type Handler = fn(Vec<serde_json::Value>) -> BoxFuture;
+type Handler = fn(Invocation) -> BoxFuture;
 
 /// What one pass of a worker thread did.
 enum Step {
@@ -32,7 +33,8 @@ enum Step {
 /// The outcome of [`Worker::claim_limited`].
 enum Claimed {
     /// A job, with its place in its queue's limit.
-    Job(Job<Processing>, Permit),
+    /// Boxed: a job record is far larger than the other variant.
+    Job(Box<Job<Processing>>, Permit),
     /// No job; `throttled` if some queue was skipped for being full.
     Nothing { throttled: bool },
 }
@@ -70,6 +72,10 @@ pub struct Worker {
     heartbeat_ttl: Duration,
     recover_interval: Duration,
     upkeep: Arc<Mutex<Upkeep>>,
+    /// Set when the worker starts shutting down: jobs with a `Progress` stop
+    /// at their next checkpoint and go back on their queue.
+    stopping: Arc<AtomicBool>,
+    checkpoint_interval: Duration,
 }
 
 /// When this worker last refreshed its heartbeat and last recovered jobs.
@@ -110,6 +116,8 @@ impl Worker {
             heartbeat_ttl: defaults.heartbeat_ttl(),
             recover_interval: defaults.recover_interval(),
             upkeep: Arc::default(),
+            stopping: Arc::default(),
+            checkpoint_interval: defaults.checkpoint_interval(),
         }
     }
 
@@ -125,6 +133,7 @@ impl Worker {
             .max_retries(config.max_retries)
             .poll_interval(config.poll_interval())
             .heartbeat_ttl(config.heartbeat_ttl())
+            .checkpoint_interval(config.checkpoint_interval())
             .recover_interval(config.recover_interval())
     }
 
@@ -197,6 +206,14 @@ impl Worker {
     /// (pub/sub) and memory wake claims the moment a job arrives, so there it
     /// is only a fallback; the file backend can't be woken, so it polls at
     /// this interval.
+    /// For jobs with a [`Progress`](crate::Progress): the most often their
+    /// progress is saved to the backend, so a crash resumes them from at most
+    /// this long ago. Checkpoints in between only update it in memory.
+    pub fn checkpoint_interval(mut self, d: Duration) -> Self {
+        self.checkpoint_interval = d;
+        self
+    }
+
     pub fn poll_interval(mut self, d: Duration) -> Self {
         self.poll_interval = d;
         self
@@ -230,7 +247,9 @@ impl Worker {
 
     /// Runs until `stop` is set, then waits for the threads to finish their
     /// current jobs.
-    pub fn run_until(self, stop: Arc<AtomicBool>) {
+    pub fn run_until(mut self, stop: Arc<AtomicBool>) {
+        // Checkpoints see the same flag: stopping interrupts continuable jobs.
+        self.stopping = Arc::clone(&stop);
         self.log_upkeep(true);
         let keeper = {
             let worker = self.clone();
@@ -310,19 +329,23 @@ impl Worker {
     fn work_one_within(&self, wait: Duration) -> Result<Step> {
         self.upkeep(false)?;
         let (job, permit) = match self.claim_limited(wait)? {
-            Claimed::Job(job, permit) => (job, permit),
+            Claimed::Job(job, permit) => (*job, permit),
             Claimed::Nothing { throttled: true } => return Ok(Step::Throttled),
             Claimed::Nothing { throttled: false } => return Ok(Step::Idle),
         };
+        let checkpoints = self.checkpoints(&job);
         let result = self.handler(&job).and_then(|handler| {
-            let fut = handler(job.args().to_vec());
+            let fut = handler(Invocation {
+                args: job.args().to_vec(),
+                checkpoints: checkpoints.clone(),
+            });
             catch_unwind(AssertUnwindSafe(|| block_on(fut))).unwrap_or_else(|panic| {
                 Err(JobError::Panicked {
                     message: panic_message(&*panic),
                 })
             })
         });
-        self.finish(job, result)?;
+        self.finish(job, result, &checkpoints)?;
         drop(permit);
         Ok(Step::Ran)
     }
@@ -357,7 +380,7 @@ impl Worker {
             .into_iter()
             .find(|(queue, _)| *queue == job.queue())
             .map_or(Permit::Unlimited, |(_, permit)| permit);
-        Ok(Claimed::Job(job, permit))
+        Ok(Claimed::Job(Box::new(job), permit))
     }
 
     /// Refreshes the heartbeat and recovers stopped workers' jobs, each only
@@ -419,12 +442,42 @@ impl Worker {
             })
     }
 
-    /// Stores the outcome: `done` with the job's output, otherwise a retry or
-    /// `dead`. The error's full cause chain becomes the job's `last_error`.
+    /// What a job run gets for its `Progress`: the progress to resume from,
+    /// the stopping flag, and a way to save progress to the backend.
+    fn checkpoints(&self, job: &Job<Processing>) -> Checkpoints {
+        let stopping = Arc::clone(&self.stopping);
+        let (queue, worker, record) = (
+            self.queue.clone(),
+            Arc::clone(&self.id),
+            job.record().clone(),
+        );
+        Checkpoints::new(
+            record.progress.clone(),
+            self.checkpoint_interval,
+            move || stopping.load(Ordering::Acquire),
+            Box::new(move |progress| {
+                let mut record = record.clone();
+                record.progress = Some(progress);
+                let (queue, worker) = (queue.clone(), Arc::clone(&worker));
+                Box::pin(async move {
+                    crate::executor::unblock(queue.blocks(), move || {
+                        queue.checkpoint(&worker, &record)
+                    })
+                    .await
+                })
+            }),
+        )
+    }
+
+    /// Stores the outcome: `done` with the job's output, back on its queue if
+    /// a checkpoint interrupted it, otherwise a retry or `dead`. A failed or
+    /// interrupted job keeps its latest progress, so the next run resumes
+    /// from there. The error's full cause chain becomes the job's `last_error`.
     fn finish(
         &self,
         job: Job<Processing>,
         result: Result<serde_json::Value, JobError>,
+        checkpoints: &Checkpoints,
     ) -> Result<()> {
         let err = match result {
             Ok(output) => {
@@ -433,6 +486,19 @@ impl Worker {
             }
             Err(err) => err,
         };
+        let job = match checkpoints.latest() {
+            Some(progress) => job.with_progress(progress),
+            None => job,
+        };
+        if checkpoints.interrupted() {
+            let job = self.queue.interrupt(&self.id, job)?;
+            tracing::info!(
+                job = job.name(),
+                id = job.id(),
+                "job interrupted at a checkpoint; it will resume from there"
+            );
+            return Ok(());
+        }
         let error = Chain(&err).to_string();
         match self.queue.fail(&self.id, job, error, self.max_retries)? {
             Failed::Dead(job) => tracing::error!(
@@ -494,6 +560,8 @@ impl Worker {
         }
 
         shutdown.await;
+        // Continuable jobs stop at their next checkpoint and requeue.
+        self.stopping.store(true, Ordering::Release);
         let _ = stop.send(true);
         while claimers.join_next().await.is_some() {}
         let all = u32::try_from(self.concurrency).unwrap_or(u32::MAX);
@@ -538,7 +606,7 @@ impl Worker {
                 Ok(Claimed::Job(job, queue_permit)) => {
                     let worker = self.clone();
                     tokio::spawn(async move {
-                        worker.execute_async(job).await;
+                        worker.execute_async(*job).await;
                         drop(queue_permit);
                         drop(permit);
                     });
@@ -567,9 +635,14 @@ impl Worker {
     }
 
     async fn execute_async(&self, job: Job<Processing>) {
+        let checkpoints = self.checkpoints(&job);
+        let invocation = Invocation {
+            args: job.args().to_vec(),
+            checkpoints: checkpoints.clone(),
+        };
         let result = match self.handler(&job) {
             // A separate task, so a panic in the job surfaces as a JoinError.
-            Ok(handler) => match tokio::spawn(handler(job.args().to_vec())).await {
+            Ok(handler) => match tokio::spawn(handler(invocation)).await {
                 Ok(result) => result,
                 Err(e) if e.is_panic() => Err(JobError::Panicked {
                     message: panic_message(&*e.into_panic()),
@@ -580,8 +653,10 @@ impl Worker {
         };
 
         let worker = self.clone();
-        let stored =
-            crate::executor::unblock(self.queue.blocks(), move || worker.finish(job, result)).await;
+        let stored = crate::executor::unblock(self.queue.blocks(), move || {
+            worker.finish(job, result, &checkpoints)
+        })
+        .await;
         if let Err(err) = stored {
             tracing::error!(error = %Chain(&err), "could not store job result");
         }

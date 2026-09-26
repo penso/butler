@@ -133,6 +133,9 @@ pub struct WorkerConfig {
     pub heartbeat_ttl_secs: u64,
     /// How often to requeue jobs held by workers whose heartbeat expired.
     pub recover_interval_secs: u64,
+    /// For jobs with a `Progress`: the most often their progress is saved to
+    /// the backend, so a crash resumes them from at most this long ago.
+    pub checkpoint_interval_ms: u64,
     /// Queues to serve. Plain names are strict priority, in order:
     /// `["critical", "default"]`. Any `[name, weight]` pair makes it weighted,
     /// with plain names weighing 1: `[["critical", 6], ["default", 1]]`.
@@ -168,6 +171,7 @@ impl Default for WorkerConfig {
             poll_interval_ms: 100,
             heartbeat_ttl_secs: 30,
             recover_interval_secs: 10,
+            checkpoint_interval_ms: 1_000,
             queues: vec![QueueEntry::Name(DEFAULT_QUEUE.to_owned())],
             queue_limits: HashMap::new(),
         }
@@ -189,6 +193,10 @@ impl WorkerConfig {
 
     pub fn recover_interval(&self) -> Duration {
         Duration::from_secs(self.recover_interval_secs)
+    }
+
+    pub fn checkpoint_interval(&self) -> Duration {
+        Duration::from_millis(self.checkpoint_interval_ms)
     }
 
     pub fn priority(&self) -> QueuePriority {

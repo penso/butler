@@ -47,6 +47,10 @@ Engineering guidance for agents working in this repository. Read it alongside
   directly from the enqueue path. Keep it free of queue and worker state.
 - `Backend::push_many` should be one step where the backend allows it (one
   round trip, one transaction); the default loops over `push`.
+- Continuations: a checkpoint saves progress (throttled by
+  `checkpoint_interval`) and reports `Interrupted` when the worker stops; the
+  worker requeues interrupted jobs without counting an attempt. A backend's
+  `checkpoint` must only write while that worker still holds the job.
 - Every backend must pass `crates/butler/tests/backends.rs`. Add new backend
   behavior there, so all backends are held to it.
 

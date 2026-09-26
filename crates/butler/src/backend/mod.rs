@@ -19,7 +19,7 @@ pub use self::sqlite::{SqliteQueue, WATCH_TICK as SQLITE_WATCH_TICK};
 pub use self::{file::FileQueue, memory::MemoryQueue};
 use crate::{
     AnyJob, Failed, Job, JobId, JobRecord, JobState, Result, Signal,
-    state::{Done, Processing},
+    state::{Done, Pending, Processing},
 };
 
 /// Storage for jobs. Methods block; async callers run them through
@@ -59,6 +59,14 @@ pub trait Backend: Send + Sync + 'static {
     fn fail(&self, worker: &str, job: &JobRecord, next: JobState) -> Result<()>;
 
     fn get(&self, id: &str) -> Result<Option<(JobState, JobRecord)>>;
+
+    /// Saves the record (in practice, its `progress`) of a job `worker`
+    /// holds, so a crash resumes it from there. Does nothing if the worker no
+    /// longer holds it. The default does nothing at all: progress then only
+    /// survives interruptions and failures, which store the whole record.
+    fn checkpoint(&self, _worker: &str, _job: &JobRecord) -> Result<()> {
+        Ok(())
+    }
 
     /// Atomically removes a pending job so no worker will run it, and marks it
     /// `Cancelled`. Returns `false`, changing nothing, if the job is unknown or
@@ -150,6 +158,20 @@ impl Queue {
         let mut record = job.into_record();
         record.result = Some(output);
         self.0.complete(worker, &record)?;
+        Ok(Job::from_record(record))
+    }
+
+    /// Saves the progress of a job `worker` holds.
+    pub fn checkpoint(&self, worker: &str, job: &JobRecord) -> Result<()> {
+        self.0.checkpoint(worker, job)
+    }
+
+    /// Puts a job interrupted at a checkpoint back on its queue, with its
+    /// progress, to resume. Unlike [`fail`](Queue::fail), it isn't counted as
+    /// a failed attempt.
+    pub fn interrupt(&self, worker: &str, job: Job<Processing>) -> Result<Job<Pending>> {
+        let record = job.into_record();
+        self.0.fail(worker, &record, JobState::Pending)?;
         Ok(Job::from_record(record))
     }
 

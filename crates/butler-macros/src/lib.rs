@@ -25,6 +25,9 @@
 //!   crate need it: the linker drops that crate's automatic registration unless
 //!   the binary references something from it.
 //!
+//! A parameter of type `butler::Progress<S>` makes the job resumable: the
+//! worker provides it from saved progress, and callers don't pass it.
+//!
 //! The function may be `async` (runs as a task on the worker's runtime) or a
 //! plain `fn` (runs on the blocking thread pool, for CPU-bound work). Job
 //! bodies must be `Send`, so a tokio worker can spawn them.
@@ -68,6 +71,13 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// Whether a parameter is the job's `Progress`, which the worker provides.
+fn is_progress(ty: &Type) -> bool {
+    matches!(ty, Type::Path(path)
+        if path.qself.is_none()
+            && path.path.segments.last().is_some_and(|segment| segment.ident == "Progress"))
+}
+
 /// Same rule as `butler::is_valid_queue_name`, checked at compile time.
 fn is_valid_queue_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
@@ -91,8 +101,11 @@ fn expand(
         ));
     }
 
+    // Arguments callers pass (serialized), and every argument in order (the call).
     let mut idents = Vec::new();
     let mut types = Vec::new();
+    let mut call_args = Vec::new();
+    let mut progress = None;
     for input in &sig.inputs {
         let FnArg::Typed(pat_type) = input else {
             return Err(syn::Error::new(
@@ -106,9 +119,32 @@ fn expand(
                 "#[job] arguments must be plain identifiers",
             ));
         };
+        call_args.push(pat_ident.ident.clone());
+        if is_progress(&pat_type.ty) {
+            if progress.is_some() {
+                return Err(syn::Error::new(
+                    pat_type.ty.span(),
+                    "#[job] functions take at most one Progress",
+                ));
+            }
+            if !is_async {
+                return Err(syn::Error::new(
+                    pat_type.ty.span(),
+                    "Progress needs an async #[job]: its checkpoints are awaited",
+                ));
+            }
+            progress = Some((pat_ident.ident.clone(), (*pat_type.ty).clone()));
+            continue;
+        }
         idents.push(pat_ident.ident.clone());
         types.push((*pat_type.ty).clone());
     }
+    // Built by the worker from saved progress, never passed by callers.
+    let progress_init = progress.as_ref().map(|(ident, ty)| {
+        quote! {
+            let #ident: #ty = <#ty>::resume(&call.checkpoints)?;
+        }
+    });
 
     let vis = &func.vis;
     let attrs = &func.attrs;
@@ -134,12 +170,12 @@ fn expand(
     let (perform_fn, run) = if is_async {
         (
             quote! { #vis async fn #perform(#inputs) #output #body },
-            quote! { #perform(#(#idents),*).await },
+            quote! { #perform(#(#call_args),*).await },
         )
     } else {
         (
             quote! { #vis fn #perform(#inputs) #output #body },
-            quote! { ::butler::__private::run_blocking(move || #perform(#(#idents),*)).await? },
+            quote! { ::butler::__private::run_blocking(move || #perform(#(#call_args),*)).await? },
         )
     };
 
@@ -166,14 +202,13 @@ fn expand(
 
         #[doc(hidden)]
         #[allow(non_snake_case)]
-        fn #dispatch(args: ::std::vec::Vec<::butler::__private::serde_json::Value>)
-            -> ::butler::__private::BoxFuture
-        {
+        fn #dispatch(call: ::butler::__private::Invocation) -> ::butler::__private::BoxFuture {
             ::std::boxed::Box::pin(async move {
-                let mut args = args.into_iter();
+                let mut args = call.args.into_iter();
                 #(
                     let #idents: #types = ::butler::__private::arg(&mut args, #job_name, #indices)?;
                 )*
+                #progress_init
                 ::butler::__private::output(#run)
             })
         }

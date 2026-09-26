@@ -30,14 +30,20 @@ use std::{
     cell::RefCell,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicU32, Ordering},
+    },
     task::{Context, Poll},
+    time::Duration,
 };
 
 use serde_json::Value;
 
 use crate::{
-    AnyJob, Backend, Failed, Job, JobDef, JobHandle, MemoryQueue, Queue, Result, error::Chain,
+    AnyJob, Backend, Failed, Job, JobDef, JobHandle, JobRecord, MemoryQueue, Queue, Result,
+    error::Chain,
+    progress::{Checkpoints, Invocation},
 };
 
 thread_local! {
@@ -65,6 +71,9 @@ pub fn perform_enqueued_jobs<F: Future>(body: F) -> Performing<F> {
 pub struct InlineJobs {
     store: MemoryQueue,
     performed: Arc<Mutex<Vec<AnyJob>>>,
+    /// Interrupt each job's first run at this checkpoint (1-based).
+    interrupt_at: Option<u32>,
+    interruptions: Arc<AtomicU32>,
 }
 
 impl InlineJobs {
@@ -78,6 +87,20 @@ impl InlineJobs {
             body: Box::pin(body),
             jobs: self.clone(),
         }
+    }
+
+    /// Interrupts each job's first run at its `n`-th checkpoint, as if the
+    /// worker were shutting down, then resumes it at once from the progress
+    /// it saved, like a restarted worker would. Use it to test that a job
+    /// with a [`Progress`](crate::Progress) resumes correctly.
+    pub fn interrupt_at_checkpoint(mut self, n: u32) -> Self {
+        self.interrupt_at = Some(n.max(1));
+        self
+    }
+
+    /// How many times a job was interrupted and resumed.
+    pub fn interruptions(&self) -> u32 {
+        self.interruptions.load(Ordering::SeqCst)
     }
 
     /// Every job performed so far, in the order they finished (a job that
@@ -107,26 +130,60 @@ impl InlineJobs {
         const INLINE: &str = "inline";
         let queue: Queue = self.store.clone().into();
         let id = self.store.push(def.name, queue_name, args.clone())?;
-        let record = self
+        let mut record = self
             .store
             .get(&id)?
             .map(|(_, record)| record)
             .ok_or_else(|| crate::Error::JobNotFound { id: id.clone() })?;
-        let running: Job<crate::state::Processing> = Job::from_record(record);
 
-        let finished = match (def.perform)(args).await {
-            Ok(output) => AnyJob::Done(queue.complete(INLINE, running, output)?),
-            // One attempt: tests shouldn't wait on retries.
-            Err(err) => match queue.fail(INLINE, running, Chain(&err).to_string(), 0)? {
-                Failed::Dead(job) => AnyJob::Dead(job),
-                Failed::Retry(job) => AnyJob::Pending(job),
-            },
+        let mut first_run = true;
+        let finished = loop {
+            let checkpoints = self.checkpoints(&record, first_run);
+            let outcome = (def.perform)(Invocation {
+                args: args.clone(),
+                checkpoints: checkpoints.clone(),
+            })
+            .await;
+            let latest = checkpoints.latest();
+            let running: Job<crate::state::Processing> = Job::from_record(record.clone());
+            let running = match latest {
+                Some(progress) => running.with_progress(progress),
+                None => running,
+            };
+            break match outcome {
+                Ok(output) => AnyJob::Done(queue.complete(INLINE, running, output)?),
+                // Interrupted: resume right away from the saved progress.
+                Err(_) if checkpoints.interrupted() => {
+                    record = running.into_record();
+                    self.interruptions.fetch_add(1, Ordering::SeqCst);
+                    first_run = false;
+                    continue;
+                }
+                // One attempt: tests shouldn't wait on retries.
+                Err(err) => match queue.fail(INLINE, running, Chain(&err).to_string(), 0)? {
+                    Failed::Dead(job) => AnyJob::Dead(job),
+                    Failed::Retry(job) => AnyJob::Pending(job),
+                },
+            };
         };
         self.performed
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(finished);
         Ok(JobHandle::new(queue, id))
+    }
+
+    /// Checkpoints for an inline run: saved to the private store at every
+    /// checkpoint, and stopping at `interrupt_at` on a job's first run.
+    fn checkpoints(&self, record: &JobRecord, first_run: bool) -> Checkpoints {
+        let stop_at = self.interrupt_at.filter(|_| first_run);
+        let seen = AtomicU32::new(0);
+        Checkpoints::new(
+            record.progress.clone(),
+            Duration::ZERO,
+            move || stop_at.is_some_and(|n| seen.fetch_add(1, Ordering::SeqCst) + 1 >= n),
+            Box::new(|_| Box::pin(async { Ok(()) })),
+        )
     }
 }
 

@@ -28,6 +28,7 @@ queues a job, and a worker process runs the body later.
   - [Bulk enqueuing](#bulk-enqueuing)
   - [Results](#results)
   - [Running a worker](#running-a-worker)
+  - [Job continuations](#job-continuations)
   - [Testing](#testing)
   - [Queues and priority](#queues-and-priority)
   - [Concurrency and cores](#concurrency-and-cores)
@@ -81,6 +82,9 @@ memory, until it is done:
   its full error chain, instead of disappearing.
 - **Shutdowns finish what they started.** On Ctrl-C, a worker stops taking
   new jobs and waits for the running ones to complete.
+- **Long jobs resume instead of restarting.** A job with
+  [checkpoints](#job-continuations) picks up where it stopped after a deploy,
+  a crash or a failed attempt, instead of redoing hours of work.
 
 One consequence to design for: delivery is **at least once**. A job
 interrupted by a crash runs again from the start, so a job should be safe to
@@ -631,6 +635,94 @@ Without tokio, `Worker::run()` runs jobs on plain threads using butler's own
 In tests, `worker.drain()` runs everything queued, including retries, and
 returns, like Sidekiq's `drain_all`.
 
+### Job continuations
+
+Like ActiveJob's `Continuable`: a long job saves its progress at checkpoints,
+and resumes from the last one instead of starting over, whether it stopped
+because the worker was shutting down (a deploy), crashed, or the attempt
+failed. Progress is a type you define, typically an enum of steps with a
+cursor in each, and the compiler checks every step:
+
+```rust
+use butler::{Interrupted, Progress};
+
+#[derive(Default, Serialize, Deserialize)]
+enum Import {
+    #[default]
+    Start,
+    Records { after: u64 },       // each step carries its own typed cursor
+    Finalize,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ImportError {
+    #[error("database error")]
+    Db(#[from] DbError),
+    #[error(transparent)]
+    Interrupted(#[from] Interrupted),   // lets `?` carry an interruption
+}
+
+#[butler::job]
+async fn process_import(import_id: u64, mut progress: Progress<Import>) -> Result<(), ImportError> {
+    loop {
+        match *progress {
+            Import::Start => {
+                initialize(import_id).await?;
+                progress.set(Import::Records { after: 0 }).await?;          // checkpoint
+            }
+            Import::Records { after } => {
+                for record in records_after(import_id, after).await? {
+                    record.process().await?;
+                    progress.set(Import::Records { after: record.id }).await?; // checkpoint
+                }
+                progress.set(Import::Finalize).await?;
+            }
+            Import::Finalize => return finalize(import_id).await,
+        }
+    }
+}
+
+process_import(42).await?;   // callers don't pass the Progress: the worker does
+```
+
+- **The worker provides `Progress<S>`**: `S::default()` on the first run, the
+  last saved value when the job resumes. Read it with `*progress`, move on
+  with `progress.set(..).await?`. `progress.is_resumed()` tells a resumed run
+  from a fresh one.
+- **A checkpoint** (`set`, or `checkpoint`) records the progress, saves it to
+  the backend at most every `checkpoint_interval_ms` (1 s by default), and
+  returns `Err(Interrupted)` if the worker is stopping. Put checkpoints where
+  resuming is safe: after a unit of work is done.
+- **Worker shutdown (deploys):** on Ctrl-C, a job with a `Progress` stops at
+  its next checkpoint, and `?` carries the `Interrupted` out. The job goes
+  back on its queue with its progress, and the next worker resumes it. It
+  isn't counted as a failed attempt. Jobs without a `Progress` are still
+  waited for, as before. So a two-hour import no longer holds up a deploy for
+  two hours.
+- **Crashes:** because progress is saved periodically, a `kill -9` doesn't
+  send the job back to the start. [Crash recovery](#crashed-workers-dont-lose-jobs)
+  requeues it, and it resumes from its last saved checkpoint, at most
+  `checkpoint_interval_ms` old. Rails keeps progress only on a clean
+  interruption; the test suite kills a real worker process mid-job and checks
+  that the next one resumes without redoing anything.
+- **Retries:** a job that fails at record 900,000 retries from its last
+  checkpoint, not from zero.
+- **Changed types:** if a deploy changes `S` so saved progress no longer
+  deserializes, the job fails with a clear error (`JobError::BadProgress`)
+  rather than guessing.
+
+| ActiveJob | butler |
+|---|---|
+| `include ActiveJob::Continuable` | add a `mut progress: Progress<S>` parameter |
+| `step :name do ... end` | a variant of your `S` enum, handled in a `match` |
+| `step.cursor` / `step.advance!` / `step.set!` | fields in the variant, `progress.set(..).await?` |
+| interrupted when the adapter stops | `Err(Interrupted)` at the next checkpoint, carried by `?` |
+| test helper to interrupt during a step | `InlineJobs::new().interrupt_at_checkpoint(n)` |
+
+To test resumption, `InlineJobs::new().interrupt_at_checkpoint(n)` interrupts
+each job's first run at its `n`-th checkpoint and resumes it at once from its
+saved progress; `jobs.interruptions()` counts how often that happened.
+
 ### Testing
 
 The same helpers as ActiveJob's `TestHelper`, in `butler::testing`. Inside
@@ -791,6 +883,7 @@ max_retries = 3
 poll_interval_ms = 100       # file: how often idle workers check; redis, memory: fallback only
 heartbeat_ttl_secs = 30      # a crashed worker's jobs are requeued after this
 recover_interval_secs = 10   # how often to look for crashed workers
+checkpoint_interval_ms = 1000  # jobs with a Progress: how often it is saved
 queues = ["default"]         # or ["critical", "default"], or [["critical", 6], ["default", 1]]
 claimers = 16                # claim loops side by side (default: the number of CPUs)
 
@@ -981,6 +1074,7 @@ crates/butler/                   the library (published as `butler`)
   src/job.rs                     Job, JobId, JobState
   src/handle.rs                  JobHandle: state, cancel, wait
   src/prepared.rs                PreparedJob, enqueue_all (bulk enqueuing)
+  src/progress.rs                Progress, Interrupted (job continuations)
   src/testing.rs                 perform_enqueued_jobs, InlineJobs
   src/backend/mod.rs             Backend trait, Queue handle
   src/backend/file.rs            file backend

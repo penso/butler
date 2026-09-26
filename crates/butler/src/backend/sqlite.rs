@@ -348,6 +348,18 @@ impl Backend for SqliteQueue {
         Ok(Some((state, serde_json::from_str(&data)?)))
     }
 
+    fn checkpoint(&self, worker: &str, job: &JobRecord) -> Result<()> {
+        let data = serde_json::to_string(job)?;
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE butler_jobs SET data = ?3
+                 WHERE id = ?1 AND state = 'processing' AND worker = ?2",
+                params![job.id, worker, data],
+            )
+        })?;
+        Ok(())
+    }
+
     fn cancel(&self, id: &str) -> Result<bool> {
         let changed = self.with_conn(|conn| {
             conn.execute(

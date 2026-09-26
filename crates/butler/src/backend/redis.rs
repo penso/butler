@@ -48,6 +48,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long finished (done or cancelled) jobs stay queryable before Redis expires them.
 const DONE_TTL_SECS: u64 = 24 * 60 * 60;
 
+/// Stores a job's data (KEYS[2]) only while the job's id is still in the
+/// worker's processing list (KEYS[1]).
+const CHECKPOINT_IF_HELD: &str = r"
+if redis.call('LPOS', KEYS[1], ARGV[1]) then
+  redis.call('HSET', KEYS[2], 'data', ARGV[2])
+end
+return 0
+";
+
 /// Moves the oldest id out of a processing list (KEYS[1]) to the claim end of
 /// its own queue, and marks it pending, as one atomic step: two workers
 /// recovering at once can't move the same job, or send one to the wrong queue.
@@ -448,6 +457,23 @@ impl Backend for RedisQueue {
             state,
         })?;
         Ok(Some((state, serde_json::from_str(&data)?)))
+    }
+
+    /// Saves only if `worker` still holds the job, checked and written in one
+    /// script: after a recovery, a slow former owner can't overwrite the
+    /// progress of the job's new run.
+    fn checkpoint(&self, worker: &str, job: &JobRecord) -> Result<()> {
+        let data = serde_json::to_string(job)?;
+        self.with_conn(|con| {
+            redis::cmd("EVAL")
+                .arg(CHECKPOINT_IF_HELD)
+                .arg(2)
+                .arg(self.processing_key(worker))
+                .arg(self.job_key(&job.id))
+                .arg(&job.id)
+                .arg(&data)
+                .exec(con)
+        })
     }
 
     fn cancel(&self, id: &str) -> Result<bool> {

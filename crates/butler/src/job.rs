@@ -26,6 +26,10 @@ pub struct JobRecord {
     /// The job's output as JSON, once it is done.
     #[serde(default)]
     pub result: Option<Value>,
+    /// Saved [`Progress`](crate::Progress), for a job that resumes from its
+    /// last checkpoint.
+    #[serde(default)]
+    pub progress: Option<Value>,
 }
 
 impl JobRecord {
@@ -42,6 +46,7 @@ impl JobRecord {
             enqueued_at_ms: now.as_millis() as u64,
             last_error: None,
             result: None,
+            progress: None,
         }
     }
 }
@@ -199,6 +204,14 @@ impl<S: State> Job<S> {
 
     pub fn into_record(self) -> JobRecord {
         self.record
+    }
+}
+
+impl Job<state::Processing> {
+    /// The same job, carrying `progress` to store with it.
+    pub(crate) fn with_progress(mut self, progress: Value) -> Self {
+        self.record.progress = Some(progress);
+        self
     }
 }
 

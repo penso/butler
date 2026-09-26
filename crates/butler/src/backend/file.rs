@@ -193,6 +193,14 @@ impl Backend for FileQueue {
         Ok(Some((state, serde_json::from_slice(&fs::read(path)?)?)))
     }
 
+    fn checkpoint(&self, worker: &str, job: &JobRecord) -> Result<()> {
+        let path = self.processing(worker).join(format!("{}.json", job.id));
+        if path.exists() {
+            self.write_atomic(&path, &serde_json::to_vec_pretty(job)?)?;
+        }
+        Ok(())
+    }
+
     fn cancel(&self, id: &str) -> Result<bool> {
         let file = format!("{id}.json");
         for queue in fs::read_dir(self.dir(JobState::Pending))? {

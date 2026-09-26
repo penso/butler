@@ -30,6 +30,7 @@ mod handle;
 mod job;
 mod limits;
 mod prepared;
+mod progress;
 mod queues;
 mod signal;
 pub mod testing;
@@ -57,6 +58,7 @@ pub use job::{
     AnyJob, DEFAULT_QUEUE, Failed, Job, JobId, JobRecord, JobState, is_valid_queue_name, state,
 };
 pub use prepared::{PreparedJob, enqueue_all};
+pub use progress::{Interrupted, Progress};
 pub use queues::QueuePriority;
 pub use signal::{JobWatch, Signal};
 pub use worker::Worker;
@@ -104,7 +106,7 @@ pub struct JobDef {
     /// Set with `#[job(queue = "...")]`; [`DEFAULT_QUEUE`] otherwise.
     pub queue: &'static str,
     #[doc(hidden)]
-    pub perform: fn(Vec<serde_json::Value>) -> __private::BoxFuture,
+    pub perform: fn(progress::Invocation) -> __private::BoxFuture,
 }
 
 static QUEUE: RwLock<Option<Queue>> = RwLock::new(None);
@@ -141,6 +143,8 @@ pub mod __private {
 
     pub use inventory;
     pub use serde_json;
+
+    pub use crate::progress::{Checkpoints, Invocation};
 
     use crate::JobError;
 

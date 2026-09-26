@@ -185,17 +185,21 @@ fn failures_retry_then_die() {
 #[test]
 fn recover_requeues_only_workers_whose_heartbeat_expired() {
     for (queue, _) in backends("recover") {
+        // Long heartbeats while setting up, so "not expired yet" doesn't depend
+        // on how fast the backend is (a slow CI disk took over 50 ms here).
         queue.heartbeat("alive", Duration::from_secs(60)).unwrap();
-        queue
-            .heartbeat("crashed", Duration::from_millis(50))
-            .unwrap();
+        queue.heartbeat("crashed", Duration::from_secs(60)).unwrap();
         let held = queue.push("held", "default", vec![]).unwrap();
         queue.claim("alive", DEFAULT, NOW).unwrap().unwrap();
         let orphan = queue.push("orphan", "default", vec![]).unwrap();
         queue.claim("crashed", DEFAULT, NOW).unwrap().unwrap();
-
         assert_eq!(queue.recover().unwrap(), 0, "{}", queue.describe());
-        thread::sleep(Duration::from_millis(100));
+
+        // Now "crashed" stops: its last heartbeat expires almost at once.
+        queue
+            .heartbeat("crashed", Duration::from_millis(1))
+            .unwrap();
+        thread::sleep(Duration::from_millis(50));
         assert_eq!(queue.recover().unwrap(), 1, "{}", queue.describe());
         assert_eq!(queue.recover().unwrap(), 0, "each job moves once");
 
@@ -335,5 +339,35 @@ fn push_many_keeps_order_and_every_job_is_claimable() {
         let low = queue.claim("w", &["low"], NOW).unwrap().unwrap();
         assert_eq!((low.id(), low.name()), (ids[1].as_str(), "b"));
         assert!(queue.push_many(Vec::new()).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn saved_progress_survives_crash_recovery() {
+    for (queue, _) in backends("checkpoint") {
+        queue.heartbeat("crashed", Duration::from_secs(60)).unwrap();
+        let id = queue.push("long", "default", vec![]).unwrap();
+        let job = queue.claim("crashed", DEFAULT, NOW).unwrap().unwrap();
+        let mut record = job.into_record();
+        record.progress = Some(json!({ "after": 41 }));
+        queue.checkpoint("crashed", &record).unwrap();
+        // Another worker can't overwrite a job it doesn't hold.
+        let mut stranger = record.clone();
+        stranger.progress = Some(json!({ "after": 999 }));
+        queue.checkpoint("someone-else", &stranger).unwrap();
+
+        queue
+            .heartbeat("crashed", Duration::from_millis(1))
+            .unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(queue.recover().unwrap(), 1, "{}", queue.describe());
+        let resumed = queue.claim("new", DEFAULT, NOW).unwrap().unwrap();
+        assert_eq!(resumed.id(), id);
+        assert_eq!(
+            resumed.record().progress,
+            Some(json!({ "after": 41 })),
+            "{}",
+            queue.describe()
+        );
     }
 }

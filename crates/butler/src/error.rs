@@ -76,6 +76,11 @@ pub enum JobError {
     #[error("job output could not be serialized")]
     Output(#[source] serde_json::Error),
 
+    /// The saved progress no longer fits the job's `Progress` type, for
+    /// example after a deploy that changed it.
+    #[error("saved job progress doesn't match the job's progress type")]
+    BadProgress(#[source] serde_json::Error),
+
     #[cfg(feature = "tokio")]
     #[error("job task was cancelled")]
     Cancelled(#[source] tokio::task::JoinError),

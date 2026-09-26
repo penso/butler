@@ -6,6 +6,7 @@
 mod common;
 
 use std::{
+    path::PathBuf,
     sync::{Arc, atomic::AtomicBool, atomic::Ordering},
     thread,
     time::Duration,
@@ -14,7 +15,7 @@ use std::{
 use butler::{JobState, Worker};
 
 #[butler::job]
-async fn write_greeting(path: String, name: String, times: u32) -> std::io::Result<()> {
+async fn write_greeting(path: PathBuf, name: String, times: u32) -> std::io::Result<()> {
     std::fs::write(path, format!("hello {name} x{times}"))
 }
 
@@ -23,13 +24,11 @@ fn awaited_job_is_executed_by_worker() {
     let (queue, dir) = common::temp_queue("roundtrip");
     let out = dir.join("greeting.txt");
 
+    // Borrowed and literal arguments: `&PathBuf` for `PathBuf`, `&str` for
+    // `String`, and a bare `3` for `u32`.
+    let enqueue = write_greeting(&out, "fabien", 3);
     // `.await` only enqueues; the job does not run here.
-    let id = butler::block_on(write_greeting(
-        out.display().to_string(),
-        "fabien".into(),
-        3,
-    ))
-    .unwrap();
+    let id = butler::block_on(enqueue).unwrap();
     assert_eq!(queue.state(&id), Some(JobState::Pending));
     assert!(!out.exists(), "job must not run inline");
 

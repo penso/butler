@@ -4,8 +4,9 @@
 //! #[butler::job]
 //! async fn send_email(to: String, subject: String) { /* ... */ }
 //!
-//! // Enqueue: returns as soon as the job is persisted.
-//! let id = send_email("a@b.c".into(), "hi".into()).await?;
+//! // Enqueue: returns as soon as the job is persisted. Arguments accept
+//! // borrowed values too (see [`JobArg`]).
+//! let id = send_email("a@b.c", "hi").await?;
 //!
 //! // Elsewhere (same binary/crate that defines the jobs):
 //! butler::Worker::from_config(&butler::Config::load()?)?.run();
@@ -19,6 +20,7 @@
 //! `Worker::run_async` spawns each job as a tokio task. That lets job bodies use
 //! tokio timers, I/O, and so on.
 
+mod arg;
 mod backend;
 mod config;
 mod error;
@@ -28,6 +30,7 @@ mod worker;
 
 use std::sync::{PoisonError, RwLock};
 
+pub use arg::JobArg;
 #[cfg(feature = "redis")]
 pub use backend::RedisQueue;
 pub use backend::{Backend, FileQueue, Queue};
@@ -106,6 +109,13 @@ pub mod __private {
     pub type BoxFuture = Pin<Box<dyn Future<Output = Result<(), JobError>> + Send>>;
 
     inventory::collect!(crate::JobDef);
+
+    /// Collects the serialized arguments of one enqueue call.
+    pub fn args<const N: usize>(
+        values: [serde_json::Result<serde_json::Value>; N],
+    ) -> crate::Result<Vec<serde_json::Value>> {
+        values.into_iter().map(|v| v.map_err(Into::into)).collect()
+    }
 
     pub async fn enqueue(
         name: &'static str,

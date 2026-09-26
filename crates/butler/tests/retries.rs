@@ -40,7 +40,7 @@ fn retries_then_succeeds_or_dies() {
 
     let ok = butler::block_on(flaky(3)).unwrap();
     let dead = butler::block_on(boom()).unwrap();
-    let missing = butler::block_on(read_missing("/nonexistent/butler".into())).unwrap();
+    let missing = butler::block_on(read_missing("/nonexistent/butler")).unwrap();
 
     // flaky: 3 runs. boom and read_missing: 1 run + 2 retries each.
     assert_eq!(worker.drain().unwrap(), 9);

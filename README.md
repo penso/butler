@@ -11,7 +11,7 @@ async fn send_email(to: String, subject: String) -> Result<(), MailError> {
 }
 
 // In your app: this puts the job on the queue and returns right away.
-let job_id = send_email("ada@example.com".into(), "Welcome".into()).await?;
+let job_id = send_email("ada@example.com", "Welcome").await?;
 ```
 
 This is an MVP: the queue is either a directory of JSON files or Redis, and the
@@ -51,10 +51,15 @@ async fn send_email(to: String) -> Result<(), MailError> { smtp::send(&to).await
 the compiler sees roughly:
 
 ```rust
-// 1. What callers get: a function whose only job is to enqueue.
-async fn send_email(to: String) -> Result<JobId, butler::Error> {
-    let args = vec![serde_json::to_value(&to)?];
-    butler::__private::enqueue("send_email", args).await   // write to the queue
+// 1. What callers get: a function whose only job is to enqueue. It accepts
+//    `&str` for a `String` parameter (see "Arguments" below), converts and
+//    serializes right away, and returns a future that writes to the queue.
+fn send_email(to: impl JobArg<String>)
+    -> impl Future<Output = Result<JobId, butler::Error>> + Send + 'static
+{
+    let to: String = to.into_arg();
+    let args = butler::__private::args([serde_json::to_value(&to)]);
+    async move { butler::__private::enqueue("send_email", args?).await }
 }
 
 // 2. Your original body, under a hidden name. Only the worker calls it.
@@ -190,8 +195,25 @@ pub async fn resize_image(path: String, width: u32) -> Result<(), ImageError> { 
 pub async fn charge(customer_id: u64, cents: i64) { ... }
 ```
 
-- Arguments must be owned values that serde can serialize (`String`, not
-  `&str`). They are stored as JSON.
+- Parameters must be owned types that serde can serialize and deserialize
+  (`String`, not `&str`). They are stored as JSON.
+- Callers don't have to pass owned values, though. Each parameter of type `T`
+  accepts anything implementing `butler::JobArg<T>`: `T` itself, `&T` for any
+  `T: Clone`, plus these conversions:
+
+  | Parameter | Also accepts |
+  |---|---|
+  | `String` | `&str`, `Cow<str>`, `Box<str>` |
+  | `PathBuf` | `&Path`, `&str` |
+  | `Vec<T>` | `&[T]` |
+
+  So `send_email("ada@example.com", "Welcome", 3)` works for
+  `send_email(to: String, subject: String, retries: u32)`. This is narrower than
+  `Into<T>` on purpose: with `impl Into<u32>`, a bare `3` doesn't compile. It
+  also means `"text".into()` at a call site is now ambiguous; drop the `.into()`.
+- The arguments are converted and serialized when you call the function, so the
+  returned future is `Send + 'static` and never borrows them. You can pass it
+  to `tokio::spawn`.
 - The function may return `()`, `anyhow::Result<T>`, or `Result<T, E>` for any
   error type `E` that converts into `anyhow::Error`. An `Err` or a panic counts
   as a failure and triggers a retry. The error's full context chain

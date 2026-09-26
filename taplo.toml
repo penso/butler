@@ -3,6 +3,9 @@
 # Command Palette, and chose "Reload Window".
 #
 # https://taplo.tamasfe.dev/configuration/formatter-options.html
+# Build output, including the manifests `cargo publish --dry-run` generates.
+exclude = ["target/**"]
+
 [formatting]
 align_comments        = false
 align_entries         = true

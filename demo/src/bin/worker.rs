@@ -6,7 +6,7 @@
 //! Backend and worker settings come from ./config.toml (see butler::Config).
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     let config = butler::Config::load()?;
     let worker = butler::Worker::from_config(&config)?.register(demo::process_tick::JOB);
     println!(

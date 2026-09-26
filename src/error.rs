@@ -1,62 +1,28 @@
-use std::fmt;
-
-#[derive(Debug)]
+/// Errors from the queue itself: storage, serialization, configuration.
+/// Failures inside a job body are not `Error`s. They go into the job record as
+/// `last_error` and trigger a retry.
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    Io(std::io::Error),
-    Json(serde_json::Error),
-    Config(config::ConfigError),
+    #[error("queue I/O failed")]
+    Io(#[from] std::io::Error),
+
+    #[error("job (de)serialization failed")]
+    Json(#[from] serde_json::Error),
+
+    #[error("invalid configuration")]
+    Config(#[from] config::ConfigError),
+
     #[cfg(feature = "redis")]
-    Redis(redis::RedisError),
-    Backend(String),
-}
+    #[error("redis operation failed")]
+    Redis(#[from] redis::RedisError),
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Io(e) => write!(f, "queue io error: {e}"),
-            Error::Json(e) => write!(f, "job serialization error: {e}"),
-            Error::Config(e) => write!(f, "config error: {e}"),
-            #[cfg(feature = "redis")]
-            Error::Redis(e) => write!(f, "redis error: {e}"),
-            Error::Backend(e) => write!(f, "queue error: {e}"),
-        }
-    }
-}
+    #[cfg(feature = "tokio")]
+    #[error("blocking queue task did not complete")]
+    Join(#[from] tokio::task::JoinError),
 
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Error::Io(e) => Some(e),
-            Error::Json(e) => Some(e),
-            Error::Config(e) => Some(e),
-            #[cfg(feature = "redis")]
-            Error::Redis(e) => Some(e),
-            Error::Backend(_) => None,
-        }
-    }
-}
+    #[error("job {id} has unknown state `{state}`")]
+    UnknownState { id: String, state: String },
 
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Error::Io(e)
-    }
-}
-
-impl From<serde_json::Error> for Error {
-    fn from(e: serde_json::Error) -> Self {
-        Error::Json(e)
-    }
-}
-
-impl From<config::ConfigError> for Error {
-    fn from(e: config::ConfigError) -> Self {
-        Error::Config(e)
-    }
-}
-
-#[cfg(feature = "redis")]
-impl From<redis::RedisError> for Error {
-    fn from(e: redis::RedisError) -> Self {
-        Error::Redis(e)
-    }
+    #[error("config selects the `{0}` backend, but butler was built without the `{0}` feature")]
+    BackendDisabled(&'static str),
 }

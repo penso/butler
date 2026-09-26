@@ -39,20 +39,21 @@ pub use job::{Job, JobId, JobState};
 pub use worker::Worker;
 
 /// Converts a job's return value into success or failure. Implemented for `()`
-/// and for `Result<T, E: Display>`.
+/// and for `Result<T, E>` where `E` converts into `anyhow::Error`: any
+/// `std::error::Error + Send + Sync`, or `anyhow::Error` itself.
 pub trait IntoJobResult {
-    fn into_job_result(self) -> Result<(), String>;
+    fn into_job_result(self) -> anyhow::Result<()>;
 }
 
 impl IntoJobResult for () {
-    fn into_job_result(self) -> Result<(), String> {
+    fn into_job_result(self) -> anyhow::Result<()> {
         Ok(())
     }
 }
 
-impl<T, E: std::fmt::Display> IntoJobResult for Result<T, E> {
-    fn into_job_result(self) -> Result<(), String> {
-        self.map(|_| ()).map_err(|e| e.to_string())
+impl<T, E: Into<anyhow::Error>> IntoJobResult for Result<T, E> {
+    fn into_job_result(self) -> anyhow::Result<()> {
+        self.map(|_| ()).map_err(Into::into)
     }
 }
 
@@ -92,10 +93,12 @@ pub fn queue() -> Result<Queue, Error> {
 pub mod __private {
     use std::{future::Future, pin::Pin};
 
+    use anyhow::Context;
+
     pub use inventory;
     pub use serde_json;
 
-    pub type BoxFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+    pub type BoxFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
 
     inventory::collect!(crate::JobDef);
 
@@ -107,10 +110,7 @@ pub mod __private {
         // Inside a tokio runtime, keep the file I/O off the async worker threads.
         #[cfg(feature = "tokio")]
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            return handle
-                .spawn_blocking(move || queue.push(name, args))
-                .await
-                .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+            return handle.spawn_blocking(move || queue.push(name, args)).await?;
         }
         queue.push(name, args)
     }
@@ -119,10 +119,10 @@ pub mod __private {
         args: &mut impl Iterator<Item = serde_json::Value>,
         job: &str,
         index: usize,
-    ) -> Result<T, String> {
+    ) -> anyhow::Result<T> {
         let value = args
             .next()
-            .ok_or_else(|| format!("{job}: missing argument #{index}"))?;
-        serde_json::from_value(value).map_err(|e| format!("{job}: bad argument #{index}: {e}"))
+            .with_context(|| format!("{job}: missing argument #{index}"))?;
+        serde_json::from_value(value).with_context(|| format!("{job}: bad argument #{index}"))
     }
 }

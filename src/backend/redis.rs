@@ -156,7 +156,7 @@ impl Backend for RedisQueue {
             return Ok(None);
         };
         let state = JobState::parse(&state)
-            .ok_or_else(|| Error::Backend(format!("job {id} has unknown state `{state}`")))?;
+            .ok_or_else(|| Error::UnknownState { id: id.to_string(), state })?;
         Ok(Some((state, serde_json::from_str(&data)?)))
     }
 

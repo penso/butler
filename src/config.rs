@@ -133,9 +133,7 @@ impl Config {
                 Ok(crate::RedisQueue::connect(&redis.url, &redis.prefix)?.into())
             }
             #[cfg(not(feature = "redis"))]
-            BackendKind::Redis => Err(Error::Backend(
-                "config selects the redis backend, but butler was built without the `redis` feature".into(),
-            )),
+            BackendKind::Redis => Err(Error::BackendDisabled("redis")),
         }
     }
 }

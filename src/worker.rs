@@ -9,6 +9,8 @@ use std::{
     time::Duration,
 };
 
+use anyhow::{Context, anyhow};
+
 use crate::{
     Config, Job, JobDef, JobState, Queue, WorkerConfig, block_on,
     __private::BoxFuture,
@@ -109,7 +111,7 @@ impl Worker {
                             Ok(true) => {}
                             Ok(false) => thread::sleep(worker.poll_interval),
                             Err(e) => {
-                                eprintln!("butler: queue error: {e}");
+                                eprintln!("butler: queue error: {:#}", anyhow::Error::from(e));
                                 thread::sleep(worker.poll_interval);
                             }
                         }
@@ -142,7 +144,7 @@ impl Worker {
             Ok(handler) => {
                 let fut = handler(job.args.clone());
                 catch_unwind(AssertUnwindSafe(|| block_on(fut)))
-                    .unwrap_or_else(|panic| Err(format!("job panicked: {}", panic_message(&*panic))))
+                    .unwrap_or_else(|panic| Err(anyhow!("job panicked: {}", panic_message(&*panic))))
             }
             Err(e) => Err(e),
         };
@@ -150,18 +152,20 @@ impl Worker {
         Ok(true)
     }
 
-    fn handler(&self, job: &Job) -> Result<Handler, String> {
+    fn handler(&self, job: &Job) -> anyhow::Result<Handler> {
         self.handlers
             .get(job.name.as_str())
             .copied()
-            .ok_or_else(|| format!("no job named `{}` is registered in this worker", job.name))
+            .with_context(|| format!("no job named `{}` is registered in this worker", job.name))
     }
 
     /// Stores the outcome: `done/` on success, otherwise a retry or `dead/`.
-    fn finish(&self, job: Job, result: Result<(), String>) -> Result<(), crate::Error> {
+    /// The error's full chain (`{:#}`) becomes the job's `last_error`.
+    fn finish(&self, job: Job, result: anyhow::Result<()>) -> Result<(), crate::Error> {
         match result {
             Ok(()) => self.queue.complete(&job),
             Err(err) => {
+                let err = format!("{err:#}");
                 let (name, id) = (job.name.clone(), job.id.clone());
                 let state = self.queue.fail(job, err.clone(), self.max_retries)?;
                 let verb = if state == JobState::Dead { "is dead" } else { "will retry" };
@@ -196,7 +200,7 @@ impl Worker {
             let queue = self.queue.clone();
             let claimed = tokio::task::spawn_blocking(move || queue.claim())
                 .await
-                .unwrap_or_else(|e| Err(crate::Error::Io(std::io::Error::other(e))));
+                .unwrap_or_else(|e| Err(e.into()));
 
             match claimed {
                 Ok(Some(job)) => {
@@ -208,7 +212,7 @@ impl Worker {
                 }
                 Ok(None) | Err(_) => {
                     if let Err(e) = claimed {
-                        eprintln!("butler: queue error: {e}");
+                        eprintln!("butler: queue error: {:#}", anyhow::Error::from(e));
                     }
                     drop(permit);
                     tokio::select! {
@@ -229,17 +233,20 @@ impl Worker {
             Ok(handler) => match tokio::spawn(handler(job.args.clone())).await {
                 Ok(result) => result,
                 Err(e) if e.is_panic() => {
-                    Err(format!("job panicked: {}", panic_message(&*e.into_panic())))
+                    Err(anyhow!("job panicked: {}", panic_message(&*e.into_panic())))
                 }
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(anyhow::Error::from(e).context("job task was cancelled")),
             },
             Err(e) => Err(e),
         };
 
         let worker = self.clone();
-        let stored = tokio::task::spawn_blocking(move || worker.finish(job, result)).await;
-        if let Err(e) = stored.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())) {
-            eprintln!("butler: could not store job result: {e}");
+        let stored = tokio::task::spawn_blocking(move || worker.finish(job, result))
+            .await
+            .map_err(crate::Error::from)
+            .and_then(|r| r);
+        if let Err(e) = stored {
+            eprintln!("butler: could not store job result: {:#}", anyhow::Error::from(e));
         }
     }
 }

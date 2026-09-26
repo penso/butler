@@ -6,7 +6,7 @@
 use std::time::{Duration, Instant};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     let queue = butler::Config::load()?.connect()?;
     println!("[injector {}] queue: {}", std::process::id(), queue.describe());
     butler::configure(queue);

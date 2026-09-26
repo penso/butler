@@ -17,8 +17,8 @@ async fn redis_sleepy_write(path: String) -> std::io::Result<()> {
 }
 
 #[butler::job]
-async fn redis_always_fails() -> Result<(), String> {
-    Err("nope".into())
+async fn redis_always_fails() -> anyhow::Result<()> {
+    anyhow::bail!("nope")
 }
 
 #[tokio::test(flavor = "multi_thread")]

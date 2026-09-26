@@ -192,8 +192,10 @@ pub async fn charge(customer_id: u64, cents: i64) { ... }
 
 - Arguments must be owned values that serde can serialize (`String`, not
   `&str`). They are stored as JSON.
-- The function may return `()` or `Result<T, E>` where `E: Display`. An `Err`
-  or a panic counts as a failure and triggers a retry.
+- The function may return `()`, `anyhow::Result<T>`, or `Result<T, E>` for any
+  error type `E` that converts into `anyhow::Error`. An `Err` or a panic counts
+  as a failure and triggers a retry. The error's full context chain
+  (`format!("{e:#}")`) is saved as the job's `last_error`.
 - The body must be `Send`, because the tokio worker runs each job as its own
   `tokio::spawn` task.
 

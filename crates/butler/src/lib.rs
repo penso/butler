@@ -28,7 +28,11 @@ mod error;
 mod executor;
 mod handle;
 mod job;
+mod limits;
+mod prepared;
 mod queues;
+mod signal;
+pub mod testing;
 mod worker;
 
 use std::sync::{PoisonError, RwLock};
@@ -38,16 +42,23 @@ use serde::{Serialize, de::DeserializeOwned};
 pub use arg::JobArg;
 #[cfg(feature = "redis")]
 pub use backend::RedisQueue;
-pub use backend::{Backend, FileQueue, MemoryQueue, Queue};
+pub use backend::{Backend, FileQueue, MemoryQueue, NewJob, Queue};
+#[cfg(feature = "sqlite")]
+pub use backend::{SQLITE_WATCH_TICK, SqliteQueue};
 pub use butler_macros::job;
 pub use config::{
-    BackendKind, Config, FileConfig, QueueConfig, QueueEntry, RedisConfig, WorkerConfig,
+    BackendKind, Config, FileConfig, QueueConfig, QueueEntry, RedisConfig, SqliteConfig,
+    WorkerConfig,
 };
 pub use error::{BoxError, Error, JobError, Result};
 pub use executor::block_on;
 pub use handle::JobHandle;
-pub use job::{DEFAULT_QUEUE, Job, JobId, JobState, is_valid_queue_name};
+pub use job::{
+    AnyJob, DEFAULT_QUEUE, Failed, Job, JobId, JobRecord, JobState, is_valid_queue_name, state,
+};
+pub use prepared::{PreparedJob, enqueue_all};
 pub use queues::QueuePriority;
+pub use signal::{JobWatch, Signal};
 pub use worker::Worker;
 
 /// Converts a job's return value into its output or a failure.
@@ -175,9 +186,26 @@ pub mod __private {
         job: &'static crate::JobDef,
         args: Vec<serde_json::Value>,
     ) -> crate::Result<crate::JobHandle<T>> {
+        enqueue_on(job, job.queue, args).await
+    }
+
+    /// Like [`enqueue`], on `queue` rather than the job's own.
+    pub async fn enqueue_on<T>(
+        job: &'static crate::JobDef,
+        queue_name: &str,
+        args: Vec<serde_json::Value>,
+    ) -> crate::Result<crate::JobHandle<T>> {
+        // Inside `testing::perform_enqueued_jobs`: run it now, no queue.
+        if let Some(inline) = crate::testing::current() {
+            return inline.run(job, queue_name, args).await;
+        }
+        let queue_name = queue_name.to_owned();
         let queue = crate::queue()?;
         let pushing = queue.clone();
-        let id = crate::executor::unblock(move || pushing.push(job.name, job.queue, args)).await?;
+        let id = crate::executor::unblock(queue.blocks(), move || {
+            pushing.push(job.name, &queue_name, args)
+        })
+        .await?;
         Ok(crate::JobHandle::new(queue, id))
     }
 

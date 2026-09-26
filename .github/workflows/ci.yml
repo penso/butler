@@ -64,6 +64,7 @@ jobs:
           cargo clippy --locked -p butler --all-targets --no-default-features -- -D warnings
           cargo clippy --locked -p butler --all-targets --no-default-features --features tokio -- -D warnings
           cargo clippy --locked -p butler --all-targets --no-default-features --features redis -- -D warnings
+          cargo clippy --locked -p butler --all-targets --no-default-features --features sqlite -- -D warnings
       - name: Test default features
         run: cargo test --locked --workspace
       - name: Test without optional features

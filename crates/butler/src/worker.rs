@@ -10,11 +10,40 @@ use std::{
 };
 
 use crate::{
-    __private::BoxFuture, Config, Job, JobDef, JobError, JobState, Queue, QueuePriority, Result,
-    WorkerConfig, block_on, error::Chain, executor::panic_message,
+    __private::BoxFuture,
+    Config, Failed, Job, JobDef, JobError, Queue, QueuePriority, Result, WorkerConfig, block_on,
+    error::Chain,
+    executor::panic_message,
+    limits::{Permit, QueueLimits},
+    state::Processing,
 };
 
 type Handler = fn(Vec<serde_json::Value>) -> BoxFuture;
+
+/// What one pass of a worker thread did.
+enum Step {
+    Ran,
+    /// Nothing waiting on the queues it could take from.
+    Idle,
+    /// Only limited queues could have work, and they are full.
+    Throttled,
+}
+
+/// The outcome of [`Worker::claim_limited`].
+enum Claimed {
+    /// A job, with its place in its queue's limit.
+    Job(Job<Processing>, Permit),
+    /// No job; `throttled` if some queue was skipped for being full.
+    Nothing { throttled: bool },
+}
+
+/// `run` spends one OS thread per job slot, so it caps them here; tokio tasks
+/// in `run_async` have no such cost.
+const MAX_THREADS: usize = 512;
+
+/// While a queue is skipped for being at its limit, idle claims re-check
+/// this often, so a freed slot is used within about this long.
+const LIMITED_RECHECK: Duration = Duration::from_millis(10);
 
 /// How often the keeper wakes to check whether a heartbeat or a recovery pass
 /// is due. The checks themselves are throttled; this only bounds the latency.
@@ -33,6 +62,8 @@ pub struct Worker {
     handlers: Arc<HashMap<&'static str, Handler>>,
     id: Arc<str>,
     queues: QueuePriority,
+    limits: QueueLimits,
+    claimers: usize,
     concurrency: usize,
     max_retries: u32,
     poll_interval: Duration,
@@ -71,6 +102,8 @@ impl Worker {
             handlers: Arc::new(handlers),
             id: new_worker_id().into(),
             queues: defaults.priority(),
+            limits: QueueLimits::default(),
+            claimers: defaults.claimers,
             concurrency: defaults.concurrency,
             max_retries: defaults.max_retries,
             poll_interval: defaults.poll_interval(),
@@ -81,8 +114,14 @@ impl Worker {
     }
 
     pub fn with_config(self, config: &WorkerConfig) -> Self {
-        self.queues(config.priority())
+        let worker = config
+            .queue_limits
+            .iter()
+            .fold(self, |worker, (queue, max)| worker.queue_limit(queue, *max));
+        worker
+            .queues(config.priority())
             .concurrency(config.concurrency)
+            .claimers(config.claimers)
             .max_retries(config.max_retries)
             .poll_interval(config.poll_interval())
             .heartbeat_ttl(config.heartbeat_ttl())
@@ -117,6 +156,30 @@ impl Worker {
         &self.queues
     }
 
+    /// How many claim loops `run_async` runs side by side. Each takes one job
+    /// at a time from the backend, so more of them start jobs faster: this is
+    /// what lets a high `concurrency` actually fill up. Defaults to the number
+    /// of CPUs; raise it for Redis, where each claim is a network round trip.
+    pub fn claimers(mut self, n: usize) -> Self {
+        self.claimers = n.max(1);
+        self
+    }
+
+    /// Caps how many jobs from `queue` run at once, on top of the overall
+    /// [`concurrency`](Worker::concurrency). When `queue` is at its limit, the
+    /// worker skips it and keeps taking jobs from its other queues.
+    pub fn queue_limit(mut self, queue: &str, max: usize) -> Self {
+        self.limits.set(queue, max);
+        self
+    }
+
+    /// The per-queue limits, sorted by queue name.
+    pub fn queue_limits(&self) -> Vec<(&str, usize)> {
+        let mut limits: Vec<_> = self.limits.limits().collect();
+        limits.sort_unstable();
+        limits
+    }
+
     /// Sets how many jobs run at the same time (threads for `run`, tasks for
     /// `run_async`). Defaults to the number of CPUs. Async jobs that mostly wait
     /// on I/O can go much higher; for CPU-bound sync jobs, the CPU count is right.
@@ -130,8 +193,10 @@ impl Worker {
         self
     }
 
-    /// How long to wait for a job before checking again. Redis blocks for up
-    /// to this long, so new jobs start right away; the file backend sleeps.
+    /// The longest an idle claim waits before checking the queues again. Redis
+    /// (pub/sub) and memory wake claims the moment a job arrives, so there it
+    /// is only a fallback; the file backend can't be woken, so it polls at
+    /// this interval.
     pub fn poll_interval(mut self, d: Duration) -> Self {
         self.poll_interval = d;
         self
@@ -178,7 +243,17 @@ impl Worker {
             })
         };
 
-        let threads: Vec<_> = (0..self.concurrency)
+        let threads = if self.concurrency > MAX_THREADS {
+            tracing::warn!(
+                concurrency = self.concurrency,
+                threads = MAX_THREADS,
+                "run() uses one OS thread per job slot; capping threads (use run_async for high concurrency)"
+            );
+            MAX_THREADS
+        } else {
+            self.concurrency
+        };
+        let threads: Vec<_> = (0..threads)
             .map(|_| {
                 let worker = self.clone();
                 let stop = Arc::clone(&stop);
@@ -186,11 +261,14 @@ impl Worker {
                     while !stop.load(Ordering::Relaxed) {
                         let started = Instant::now();
                         match worker.work_one_within(worker.poll_interval) {
-                            Ok(true) => {}
-                            Ok(false) => {
+                            Ok(Step::Ran) => {}
+                            Ok(Step::Idle) => {
                                 thread::sleep(
                                     worker.poll_interval.saturating_sub(started.elapsed()),
                                 );
+                            }
+                            Ok(Step::Throttled) => {
+                                thread::sleep(LIMITED_RECHECK.saturating_sub(started.elapsed()));
                             }
                             Err(err) => {
                                 tracing::error!(error = %Chain(&err), "queue error");
@@ -223,22 +301,21 @@ impl Worker {
         Ok(n)
     }
 
-    /// Claims and runs one job, without waiting. Returns `Ok(false)` if the
-    /// queue was empty.
+    /// Claims and runs one job, without waiting. Returns `Ok(false)` if there
+    /// was none it could start.
     pub fn work_one(&self) -> Result<bool> {
-        self.work_one_within(Duration::ZERO)
+        Ok(matches!(self.work_one_within(Duration::ZERO)?, Step::Ran))
     }
 
-    fn work_one_within(&self, wait: Duration) -> Result<bool> {
+    fn work_one_within(&self, wait: Duration) -> Result<Step> {
         self.upkeep(false)?;
-        let Some(job) = self
-            .queue
-            .claim(&self.id, &self.queues.claim_order(), wait)?
-        else {
-            return Ok(false);
+        let (job, permit) = match self.claim_limited(wait)? {
+            Claimed::Job(job, permit) => (job, permit),
+            Claimed::Nothing { throttled: true } => return Ok(Step::Throttled),
+            Claimed::Nothing { throttled: false } => return Ok(Step::Idle),
         };
         let result = self.handler(&job).and_then(|handler| {
-            let fut = handler(job.args.clone());
+            let fut = handler(job.args().to_vec());
             catch_unwind(AssertUnwindSafe(|| block_on(fut))).unwrap_or_else(|panic| {
                 Err(JobError::Panicked {
                     message: panic_message(&*panic),
@@ -246,7 +323,41 @@ impl Worker {
             })
         });
         self.finish(job, result)?;
-        Ok(true)
+        drop(permit);
+        Ok(Step::Ran)
+    }
+
+    /// Claims from the queues that have room, reserving a slot in each limited
+    /// one first so a job is only taken when it can start. Keeps the slot of
+    /// the job's queue and releases the others.
+    fn claim_limited(&self, wait: Duration) -> Result<Claimed> {
+        let mut reserved: Vec<(&str, Permit)> = Vec::new();
+        let mut skipped = false;
+        for queue in self.queues.claim_order() {
+            match self.limits.try_acquire(queue) {
+                Some(permit) => reserved.push((queue, permit)),
+                None => skipped = true,
+            }
+        }
+        if reserved.is_empty() {
+            return Ok(Claimed::Nothing { throttled: true });
+        }
+        // A waiting claim can't see a slot free up on a skipped queue, so keep
+        // waits short while any queue is full.
+        let wait = if skipped {
+            wait.min(LIMITED_RECHECK)
+        } else {
+            wait
+        };
+        let queues: Vec<&str> = reserved.iter().map(|(queue, _)| *queue).collect();
+        let Some(job) = self.queue.claim(&self.id, &queues, wait)? else {
+            return Ok(Claimed::Nothing { throttled: skipped });
+        };
+        let permit = reserved
+            .into_iter()
+            .find(|(queue, _)| *queue == job.queue())
+            .map_or(Permit::Unlimited, |(_, permit)| permit);
+        Ok(Claimed::Job(job, permit))
     }
 
     /// Refreshes the heartbeat and recovers stopped workers' jobs, each only
@@ -299,32 +410,43 @@ impl Worker {
         }
     }
 
-    fn handler(&self, job: &Job) -> Result<Handler, JobError> {
+    fn handler(&self, job: &Job<Processing>) -> Result<Handler, JobError> {
         self.handlers
-            .get(job.name.as_str())
+            .get(job.name())
             .copied()
             .ok_or_else(|| JobError::UnknownJob {
-                name: job.name.clone(),
+                name: job.name().to_owned(),
             })
     }
 
     /// Stores the outcome: `done` with the job's output, otherwise a retry or
     /// `dead`. The error's full cause chain becomes the job's `last_error`.
-    fn finish(&self, mut job: Job, result: Result<serde_json::Value, JobError>) -> Result<()> {
+    fn finish(
+        &self,
+        job: Job<Processing>,
+        result: Result<serde_json::Value, JobError>,
+    ) -> Result<()> {
         let err = match result {
             Ok(output) => {
-                job.result = Some(output);
-                return self.queue.complete(&self.id, &job);
+                self.queue.complete(&self.id, job, output)?;
+                return Ok(());
             }
             Err(err) => err,
         };
-        let (name, id) = (job.name.clone(), job.id.clone());
         let error = Chain(&err).to_string();
         match self.queue.fail(&self.id, job, error, self.max_retries)? {
-            JobState::Dead => {
-                tracing::error!(job = name, id, error = %Chain(&err), "job failed and is dead")
-            }
-            _ => tracing::warn!(job = name, id, error = %Chain(&err), "job failed and will retry"),
+            Failed::Dead(job) => tracing::error!(
+                job = job.name(),
+                id = job.id(),
+                error = %Chain(&err),
+                "job failed and is dead"
+            ),
+            Failed::Retry(job) => tracing::warn!(
+                job = job.name(),
+                id = job.id(),
+                error = %Chain(&err),
+                "job failed and will retry"
+            ),
         }
         Ok(())
     }
@@ -359,58 +481,24 @@ impl Worker {
             }
         });
 
+        // One permit per job allowed to run at once. Job tasks hold theirs
+        // until they finish, so getting every permit back means they all have.
         let permits = Arc::new(Semaphore::new(self.concurrency));
-        let mut running = JoinSet::new();
-        let mut shutdown = std::pin::pin!(shutdown);
-
-        loop {
-            // The semaphore is never closed, so acquiring only fails if that changes.
-            let permit = tokio::select! {
-                _ = &mut shutdown => break,
-                permit = Arc::clone(&permits).acquire_owned() => match permit {
-                    Ok(permit) => permit,
-                    Err(_) => break,
-                },
-            };
-
-            // Not raced against `shutdown`: once a claim has started, it must
-            // finish, or the job would sit in this worker's processing area
-            // until recovery. Redis blocks here for up to `poll_interval`.
-            let started = Instant::now();
-            let worker = self.clone();
-            let claimed = tokio::task::spawn_blocking(move || {
-                worker.queue.claim(
-                    &worker.id,
-                    &worker.queues.claim_order(),
-                    worker.poll_interval,
-                )
-            })
-            .await
-            .unwrap_or_else(|e| Err(e.into()));
-
-            match claimed {
-                Ok(Some(job)) => {
-                    let worker = self.clone();
-                    running.spawn(async move {
-                        worker.execute_async(job).await;
-                        drop(permit);
-                    });
-                }
-                Ok(None) | Err(_) => {
-                    if let Err(err) = claimed {
-                        tracing::error!(error = %Chain(&err), "queue error");
-                    }
-                    drop(permit);
-                    tokio::select! {
-                        _ = &mut shutdown => break,
-                        _ = tokio::time::sleep(self.poll_interval.saturating_sub(started.elapsed())) => {}
-                    }
-                }
-            }
-            while running.try_join_next().is_some() {}
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let mut claimers = JoinSet::new();
+        for _ in 0..self.claimers.min(self.concurrency) {
+            claimers.spawn(
+                self.clone()
+                    .claim_loop(Arc::clone(&permits), stopped.clone()),
+            );
         }
 
-        while running.join_next().await.is_some() {}
+        shutdown.await;
+        let _ = stop.send(true);
+        while claimers.join_next().await.is_some() {}
+        let all = u32::try_from(self.concurrency).unwrap_or(u32::MAX);
+        drop(permits.acquire_many(all).await);
+
         keeper.abort();
         let worker = self.clone();
         if let Err(err) = tokio::task::spawn_blocking(move || worker.log_retire()).await {
@@ -418,14 +506,70 @@ impl Worker {
         }
     }
 
+    /// Claims jobs and spawns each as its own task, until `stopped` turns true.
+    /// Several of these run side by side; the global and per-queue limits are
+    /// shared, so together they never exceed either.
+    async fn claim_loop(
+        self,
+        permits: Arc<tokio::sync::Semaphore>,
+        mut stopped: tokio::sync::watch::Receiver<bool>,
+    ) {
+        loop {
+            // The semaphore is never closed, so acquiring only fails if that changes.
+            let permit = tokio::select! {
+                _ = stopped.wait_for(|stop| *stop) => break,
+                permit = Arc::clone(&permits).acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                },
+            };
+
+            // Not raced against `stopped`: once a claim has started, it must
+            // finish, or the job would sit in this worker's processing area
+            // until recovery. It waits here for up to `poll_interval`.
+            let started = Instant::now();
+            let worker = self.clone();
+            let claimed =
+                tokio::task::spawn_blocking(move || worker.claim_limited(worker.poll_interval))
+                    .await
+                    .unwrap_or_else(|e| Err(e.into()));
+
+            match claimed {
+                Ok(Claimed::Job(job, queue_permit)) => {
+                    let worker = self.clone();
+                    tokio::spawn(async move {
+                        worker.execute_async(job).await;
+                        drop(queue_permit);
+                        drop(permit);
+                    });
+                }
+                nothing => {
+                    drop(permit);
+                    let pause = match nothing {
+                        Ok(Claimed::Nothing { throttled: true }) => LIMITED_RECHECK,
+                        Ok(_) => self.poll_interval,
+                        Err(err) => {
+                            tracing::error!(error = %Chain(&err), "queue error");
+                            self.poll_interval
+                        }
+                    };
+                    tokio::select! {
+                        _ = stopped.wait_for(|stop| *stop) => break,
+                        _ = tokio::time::sleep(pause.saturating_sub(started.elapsed())) => {}
+                    }
+                }
+            }
+        }
+    }
+
     fn log_upkeep_error(&self, err: &crate::Error) {
         tracing::error!(worker = %self.id, error = %Chain(err), "heartbeat or recovery failed");
     }
 
-    async fn execute_async(&self, job: Job) {
+    async fn execute_async(&self, job: Job<Processing>) {
         let result = match self.handler(&job) {
             // A separate task, so a panic in the job surfaces as a JoinError.
-            Ok(handler) => match tokio::spawn(handler(job.args.clone())).await {
+            Ok(handler) => match tokio::spawn(handler(job.args().to_vec())).await {
                 Ok(result) => result,
                 Err(e) if e.is_panic() => Err(JobError::Panicked {
                     message: panic_message(&*e.into_panic()),
@@ -436,10 +580,8 @@ impl Worker {
         };
 
         let worker = self.clone();
-        let stored = tokio::task::spawn_blocking(move || worker.finish(job, result))
-            .await
-            .map_err(crate::Error::from)
-            .and_then(|stored| stored);
+        let stored =
+            crate::executor::unblock(self.queue.blocks(), move || worker.finish(job, result)).await;
         if let Err(err) = stored {
             tracing::error!(error = %Chain(&err), "could not store job result");
         }

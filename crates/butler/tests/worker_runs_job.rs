@@ -32,7 +32,7 @@ fn awaited_job_is_executed_by_worker() {
     assert_eq!(queue.state(job.id()), Some(JobState::Pending));
     assert!(!out.exists(), "job must not run inline");
 
-    let (_, record) = queue.get(job.id()).unwrap().unwrap();
+    let (_, record) = queue.get(job.id()).unwrap().unwrap().into_parts();
     assert_eq!(record.name, "write_greeting");
     assert_eq!(record.args[1], "fabien");
 

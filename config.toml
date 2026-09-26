@@ -2,10 +2,13 @@
 # Environment variables override any key, e.g. BUTLER_QUEUE__BACKEND=file.
 
 [queue]
-backend = "redis" # "file" or "redis"
+backend = "redis" # "redis", "sqlite", "file", or "memory" (in-process only)
 
 [queue.file]
 dir = ".butler"
+
+[queue.sqlite]
+path = "butler.db"
 
 [queue.redis]
 prefix = "butler"
@@ -20,3 +23,7 @@ recover_interval_secs = 10
 # Weighted: "critical" comes first 3 times out of 4. A plain list like
 # ["critical", "default"] would be strict priority instead.
 queues = [["critical", 3], ["default", 1]]
+
+# Optional caps on jobs running at once, per queue, on top of `concurrency`.
+# [worker.queue_limits]
+# mailers = 20

@@ -5,6 +5,8 @@ mod file;
 mod memory;
 #[cfg(feature = "redis")]
 mod redis;
+#[cfg(feature = "sqlite")]
+mod sqlite;
 
 use std::{sync::Arc, time::Duration};
 
@@ -12,8 +14,13 @@ use serde_json::Value;
 
 #[cfg(feature = "redis")]
 pub use self::redis::RedisQueue;
+#[cfg(feature = "sqlite")]
+pub use self::sqlite::{SqliteQueue, WATCH_TICK as SQLITE_WATCH_TICK};
 pub use self::{file::FileQueue, memory::MemoryQueue};
-use crate::{Job, JobId, JobState, Result};
+use crate::{
+    AnyJob, Failed, Job, JobId, JobRecord, JobState, Result, Signal,
+    state::{Done, Processing},
+};
 
 /// Storage for jobs. Methods block; async callers run them through
 /// `spawn_blocking`.
@@ -27,20 +34,31 @@ pub trait Backend: Send + Sync + 'static {
     /// Stores a new pending job on `queue` and returns its id.
     fn push(&self, name: &str, queue: &str, args: Vec<Value>) -> Result<JobId>;
 
+    /// Stores many new pending jobs, in order, and returns their ids in the
+    /// same order. Backends that can should do it in one step (one round
+    /// trip, one transaction); the default pushes them one by one.
+    fn push_many(&self, jobs: Vec<NewJob>) -> Result<Vec<JobId>> {
+        jobs.into_iter()
+            .map(|job| self.push(&job.name, &job.queue, job.args))
+            .collect()
+    }
+
     /// Atomically moves the oldest pending job of the first non-empty queue in
     /// `queues` into `worker`'s processing area, so no other worker can take
-    /// it. May block up to `wait` for a job to arrive; backends that can't
-    /// block return `None` right away.
-    fn claim(&self, worker: &str, queues: &[&str], wait: Duration) -> Result<Option<Job>>;
+    /// it. May wait up to `wait` for a job to arrive on any of `queues`, and
+    /// should return as soon as one does; backends that can't wait return
+    /// `None` right away, and the worker polls them instead.
+    fn claim(&self, worker: &str, queues: &[&str], wait: Duration) -> Result<Option<JobRecord>>;
 
     /// Marks a job `worker` claimed as done.
-    fn complete(&self, worker: &str, job: &Job) -> Result<()>;
+    fn complete(&self, worker: &str, job: &JobRecord) -> Result<()>;
 
-    /// Records a failure and returns the job's new state: `Pending` to retry,
-    /// or `Dead` once it has failed more than `max_retries` times.
-    fn fail(&self, worker: &str, job: Job, error: String, max_retries: u32) -> Result<JobState>;
+    /// Stores a failed attempt of a job `worker` claimed. `job` already carries
+    /// the new attempt count and error; `next` is `Pending` (back on its queue
+    /// for a retry) or `Dead`.
+    fn fail(&self, worker: &str, job: &JobRecord, next: JobState) -> Result<()>;
 
-    fn get(&self, id: &str) -> Result<Option<(JobState, Job)>>;
+    fn get(&self, id: &str) -> Result<Option<(JobState, JobRecord)>>;
 
     /// Atomically removes a pending job so no worker will run it, and marks it
     /// `Cancelled`. Returns `false`, changing nothing, if the job is unknown or
@@ -58,12 +76,36 @@ pub trait Backend: Send + Sync + 'static {
     /// each job moves exactly once.
     fn recover(&self) -> Result<usize>;
 
+    /// A signal notified when job `id` may have finished (done, dead or
+    /// cancelled), so a waiting [`JobHandle`](crate::JobHandle) wakes at once.
+    /// Per job, so finishing one job only wakes its own waiters. `None`, the
+    /// default, makes waiters poll at the interval they were given.
+    fn watch_finished(&self, _id: &str) -> Option<Arc<Signal>> {
+        None
+    }
+
+    /// Whether calls can block on I/O (network, disk). Async callers send
+    /// blocking backends' calls to tokio's blocking pool; calls to backends
+    /// that never block run in place, which is much cheaper. `claim` with a
+    /// `wait` always counts as blocking.
+    fn blocks(&self) -> bool {
+        true
+    }
+
     /// Where the queue lives, for logs. Must not include secrets.
     fn describe(&self) -> String;
 }
 
+/// A job to push, for [`Backend::push_many`].
+#[derive(Debug, Clone)]
+pub struct NewJob {
+    pub name: String,
+    pub queue: String,
+    pub args: Vec<Value>,
+}
+
 /// Records a failure on `job` and returns the state it should move to.
-pub(crate) fn record_failure(job: &mut Job, error: String, max_retries: u32) -> JobState {
+pub(crate) fn record_failure(job: &mut JobRecord, error: String, max_retries: u32) -> JobState {
     job.attempts += 1;
     job.last_error = Some(error);
     if job.attempts > max_retries {
@@ -86,22 +128,47 @@ impl Queue {
         self.0.push(name, queue, args)
     }
 
-    pub fn claim(&self, worker: &str, queues: &[&str], wait: Duration) -> Result<Option<Job>> {
-        self.0.claim(worker, queues, wait)
+    pub fn push_many(&self, jobs: Vec<NewJob>) -> Result<Vec<JobId>> {
+        self.0.push_many(jobs)
     }
 
-    pub fn complete(&self, worker: &str, job: &Job) -> Result<()> {
-        self.0.complete(worker, job)
+    /// Takes the next job for `worker`: the oldest on the first non-empty
+    /// queue of `queues`, waiting up to `wait` for one. The job comes back
+    /// typed as [`Processing`], the only state that can be completed or failed.
+    pub fn claim(
+        &self,
+        worker: &str,
+        queues: &[&str],
+        wait: Duration,
+    ) -> Result<Option<Job<Processing>>> {
+        Ok(self.0.claim(worker, queues, wait)?.map(Job::from_record))
     }
 
+    /// Stores `output` and marks the job done. Takes the job by value, so it
+    /// can't be completed twice or failed afterwards.
+    pub fn complete(&self, worker: &str, job: Job<Processing>, output: Value) -> Result<Job<Done>> {
+        let mut record = job.into_record();
+        record.result = Some(output);
+        self.0.complete(worker, &record)?;
+        Ok(Job::from_record(record))
+    }
+
+    /// Records a failed attempt: the job goes back on its queue for a retry,
+    /// or dies once it has failed more than `max_retries` times.
     pub fn fail(
         &self,
         worker: &str,
-        job: Job,
+        job: Job<Processing>,
         error: String,
         max_retries: u32,
-    ) -> Result<JobState> {
-        self.0.fail(worker, job, error, max_retries)
+    ) -> Result<Failed> {
+        let mut record = job.into_record();
+        let next = record_failure(&mut record, error, max_retries);
+        self.0.fail(worker, &record, next)?;
+        Ok(match next {
+            JobState::Dead => Failed::Dead(Job::from_record(record)),
+            _ => Failed::Retry(Job::from_record(record)),
+        })
     }
 
     pub fn heartbeat(&self, worker: &str, ttl: Duration) -> Result<()> {
@@ -116,8 +183,12 @@ impl Queue {
         self.0.recover()
     }
 
-    pub fn get(&self, id: &str) -> Result<Option<(JobState, Job)>> {
-        self.0.get(id)
+    /// The job as it is right now, typed by its state.
+    pub fn get(&self, id: &str) -> Result<Option<AnyJob>> {
+        Ok(self
+            .0
+            .get(id)?
+            .map(|(state, record)| AnyJob::new(state, record)))
     }
 
     /// The job's current state. Returns `None` if the job is unknown, or if the
@@ -133,6 +204,14 @@ impl Queue {
     /// A handle to an existing job, for example from an id stored elsewhere.
     pub fn handle(&self, id: impl Into<JobId>) -> crate::JobHandle {
         crate::JobHandle::new(self.clone(), id.into())
+    }
+
+    pub fn watch_finished(&self, id: &str) -> Option<Arc<Signal>> {
+        self.0.watch_finished(id)
+    }
+
+    pub fn blocks(&self) -> bool {
+        self.0.blocks()
     }
 
     pub fn describe(&self) -> String {
@@ -154,6 +233,13 @@ impl From<MemoryQueue> for Queue {
 
 impl From<FileQueue> for Queue {
     fn from(q: FileQueue) -> Self {
+        Queue::new(q)
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl From<SqliteQueue> for Queue {
+    fn from(q: SqliteQueue) -> Self {
         Queue::new(q)
     }
 }

@@ -26,8 +26,8 @@ use std::{
 
 use serde_json::Value;
 
-use super::{Backend, record_failure};
-use crate::{Job, JobId, JobState, Result, job::DEFAULT_QUEUE};
+use super::Backend;
+use crate::{JobId, JobRecord, JobState, Result, job::DEFAULT_QUEUE};
 
 /// Checked in this order. During a retry, a job is briefly in both
 /// `processing/` and `pending/`, and `processing/` wins.
@@ -110,7 +110,7 @@ impl FileQueue {
         Ok(())
     }
 
-    fn write(&self, state: JobState, job: &Job) -> Result<()> {
+    fn write(&self, state: JobState, job: &JobRecord) -> Result<()> {
         let dir = if state == JobState::Pending {
             let dir = self.pending(&job.queue);
             fs::create_dir_all(&dir)?;
@@ -122,7 +122,7 @@ impl FileQueue {
         self.write_atomic(&to, &serde_json::to_vec_pretty(job)?)
     }
 
-    fn remove_processing(&self, worker: &str, job: &Job) -> Result<()> {
+    fn remove_processing(&self, worker: &str, job: &JobRecord) -> Result<()> {
         ignore_missing(fs::remove_file(
             self.processing(worker).join(format!("{}.json", job.id)),
         ))
@@ -140,13 +140,13 @@ impl FileQueue {
 
 impl Backend for FileQueue {
     fn push(&self, name: &str, queue: &str, args: Vec<Value>) -> Result<JobId> {
-        let job = Job::new(name, queue, args);
+        let job = JobRecord::new(name, queue, args);
         self.write(JobState::Pending, &job)?;
         Ok(job.id)
     }
 
     /// Never blocks: there is nothing to wait on, so the worker sleeps instead.
-    fn claim(&self, worker: &str, queues: &[&str], _wait: Duration) -> Result<Option<Job>> {
+    fn claim(&self, worker: &str, queues: &[&str], _wait: Duration) -> Result<Option<JobRecord>> {
         for queue in queues {
             let dir = self.pending(queue);
             let mut names: Vec<_> = match fs::read_dir(&dir) {
@@ -176,25 +176,17 @@ impl Backend for FileQueue {
         Ok(None)
     }
 
-    fn complete(&self, worker: &str, job: &Job) -> Result<()> {
+    fn complete(&self, worker: &str, job: &JobRecord) -> Result<()> {
         self.write(JobState::Done, job)?;
         self.remove_processing(worker, job)
     }
 
-    fn fail(
-        &self,
-        worker: &str,
-        mut job: Job,
-        error: String,
-        max_retries: u32,
-    ) -> Result<JobState> {
-        let state = record_failure(&mut job, error, max_retries);
-        self.write(state, &job)?;
-        self.remove_processing(worker, &job)?;
-        Ok(state)
+    fn fail(&self, worker: &str, job: &JobRecord, next: JobState) -> Result<()> {
+        self.write(next, job)?;
+        self.remove_processing(worker, job)
     }
 
-    fn get(&self, id: &str) -> Result<Option<(JobState, Job)>> {
+    fn get(&self, id: &str) -> Result<Option<(JobState, JobRecord)>> {
         let Some((state, path)) = self.find(id)? else {
             return Ok(None);
         };
@@ -250,7 +242,7 @@ impl Backend for FileQueue {
             for held in fs::read_dir(entry.path())? {
                 let held = held?;
                 let queue = match fs::read(held.path()) {
-                    Ok(bytes) => serde_json::from_slice::<Job>(&bytes)?.queue,
+                    Ok(bytes) => serde_json::from_slice::<JobRecord>(&bytes)?.queue,
                     // Another recover moved it first.
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                     Err(e) => return Err(e.into()),

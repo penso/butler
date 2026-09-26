@@ -42,7 +42,7 @@ fn cancel_rebuild_and_wait() {
     );
 
     // The stored record survives cancellation, for inspection.
-    let record = block_on(cancelled.job()).unwrap().unwrap();
+    let record = block_on(cancelled.job()).unwrap().unwrap().record().clone();
     assert_eq!(record.args[0], "cancelled");
 
     // A handle rebuilt from a stored id, and `wait` without a tokio runtime.

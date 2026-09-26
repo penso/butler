@@ -13,9 +13,14 @@
 //! A claim is an `LMOVE queue:<q> processing:<worker>` for each queue the
 //! worker serves, in its priority order, which Redis runs atomically, so only
 //! one worker gets each job, and the job never exists only in a worker's
-//! memory. When every queue is empty, the claim blocks with `BLMOVE` on the
-//! first one, so jobs on it start at once and jobs on the others within the
-//! wait. If a worker dies, its heartbeat key expires and `recover` moves the
+//! memory.
+//!
+//! Waiting is push-based. Every push, retry and recovery also `PUBLISH`es to
+//! `<prefix>:wake`; a listener thread per worker process turns those messages
+//! into a wake-up, so an idle claim re-checks its queues the moment a job
+//! lands on any of them. Pub/sub only carries the signal, never the job: a
+//! missed message costs at most the claim's `wait`, after which it re-checks
+//! anyway. If a worker dies, its heartbeat key expires and `recover` moves the
 //! ids in its processing list back to the front of their own queues, one atomic
 //! script call per job.
 //!
@@ -27,15 +32,16 @@
 //! are lost.
 
 use std::{
-    sync::{Mutex, PoisonError},
-    time::Duration,
+    sync::{Arc, Mutex, OnceLock, PoisonError, Weak},
+    thread,
+    time::{Duration, Instant},
 };
 
 use redis::{Client, Connection, RedisResult};
 use serde_json::Value;
 
-use super::{Backend, record_failure};
-use crate::{Error, Job, JobId, JobState, Result};
+use super::{Backend, NewJob};
+use crate::{Error, JobId, JobRecord, JobState, Result, Signal, signal::JobWatch};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -53,11 +59,9 @@ local job = ARGV[1] .. 'job:' .. id
 local queue = redis.call('HGET', job, 'queue') or 'default'
 redis.call('RPUSH', ARGV[1] .. 'queue:' .. queue, id)
 redis.call('HSET', job, 'state', 'pending')
+redis.call('PUBLISH', ARGV[1] .. 'wake', queue)
 return id
 ";
-
-/// `BLMOVE` treats 0 as "block forever", so a claim always waits at least this.
-const MIN_BLOCK: Duration = Duration::from_millis(10);
 
 pub struct RedisQueue {
     client: Client,
@@ -66,6 +70,75 @@ pub struct RedisQueue {
     idle: Mutex<Vec<Connection>>,
     prefix: String,
     display: String,
+    /// Notified from pub/sub messages; see [`Signals`].
+    signals: Arc<Signals>,
+    /// The pub/sub listener thread, started by the first waiting claim or
+    /// result wait.
+    subscriber: OnceLock<()>,
+}
+
+/// The two things a worker process listens for: a job was pushed (idle claims
+/// re-check their queues), and a job finished (`JobHandle::wait` re-checks).
+#[derive(Default)]
+struct Signals {
+    pushed: Signal,
+    finished: JobWatch,
+}
+
+/// How often the listener checks whether its queue was dropped, and the pause
+/// before resubscribing after an error.
+const LISTEN_TICK: Duration = Duration::from_secs(1);
+
+/// Listens for wake-ups and bumps the matching signal for every message,
+/// until the `RedisQueue` that owns `signals` is dropped. Reconnects after
+/// errors; while disconnected, waiters still re-check at their fallback
+/// interval.
+fn subscribe_until_dropped(client: &Client, prefix: &str, signals: &Weak<Signals>) {
+    while signals.strong_count() > 0 {
+        if let Err(err) = listen(client, prefix, signals) {
+            tracing::warn!(error = %err, "redis pub/sub wake-ups interrupted; reconnecting");
+            thread::sleep(LISTEN_TICK);
+        }
+    }
+}
+
+fn listen(client: &Client, prefix: &str, signals: &Weak<Signals>) -> RedisResult<()> {
+    let (wake, done) = (format!("{prefix}:wake"), format!("{prefix}:done"));
+    let mut conn = client.get_connection_with_timeout(CONNECT_TIMEOUT)?;
+    let mut pubsub = conn.as_pubsub();
+    pubsub.subscribe(&wake)?;
+    pubsub.subscribe(&done)?;
+    pubsub.set_read_timeout(Some(LISTEN_TICK))?;
+    // Anything that happened while we weren't subscribed sent no message we saw.
+    let Some(all) = signals.upgrade() else {
+        return Ok(());
+    };
+    all.pushed.notify();
+    all.finished.notify_all();
+    drop(all);
+    loop {
+        match pubsub.get_message() {
+            Ok(message) => {
+                let Some(signals) = signals.upgrade() else {
+                    return Ok(());
+                };
+                if message.get_channel_name() == done {
+                    // The payload is the finished job's id: wake only its waiters.
+                    signals
+                        .finished
+                        .notify(&String::from_utf8_lossy(message.get_payload_bytes()));
+                } else {
+                    signals.pushed.notify();
+                }
+            }
+            Err(err) if err.is_timeout() => {
+                if signals.strong_count() == 0 {
+                    return Ok(());
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 impl RedisQueue {
@@ -78,6 +151,8 @@ impl RedisQueue {
             idle: Mutex::new(vec![conn]),
             prefix: prefix.to_string(),
             display: format!("redis:{} (prefix {prefix})", redact(url)),
+            signals: Arc::default(),
+            subscriber: OnceLock::new(),
         })
     }
 
@@ -125,38 +200,11 @@ impl RedisQueue {
         }
         Ok(result?)
     }
-}
 
-impl Backend for RedisQueue {
-    fn push(&self, name: &str, queue: &str, args: Vec<Value>) -> Result<JobId> {
-        let job = Job::new(name, queue, args);
-        let data = serde_json::to_string(&job)?;
-        self.with_conn(|con| {
-            redis::pipe()
-                .atomic()
-                .cmd("HSET")
-                .arg(self.job_key(&job.id))
-                .arg("state")
-                .arg(JobState::Pending.as_str())
-                .arg("queue")
-                .arg(queue)
-                .arg("data")
-                .arg(&data)
-                .ignore()
-                .cmd("LPUSH")
-                .arg(self.queue_key(queue))
-                .arg(&job.id)
-                .ignore()
-                .exec(con)
-        })?;
-        Ok(job.id)
-    }
-
-    fn claim(&self, worker: &str, queues: &[&str], wait: Duration) -> Result<Option<Job>> {
+    /// Takes the oldest job of the first non-empty queue, in order, into
+    /// `worker`'s processing list. Never blocks.
+    fn sweep(&self, worker: &str, queues: &[&str]) -> Result<Option<JobRecord>> {
         let processing = self.processing_key(worker);
-        let Some(&first) = queues.first() else {
-            return Ok(None);
-        };
         loop {
             let mut id: Option<String> = None;
             for queue in queues {
@@ -171,18 +219,6 @@ impl Backend for RedisQueue {
                 if id.is_some() {
                     break;
                 }
-            }
-            if id.is_none() && !wait.is_zero() {
-                // Everything is empty: wait on the highest-priority queue.
-                id = self.with_conn(|con| {
-                    redis::cmd("BLMOVE")
-                        .arg(self.queue_key(first))
-                        .arg(&processing)
-                        .arg("RIGHT")
-                        .arg("LEFT")
-                        .arg(wait.max(MIN_BLOCK).as_secs_f64())
-                        .query(con)
-                })?;
             }
             let Some(id) = id else { return Ok(None) };
 
@@ -221,7 +257,113 @@ impl Backend for RedisQueue {
         }
     }
 
-    fn complete(&self, worker: &str, job: &Job) -> Result<()> {
+    /// Starts, once per queue, the thread that turns pub/sub messages into
+    /// [`Signals`]. Only workers and result waiters need it, so enqueue-only
+    /// processes never open the extra connection.
+    fn listen_for_signals(&self) {
+        self.subscriber.get_or_init(|| {
+            let client = self.client.clone();
+            let prefix = self.prefix.clone();
+            let signals = Arc::downgrade(&self.signals);
+            let spawned = thread::Builder::new()
+                .name("butler-redis-wake".into())
+                .spawn(move || subscribe_until_dropped(&client, &prefix, &signals));
+            if let Err(err) = spawned {
+                tracing::error!(error = %err, "no pub/sub wake-ups; waiters fall back to polling");
+            }
+        });
+    }
+}
+
+impl Backend for RedisQueue {
+    fn push(&self, name: &str, queue: &str, args: Vec<Value>) -> Result<JobId> {
+        let job = JobRecord::new(name, queue, args);
+        let data = serde_json::to_string(&job)?;
+        self.with_conn(|con| {
+            redis::pipe()
+                .atomic()
+                .cmd("HSET")
+                .arg(self.job_key(&job.id))
+                .arg("state")
+                .arg(JobState::Pending.as_str())
+                .arg("queue")
+                .arg(queue)
+                .arg("data")
+                .arg(&data)
+                .ignore()
+                .cmd("LPUSH")
+                .arg(self.queue_key(queue))
+                .arg(&job.id)
+                .ignore()
+                .cmd("PUBLISH")
+                .arg(self.key("wake"))
+                .arg(queue)
+                .ignore()
+                .exec(con)
+        })?;
+        Ok(job.id)
+    }
+
+    /// One pipelined transaction for every job, and one wake-up per queue.
+    fn push_many(&self, jobs: Vec<NewJob>) -> Result<Vec<JobId>> {
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        let mut ids = Vec::with_capacity(jobs.len());
+        let mut queues: Vec<String> = Vec::new();
+        for new in jobs {
+            let job = JobRecord::new(&new.name, &new.queue, new.args);
+            pipe.cmd("HSET")
+                .arg(self.job_key(&job.id))
+                .arg("state")
+                .arg(JobState::Pending.as_str())
+                .arg("queue")
+                .arg(&new.queue)
+                .arg("data")
+                .arg(serde_json::to_string(&job)?)
+                .ignore()
+                .cmd("LPUSH")
+                .arg(self.queue_key(&new.queue))
+                .arg(&job.id)
+                .ignore();
+            if !queues.contains(&new.queue) {
+                queues.push(new.queue);
+            }
+            ids.push(job.id);
+        }
+        for queue in &queues {
+            pipe.cmd("PUBLISH")
+                .arg(self.key("wake"))
+                .arg(queue)
+                .ignore();
+        }
+        self.with_conn(|con| pipe.exec(con))?;
+        Ok(ids)
+    }
+
+    fn claim(&self, worker: &str, queues: &[&str], wait: Duration) -> Result<Option<JobRecord>> {
+        if queues.is_empty() {
+            return Ok(None);
+        }
+        if !wait.is_zero() {
+            self.listen_for_signals();
+        }
+        let deadline = Instant::now() + wait;
+        loop {
+            // Read before sweeping: a push that lands during the sweep changes
+            // it, so the wait below returns at once instead of missing the job.
+            let seen = self.signals.pushed.generation();
+            if let Some(job) = self.sweep(worker, queues)? {
+                return Ok(Some(job));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            self.signals.pushed.wait_past(seen, deadline - now);
+        }
+    }
+
+    fn complete(&self, worker: &str, job: &JobRecord) -> Result<()> {
         let data = serde_json::to_string(job)?;
         self.with_conn(|con| {
             redis::pipe()
@@ -242,19 +384,17 @@ impl Backend for RedisQueue {
                 .arg(self.job_key(&job.id))
                 .arg(DONE_TTL_SECS)
                 .ignore()
+                .cmd("PUBLISH")
+                .arg(self.key("done"))
+                .arg(&job.id)
+                .ignore()
                 .exec(con)
         })
     }
 
-    fn fail(
-        &self,
-        worker: &str,
-        mut job: Job,
-        error: String,
-        max_retries: u32,
-    ) -> Result<JobState> {
-        let state = record_failure(&mut job, error, max_retries);
-        let data = serde_json::to_string(&job)?;
+    fn fail(&self, worker: &str, job: &JobRecord, next: JobState) -> Result<()> {
+        let state = next;
+        let data = serde_json::to_string(job)?;
         let target = if state == JobState::Dead {
             self.key("dead")
         } else {
@@ -279,12 +419,20 @@ impl Backend for RedisQueue {
                 .arg(&target)
                 .arg(&job.id)
                 .ignore()
+                // A retry wakes idle claims; a dead job wakes result waiters.
+                .cmd("PUBLISH")
+                .arg(self.key(if state == JobState::Dead {
+                    "done"
+                } else {
+                    "wake"
+                }))
+                .arg(&job.id)
+                .ignore()
                 .exec(con)
-        })?;
-        Ok(state)
+        })
     }
 
-    fn get(&self, id: &str) -> Result<Option<(JobState, Job)>> {
+    fn get(&self, id: &str) -> Result<Option<(JobState, JobRecord)>> {
         let (state, data): (Option<String>, Option<String>) = self.with_conn(|con| {
             redis::cmd("HMGET")
                 .arg(self.job_key(id))
@@ -334,6 +482,10 @@ impl Backend for RedisQueue {
                 .cmd("EXPIRE")
                 .arg(self.job_key(id))
                 .arg(DONE_TTL_SECS)
+                .ignore()
+                .cmd("PUBLISH")
+                .arg(self.key("done"))
+                .arg(id)
                 .ignore()
                 .exec(con)
         })?;
@@ -396,6 +548,11 @@ impl Backend for RedisQueue {
             })?;
         }
         Ok(recovered)
+    }
+
+    fn watch_finished(&self, id: &str) -> Option<Arc<Signal>> {
+        self.listen_for_signals();
+        Some(self.signals.finished.watch(id))
     }
 
     fn describe(&self) -> String {

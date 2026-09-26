@@ -48,7 +48,10 @@ fn queues_and_priorities() {
         block_on(urgent(n)).unwrap();
     }
     let job = block_on(urgent(99)).unwrap();
-    assert_eq!(block_on(job.job()).unwrap().unwrap().queue, "critical");
+    assert_eq!(
+        block_on(job.job()).unwrap().unwrap().record().clone().queue,
+        "critical"
+    );
     assert!(block_on(job.cancel()).unwrap());
 
     // Strict: a queue only runs once every queue before it is empty.

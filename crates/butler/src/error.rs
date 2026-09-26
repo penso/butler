@@ -24,6 +24,10 @@ pub enum Error {
     #[error("redis operation failed")]
     Redis(#[from] redis::RedisError),
 
+    #[cfg(feature = "sqlite")]
+    #[error("sqlite operation failed")]
+    Sqlite(#[from] rusqlite::Error),
+
     #[cfg(feature = "tokio")]
     #[error("blocking queue task did not complete")]
     Join(#[from] tokio::task::JoinError),

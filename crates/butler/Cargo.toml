@@ -15,9 +15,11 @@ all-features = true
 workspace = true
 
 [features]
-default = ["redis", "tokio"]
+default = ["redis", "sqlite", "tokio"]
 # Adds the Redis backend (`backend = "redis"` in config.toml).
 redis = ["dep:redis"]
+# Adds the SQLite backend (`backend = "sqlite"` in config.toml), with SQLite bundled.
+sqlite = ["dep:rusqlite"]
 # Adds `Worker::run_async` and makes enqueueing from inside a tokio runtime non-blocking.
 tokio = ["dep:tokio"]
 
@@ -26,6 +28,7 @@ butler-macros.workspace = true
 config.workspace        = true
 inventory.workspace     = true
 redis                   = { optional = true, workspace = true }
+rusqlite                = { optional = true, workspace = true }
 serde.workspace         = true
 serde_json.workspace    = true
 thiserror.workspace     = true

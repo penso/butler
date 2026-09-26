@@ -36,7 +36,7 @@ fn cpu_bound(rounds: u64) -> Result<u64, Infallible> {
 
 /// Starts a worker, waits for every result, stops the worker, and returns the
 /// wall time from start to the last result.
-async fn run<T: serde::de::DeserializeOwned>(
+async fn run<T: serde::de::DeserializeOwned + Send + 'static>(
     queue: &Queue,
     concurrency: usize,
     jobs: Vec<JobHandle<T>>,
@@ -49,8 +49,13 @@ async fn run<T: serde::de::DeserializeOwned>(
     let running = tokio::spawn(worker.run_async(async {
         let _ = stopped.await;
     }));
-    for job in &jobs {
-        job.wait_result(Duration::from_millis(1)).await?;
+    // Read the results side by side, so reading them doesn't limit the measure.
+    let mut waiting = tokio::task::JoinSet::new();
+    for job in jobs {
+        waiting.spawn(async move { job.wait_result(Duration::from_secs(5)).await });
+    }
+    while let Some(result) = waiting.join_next().await {
+        result??;
     }
     let took = started.elapsed();
     let _ = stop.send(());
@@ -74,10 +79,26 @@ async fn main() -> anyhow::Result<()> {
     }
     let took = run(&queue, 1_000, jobs).await?;
     println!("I/O-bound: {count} async jobs x {wait_ms}ms of waiting, concurrency 1000");
+    let sequential = (count as u64 * wait_ms) as f64 / 1000.0;
     println!(
-        "  {took:.2?} ({:.0} jobs/s); one at a time would take {:.0}s\n",
+        "  {took:.2?} ({:.0} jobs/s); one at a time would take {sequential:.0}s, so {:.0}x faster\n",
         count as f64 / took.as_secs_f64(),
-        (count as u64 * wait_ms) as f64 / 1000.0
+        sequential / took.as_secs_f64()
+    );
+
+    // 1b. Very high concurrency: 100,000 jobs allowed to run at once, each
+    // waiting 1s. Tokio tasks are cheap, so the cap can be this high.
+    let (count, wait_ms) = (100_000, 1_000);
+    let mut jobs = Vec::with_capacity(count);
+    for _ in 0..count {
+        jobs.push(io_bound(wait_ms).await?);
+    }
+    let took = run(&queue, count, jobs).await?;
+    println!("High concurrency: {count} async jobs x {wait_ms}ms, concurrency {count}");
+    println!(
+        "  {took:.2?} ({:.0} jobs/s); one at a time would take {:.0} hours\n",
+        count as f64 / took.as_secs_f64(),
+        (count as u64 * wait_ms) as f64 / 3_600_000.0
     );
 
     // 2. CPU-bound, first on one core, then on all of them.

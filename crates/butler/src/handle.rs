@@ -3,7 +3,7 @@ use std::{fmt, marker::PhantomData, time::Duration};
 use serde::de::DeserializeOwned;
 
 use crate::{
-    Error, Job, JobId, JobState, Queue, Result,
+    AnyJob, Error, JobId, JobState, Queue, Result, Signal,
     executor::{sleep, unblock},
 };
 
@@ -41,12 +41,15 @@ impl<T> JobHandle<T> {
     /// The job's current state, or `None` if the backend no longer knows it
     /// (for example, Redis expired it a day after it finished).
     pub async fn state(&self) -> Result<Option<JobState>> {
-        Ok(self.job_with_state().await?.map(|(state, _)| state))
+        Ok(self.job().await?.map(|job| job.state()))
     }
 
-    /// The stored job: its arguments, attempts so far, last error and output.
-    pub async fn job(&self) -> Result<Option<Job>> {
-        Ok(self.job_with_state().await?.map(|(_, job)| job))
+    /// The job as stored right now, typed by its state: match on it to reach
+    /// what that state offers, like [`Job::output`](crate::Job::output) once
+    /// it is done.
+    pub async fn job(&self) -> Result<Option<AnyJob>> {
+        let (queue, id) = (self.queue.clone(), self.id.clone());
+        unblock(queue.blocks(), move || queue.get(&id)).await
     }
 
     /// Removes the job if no worker has claimed it yet, and marks it
@@ -55,28 +58,40 @@ impl<T> JobHandle<T> {
     /// interrupted.
     pub async fn cancel(&self) -> Result<bool> {
         let (queue, id) = (self.queue.clone(), self.id.clone());
-        unblock(move || queue.cancel(&id)).await
+        unblock(queue.blocks(), move || queue.cancel(&id)).await
     }
 
-    /// Polls every `interval` until the job is done, dead, or cancelled, and
-    /// returns that state.
-    pub async fn wait(&self, interval: Duration) -> Result<JobState> {
+    /// Waits until the job is done, dead, or cancelled, and returns that state.
+    ///
+    /// With Redis and memory, the backend signals every finished job, so this
+    /// returns as soon as it happens and `fallback` is only a safety net
+    /// (a missed Redis message). The file backend can't signal, so it re-checks
+    /// every `fallback`.
+    pub async fn wait(&self, fallback: Duration) -> Result<JobState> {
+        Ok(self.finished(fallback).await?.state())
+    }
+
+    /// Waits for the job to reach a final state, and returns it as it is then.
+    async fn finished(&self, fallback: Duration) -> Result<AnyJob> {
+        let signal = self.queue.watch_finished(&self.id);
+        let signal = signal.as_deref();
         loop {
-            match self.state().await? {
-                Some(state) if state.is_finished() => return Ok(state),
-                Some(_) => sleep(interval).await,
+            // Read before checking, so a job finishing in between still wakes us.
+            let seen = signal.map(Signal::generation);
+            match self.job().await? {
+                Some(job) if job.state().is_finished() => return Ok(job),
+                Some(_) => {}
                 None => {
                     return Err(Error::JobNotFound {
                         id: self.id.clone(),
                     });
                 }
             }
+            match (signal, seen) {
+                (Some(signal), Some(seen)) => signal.changed_past(seen, fallback).await,
+                _ => sleep(fallback).await,
+            }
         }
-    }
-
-    async fn job_with_state(&self) -> Result<Option<(JobState, Job)>> {
-        let (queue, id) = (self.queue.clone(), self.id.clone());
-        unblock(move || queue.get(&id)).await
     }
 
     /// The same job, with its output read as `U` instead.
@@ -90,8 +105,8 @@ impl<T: DeserializeOwned> JobHandle<T> {
     /// pending or running, and also if it died or was cancelled: use
     /// [`JobHandle::wait_result`] to tell those apart.
     pub async fn result(&self) -> Result<Option<T>> {
-        match self.job_with_state().await? {
-            Some((JobState::Done, job)) => Ok(Some(Self::decode(job)?)),
+        match self.job().await? {
+            Some(AnyJob::Done(job)) => Ok(Some(job.output()?)),
             Some(_) => Ok(None),
             None => Err(Error::JobNotFound {
                 id: self.id.clone(),
@@ -99,35 +114,23 @@ impl<T: DeserializeOwned> JobHandle<T> {
         }
     }
 
-    /// Polls every `interval` until the job finishes, and returns what it
-    /// returned. A job that exhausted its retries is [`Error::JobFailed`], with
-    /// its last error; a cancelled one is [`Error::JobCancelled`].
-    pub async fn wait_result(&self, interval: Duration) -> Result<T> {
-        match self.wait(interval).await? {
-            JobState::Done => self.result().await?.ok_or_else(|| Error::JobNotFound {
+    /// Waits until the job finishes, and returns what it returned. A job that
+    /// exhausted its retries is [`Error::JobFailed`], with its last error; a
+    /// cancelled one is [`Error::JobCancelled`]. Redis and memory wake it the
+    /// moment the job finishes; `fallback` is how often to re-check anyway
+    /// (always, on the file backend). See [`JobHandle::wait`].
+    pub async fn wait_result(&self, fallback: Duration) -> Result<T> {
+        match self.finished(fallback).await? {
+            AnyJob::Done(job) => job.output(),
+            AnyJob::Dead(job) => Err(Error::JobFailed {
+                id: self.id.clone(),
+                error: job.error().to_owned(),
+            }),
+            // `finished` only returns final states; anything else was cancelled.
+            _ => Err(Error::JobCancelled {
                 id: self.id.clone(),
             }),
-            JobState::Cancelled => Err(Error::JobCancelled {
-                id: self.id.clone(),
-            }),
-            _ => {
-                let error = self
-                    .job()
-                    .await?
-                    .and_then(|job| job.last_error)
-                    .unwrap_or_default();
-                Err(Error::JobFailed {
-                    id: self.id.clone(),
-                    error,
-                })
-            }
         }
-    }
-
-    /// Done jobs written before results existed have none; they read as null.
-    fn decode(job: Job) -> Result<T> {
-        let value = job.result.unwrap_or(serde_json::Value::Null);
-        Ok(serde_json::from_value(value)?)
     }
 }
 

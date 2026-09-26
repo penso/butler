@@ -37,16 +37,20 @@ pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "unknown panic".into())
 }
 
-/// Runs a blocking backend call. Inside a tokio runtime it goes to the
-/// blocking thread pool, so async worker threads never wait on I/O; elsewhere
-/// it runs in place.
+/// Runs a backend call. If the backend `blocks` (network or disk I/O) and
+/// we're inside a tokio runtime, it goes to the blocking thread pool, so async
+/// worker threads never wait on I/O. Otherwise, including backends that never
+/// block like the in-memory one, it runs in place: a hop through the blocking
+/// pool costs far more than such a call.
 pub(crate) async fn unblock<T: Send + 'static>(
+    blocks: bool,
     f: impl FnOnce() -> crate::Result<T> + Send + 'static,
 ) -> crate::Result<T> {
     #[cfg(feature = "tokio")]
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+    if blocks && let Ok(handle) = tokio::runtime::Handle::try_current() {
         return handle.spawn_blocking(f).await?;
     }
+    let _ = blocks;
     f()
 }
 

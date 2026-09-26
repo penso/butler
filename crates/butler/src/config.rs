@@ -19,6 +19,9 @@
 //! heartbeat_ttl_secs = 30      # crashed workers' jobs are requeued after this
 //! recover_interval_secs = 10
 //! queues = [["critical", 6], ["default", 3], ["low", 1]]   # or ["critical", "default"]
+//!
+//! [worker.queue_limits]        # optional, per queue, on top of `concurrency`
+//! mailers = 20
 //! ```
 //!
 //! The config file is `$BUTLER_CONFIG` if set (it must then exist), otherwise
@@ -27,6 +30,7 @@
 //! `BUTLER_QUEUE__REDIS__URL=redis://host/`, `BUTLER_WORKER__CONCURRENCY=8`.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -51,6 +55,23 @@ pub struct QueueConfig {
     pub backend: BackendKind,
     pub file: FileConfig,
     pub redis: RedisConfig,
+    pub sqlite: SqliteConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SqliteConfig {
+    /// Created if missing. Use a file, not `:memory:`: other processes and
+    /// the change watcher open their own connections to it.
+    pub path: PathBuf,
+}
+
+impl Default for SqliteConfig {
+    fn default() -> Self {
+        Self {
+            path: "butler.db".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -61,6 +82,8 @@ pub enum BackendKind {
     Redis,
     /// In-process only: see [`MemoryQueue`](crate::MemoryQueue).
     Memory,
+    /// One database file shared by processes on the same machine.
+    Sqlite,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -100,6 +123,9 @@ pub struct WorkerConfig {
     /// Jobs run at the same time (threads for `run`, tasks for `run_async`).
     /// Defaults to the number of CPUs.
     pub concurrency: usize,
+    /// Claim loops running side by side in `run_async`; more start jobs
+    /// faster. Defaults to the number of CPUs.
+    pub claimers: usize,
     pub max_retries: u32,
     pub poll_interval_ms: u64,
     /// A worker counts as alive this long after each heartbeat; it refreshes
@@ -111,6 +137,10 @@ pub struct WorkerConfig {
     /// `["critical", "default"]`. Any `[name, weight]` pair makes it weighted,
     /// with plain names weighing 1: `[["critical", 6], ["default", 1]]`.
     pub queues: Vec<QueueEntry>,
+    /// Caps on jobs running at once, per queue, on top of `concurrency`:
+    /// `[worker.queue_limits]` then `mailers = 20`. Queues not listed are only
+    /// bound by `concurrency`.
+    pub queue_limits: HashMap<String, usize>,
 }
 
 /// One entry of `[worker] queues`.
@@ -132,14 +162,20 @@ impl QueueEntry {
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
-            concurrency: std::thread::available_parallelism().map_or(4, |n| n.get()),
+            concurrency: cpus(),
+            claimers: cpus(),
             max_retries: 3,
             poll_interval_ms: 100,
             heartbeat_ttl_secs: 30,
             recover_interval_secs: 10,
             queues: vec![QueueEntry::Name(DEFAULT_QUEUE.to_owned())],
+            queue_limits: HashMap::new(),
         }
     }
+}
+
+fn cpus() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get())
 }
 
 impl WorkerConfig {
@@ -185,6 +221,19 @@ impl WorkerConfig {
                 reason,
             });
         }
+        for (queue, max) in &self.queue_limits {
+            let reason = if !is_valid_queue_name(queue) {
+                "use 1 to 64 of A-Z a-z 0-9 _ - . (not starting with a dot)"
+            } else if *max == 0 {
+                "a queue limit starts at 1"
+            } else {
+                continue;
+            };
+            return Err(Error::InvalidQueue {
+                name: queue.clone(),
+                reason,
+            });
+        }
         Ok(())
     }
 }
@@ -220,6 +269,10 @@ impl Config {
         match self.queue.backend {
             BackendKind::File => Ok(FileQueue::new(&self.queue.file.dir)?.into()),
             BackendKind::Memory => Ok(crate::MemoryQueue::shared().into()),
+            #[cfg(feature = "sqlite")]
+            BackendKind::Sqlite => Ok(crate::SqliteQueue::open(&self.queue.sqlite.path)?.into()),
+            #[cfg(not(feature = "sqlite"))]
+            BackendKind::Sqlite => Err(Error::BackendDisabled("sqlite")),
             #[cfg(feature = "redis")]
             BackendKind::Redis => {
                 let redis = &self.queue.redis;
@@ -288,6 +341,16 @@ mod tests {
             default.worker.priority(),
             QueuePriority::strict(["default"])
         );
+    }
+
+    #[test]
+    fn queue_limits_load_and_reject_zero() {
+        let config = load("[worker.queue_limits]\nmailers = 20\nreports = 2\n").unwrap();
+        assert_eq!(config.worker.queue_limits.get("mailers"), Some(&20));
+        assert_eq!(config.worker.queue_limits.get("reports"), Some(&2));
+
+        let zero = load("[worker.queue_limits]\nmailers = 0\n").unwrap_err();
+        assert!(matches!(zero, Error::InvalidQueue { ref name, .. } if name == "mailers"));
     }
 
     #[test]

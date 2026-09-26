@@ -9,15 +9,15 @@
 //! job is pushed.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError},
     time::{Duration, Instant},
 };
 
 use serde_json::Value;
 
-use super::{Backend, record_failure};
-use crate::{Job, JobId, JobState, Result};
+use super::{Backend, NewJob};
+use crate::{JobId, JobRecord, JobState, Result, Signal, signal::JobWatch};
 
 #[derive(Clone, Default)]
 pub struct MemoryQueue {
@@ -28,14 +28,18 @@ pub struct MemoryQueue {
 struct Inner {
     state: Mutex<State>,
     pushed: Condvar,
+    /// Notified per job when it finishes, for `JobHandle::wait`.
+    finished: JobWatch,
 }
 
 #[derive(Default)]
 struct State {
     /// Per queue, oldest first.
     pending: HashMap<String, VecDeque<JobId>>,
-    jobs: HashMap<JobId, (JobState, Job)>,
-    processing: HashMap<String, Vec<JobId>>,
+    jobs: HashMap<JobId, (JobState, JobRecord)>,
+    /// Per worker. A set: a worker can hold a great many jobs at once, and
+    /// finishing one must not scan the others.
+    processing: HashMap<String, HashSet<JobId>>,
     /// When each worker's heartbeat expires.
     heartbeats: HashMap<String, Instant>,
 }
@@ -66,14 +70,14 @@ impl MemoryQueue {
 impl State {
     fn release(&mut self, worker: &str, id: &str) {
         if let Some(held) = self.processing.get_mut(worker) {
-            held.retain(|held| held != id);
+            held.remove(id);
         }
     }
 }
 
 impl Backend for MemoryQueue {
     fn push(&self, name: &str, queue: &str, args: Vec<Value>) -> Result<JobId> {
-        let job = Job::new(name, queue, args);
+        let job = JobRecord::new(name, queue, args);
         let id = job.id.clone();
         let mut state = self.lock();
         state.jobs.insert(id.clone(), (JobState::Pending, job));
@@ -87,7 +91,27 @@ impl Backend for MemoryQueue {
         Ok(id)
     }
 
-    fn claim(&self, worker: &str, queues: &[&str], wait: Duration) -> Result<Option<Job>> {
+    fn push_many(&self, jobs: Vec<NewJob>) -> Result<Vec<JobId>> {
+        let mut state = self.lock();
+        let ids = jobs
+            .into_iter()
+            .map(|new| {
+                let job = JobRecord::new(&new.name, &new.queue, new.args);
+                let id = job.id.clone();
+                state.jobs.insert(id.clone(), (JobState::Pending, job));
+                state
+                    .pending
+                    .entry(new.queue)
+                    .or_default()
+                    .push_back(id.clone());
+                id
+            })
+            .collect();
+        self.inner.pushed.notify_all();
+        Ok(ids)
+    }
+
+    fn claim(&self, worker: &str, queues: &[&str], wait: Duration) -> Result<Option<JobRecord>> {
         let deadline = Instant::now() + wait;
         let mut state = self.lock();
         loop {
@@ -99,7 +123,7 @@ impl Backend for MemoryQueue {
                     .processing
                     .entry(worker.to_owned())
                     .or_default()
-                    .push(id.clone());
+                    .insert(id.clone());
                 if let Some((job_state, job)) = state.jobs.get_mut(&id) {
                     *job_state = JobState::Processing;
                     return Ok(Some(job.clone()));
@@ -119,23 +143,17 @@ impl Backend for MemoryQueue {
         }
     }
 
-    fn complete(&self, worker: &str, job: &Job) -> Result<()> {
+    fn complete(&self, worker: &str, job: &JobRecord) -> Result<()> {
         let mut state = self.lock();
         state.release(worker, &job.id);
         state
             .jobs
             .insert(job.id.clone(), (JobState::Done, job.clone()));
+        self.inner.finished.notify(&job.id);
         Ok(())
     }
 
-    fn fail(
-        &self,
-        worker: &str,
-        mut job: Job,
-        error: String,
-        max_retries: u32,
-    ) -> Result<JobState> {
-        let next = record_failure(&mut job, error, max_retries);
+    fn fail(&self, worker: &str, job: &JobRecord, next: JobState) -> Result<()> {
         let mut state = self.lock();
         state.release(worker, &job.id);
         if next == JobState::Pending {
@@ -146,11 +164,14 @@ impl Backend for MemoryQueue {
                 .push_back(job.id.clone());
             self.inner.pushed.notify_all();
         }
-        state.jobs.insert(job.id.clone(), (next, job));
-        Ok(next)
+        state.jobs.insert(job.id.clone(), (next, job.clone()));
+        if next == JobState::Dead {
+            self.inner.finished.notify(&job.id);
+        }
+        Ok(())
     }
 
-    fn get(&self, id: &str) -> Result<Option<(JobState, Job)>> {
+    fn get(&self, id: &str) -> Result<Option<(JobState, JobRecord)>> {
         Ok(self.lock().jobs.get(id).cloned())
     }
 
@@ -169,6 +190,7 @@ impl Backend for MemoryQueue {
         if let Some((job_state, _)) = state.jobs.get_mut(id) {
             *job_state = JobState::Cancelled;
         }
+        self.inner.finished.notify(id);
         Ok(true)
     }
 
@@ -185,7 +207,7 @@ impl Backend for MemoryQueue {
         let mut state = self.lock();
         state.heartbeats.remove(worker);
         // Anything still held stays for `recover`, as with the other backends.
-        if state.processing.get(worker).is_some_and(Vec::is_empty) {
+        if state.processing.get(worker).is_some_and(HashSet::is_empty) {
             state.processing.remove(worker);
         }
         Ok(())
@@ -223,6 +245,15 @@ impl Backend for MemoryQueue {
             self.inner.pushed.notify_all();
         }
         Ok(recovered)
+    }
+
+    fn watch_finished(&self, id: &str) -> Option<Arc<Signal>> {
+        Some(self.inner.finished.watch(id))
+    }
+
+    /// Every call is a few map updates under a lock.
+    fn blocks(&self) -> bool {
+        false
     }
 
     fn describe(&self) -> String {

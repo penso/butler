@@ -13,7 +13,7 @@ Engineering guidance for agents working in this repository. Read it alongside
 
 | Location | Responsibility |
 | --- | --- |
-| `crates/butler/src/backend/` | `Backend` trait and the file, Redis and in-memory queues |
+| `crates/butler/src/backend/` | `Backend` trait and the Redis, SQLite, file and in-memory queues |
 | `crates/butler/src/handle.rs` | `JobHandle<T>`: state, cancel, wait, and the job's result |
 | `crates/butler/src/worker.rs` | Claiming, running, retrying: `run` (threads), `run_async` (tokio), `drain` |
 | `crates/butler/src/config.rs` | `config.toml` and `BUTLER_*` environment loading |
@@ -36,6 +36,17 @@ Engineering guidance for agents working in this repository. Read it alongside
 - Jobs live on named queues (`#[job(queue = ...)]`, default `"default"`), and
   workers claim in `QueuePriority` order. Retries and recovery must put a job
   back on its own queue.
+- Job states are types (`Job<Pending>`, `Job<Processing>`, ...): only `claim`
+  creates a `Job<Processing>`, and `complete`/`fail` consume it. Keep new
+  transitions typed; a backend reads jobs back as `AnyJob`.
+- Wake-ups for results are per job (`JobWatch`): never notify every waiter
+  for one job finishing, it is quadratic with many waiters. Backends that
+  never block report `blocks() == false`, so async callers skip the blocking
+  pool.
+- `butler::testing` runs jobs inline in tests by calling the job's `JobDef`
+  directly from the enqueue path. Keep it free of queue and worker state.
+- `Backend::push_many` should be one step where the backend allows it (one
+  round trip, one transaction); the default loops over `push`.
 - Every backend must pass `crates/butler/tests/backends.rs`. Add new backend
   behavior there, so all backends are held to it.
 

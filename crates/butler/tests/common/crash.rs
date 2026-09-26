@@ -52,7 +52,7 @@ pub fn crash_mid_job_is_recovered(
         .claim(&alive, DEFAULT, Duration::ZERO)
         .unwrap()
         .unwrap();
-    assert_eq!(claimed.id, held.id());
+    assert_eq!(claimed.id(), held.id());
 
     let marker = dir.join("marker");
     let job = block_on(fragile(&marker)).unwrap();
@@ -83,6 +83,8 @@ pub fn crash_mid_job_is_recovered(
     assert_eq!(block_on(held.state()).unwrap(), Some(JobState::Processing));
     assert_eq!(queue.recover().unwrap(), 0);
 
-    queue.complete(&alive, &claimed).unwrap();
+    queue
+        .complete(&alive, claimed, serde_json::Value::Null)
+        .unwrap();
     queue.retire(&alive).unwrap();
 }

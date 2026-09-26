@@ -48,17 +48,17 @@ fn retries_then_succeeds_or_dies() {
     // flaky: 3 runs. boom and read_missing: 1 run + 2 retries each.
     assert_eq!(worker.drain().unwrap(), 9);
 
-    let (state, job) = queue.get(ok.id()).unwrap().unwrap();
+    let (state, job) = queue.get(ok.id()).unwrap().unwrap().into_parts();
     assert_eq!(state, JobState::Done);
     assert_eq!(job.attempts, 2);
 
-    let (state, job) = queue.get(dead.id()).unwrap().unwrap();
+    let (state, job) = queue.get(dead.id()).unwrap().unwrap().into_parts();
     assert_eq!(state, JobState::Dead);
     assert_eq!(job.attempts, 3);
     assert_eq!(job.last_error.as_deref(), Some("job panicked: kaboom"));
 
     // The whole anyhow context chain is kept, not just the outer message.
-    let (_, job) = queue.get(missing.id()).unwrap().unwrap();
+    let (_, job) = queue.get(missing.id()).unwrap().unwrap().into_parts();
     let err = job.last_error.unwrap();
     assert!(err.starts_with("reading /nonexistent/butler: "), "{err}");
     assert!(err.contains("No such file or directory"), "{err}");

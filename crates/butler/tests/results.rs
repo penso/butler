@@ -54,9 +54,15 @@ async fn refuse() -> Result<u32, String> {
     Err("refused on purpose".to_owned())
 }
 
+/// The file backend can't notify, so its waiters poll at this interval.
 const POLL: Duration = Duration::from_millis(5);
+/// Longer than the test's timeout: reaching the result requires a notification.
+const NOTIFIED: Duration = Duration::from_secs(30);
 
-async fn round_trip(queue: Queue) {
+/// `fallback` is the re-check interval when no notification arrives. Memory and
+/// Redis get 30s: the whole round trip must still finish within the 10s
+/// timeout, so it passes only if finished jobs wake the waiters.
+async fn round_trip(queue: Queue, fallback: Duration) {
     let name = queue.describe();
     butler::configure(queue.clone());
 
@@ -81,12 +87,12 @@ async fn round_trip(queue: Queue) {
 
     let results = async {
         (
-            sum.wait_result(POLL).await,
-            fibonacci.wait_result(POLL).await,
-            unit.wait_result(POLL).await,
-            refused.wait_result(POLL).await,
-            cancelled.wait_result(POLL).await,
-            overflowed.wait_result(POLL).await,
+            sum.wait_result(fallback).await,
+            fibonacci.wait_result(fallback).await,
+            unit.wait_result(fallback).await,
+            refused.wait_result(fallback).await,
+            cancelled.wait_result(fallback).await,
+            overflowed.wait_result(fallback).await,
         )
     };
     let (sum_out, fib_out, unit_out, refused_out, cancelled_out, overflow_out) =
@@ -127,11 +133,18 @@ async fn round_trip(queue: Queue) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn results_come_back_from_every_backend() {
-    round_trip(MemoryQueue::new().into()).await;
+    round_trip(MemoryQueue::new().into(), NOTIFIED).await;
 
     let dir = std::env::temp_dir().join(format!("butler-results-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    round_trip(FileQueue::new(&dir).unwrap().into()).await;
+    round_trip(FileQueue::new(&dir).unwrap().into(), POLL).await;
+
+    #[cfg(feature = "sqlite")]
+    {
+        let db = std::env::temp_dir().join(format!("butler-results-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        round_trip(butler::SqliteQueue::open(&db).unwrap().into(), NOTIFIED).await;
+    }
 
     #[cfg(feature = "redis")]
     {
@@ -139,7 +152,7 @@ async fn results_come_back_from_every_backend() {
             .unwrap_or_else(|_| "redis://127.0.0.1:6379/".into());
         let prefix = format!("butler-results-{}", std::process::id());
         match butler::RedisQueue::connect(&url, &prefix) {
-            Ok(q) => round_trip(q.into()).await,
+            Ok(q) => round_trip(q.into(), NOTIFIED).await,
             Err(e) => eprintln!("skipping redis: {e}"),
         }
     }

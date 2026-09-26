@@ -19,6 +19,8 @@
 //! Attributes: `#[job(name = "billing.charge")]` sets the name workers look the
 //! job up by (default: the function name), and `#[job(queue = "mailers")]` the
 //! queue it is enqueued on (default: `"default"`).
+//! - `send_email::prepare(...)`, which builds the job without enqueueing it,
+//!   for `butler::enqueue_all` or `.on_queue(..)`.
 //! - `send_email::JOB`, a handle for `Worker::register`. Jobs defined in another
 //!   crate need it: the linker drops that crate's automatic registration unless
 //!   the binary references something from it.
@@ -178,9 +180,28 @@ fn expand(
 
         #[doc(hidden)]
         #vis mod #name {
+            // The job's argument and output types are named as in the parent.
+            #[allow(unused_imports)]
+            use super::*;
+
             /// Pass to `Worker::register` when the job lives in another crate.
             pub const JOB: ::butler::JobDef =
                 ::butler::JobDef { name: #job_name, queue: #queue, perform: super::#dispatch };
+
+            /// Builds this job without enqueueing it, for `butler::enqueue_all`
+            /// (or `.on_queue(..)`, then `.enqueue()`).
+            pub fn prepare(#(#idents: impl ::butler::JobArg<#types>),*)
+                -> ::core::result::Result<
+                    ::butler::PreparedJob<<#returns as ::butler::IntoJobResult>::Output>,
+                    ::butler::Error,
+                >
+            {
+                #(let #idents: #types = ::butler::JobArg::into_arg(#idents);)*
+                let args = ::butler::__private::args([
+                    #(::butler::__private::serde_json::to_value(&#idents)),*
+                ])?;
+                ::core::result::Result::Ok(::butler::PreparedJob::new(&JOB, args))
+            }
         }
 
         ::butler::__private::inventory::submit! { #name::JOB }

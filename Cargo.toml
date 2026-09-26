@@ -23,12 +23,14 @@ anyhow = "1.0.104"
 butler = { path = "crates/butler", version = "0.1.0" }
 # Exact: the macro expands to calls into `butler::__private`, so the two crates
 # are released in lockstep.
-butler-macros      = { path = "crates/butler-macros", version = "=0.1.0" }
-config             = { default-features = false, features = ["toml"], version = "0.15.26" }
-inventory          = "0.3.24"
-proc-macro2        = "1.0.107"
-quote              = "1.0.47"
-redis              = { default-features = false, version = "1.7.1" }
+butler-macros = { path = "crates/butler-macros", version = "=0.1.0" }
+config        = { default-features = false, features = ["toml"], version = "0.15.26" }
+inventory     = "0.3.24"
+proc-macro2   = "1.0.107"
+quote         = "1.0.47"
+redis         = { default-features = false, version = "1.7.1" }
+# Bundled: SQLite is compiled in, so there is no system library to install.
+rusqlite           = { features = ["bundled"], version = "0.40.2" }
 serde              = { features = ["derive"], version = "1.0.229" }
 serde_json         = "1.0.151"
 syn                = { features = ["full"], version = "2" }

@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use butler::{FileQueue, JobState, MemoryQueue, Queue};
+use butler::{Failed, FileQueue, JobState, MemoryQueue, NewJob, Queue};
 use serde_json::json;
 
 /// Whether `claim` with a wait blocks until a job arrives.
@@ -28,11 +28,18 @@ fn backends(test: &str) -> Vec<(Queue, Claim)> {
 
     let dir: PathBuf = std::env::temp_dir().join(format!("butler-backends-{unique}"));
     let _ = std::fs::remove_dir_all(&dir);
-    #[cfg_attr(not(feature = "redis"), allow(unused_mut))]
+    #[cfg_attr(not(any(feature = "redis", feature = "sqlite")), allow(unused_mut))]
     let mut all: Vec<(Queue, Claim)> = vec![
         (MemoryQueue::new().into(), Claim::Blocks),
         (FileQueue::new(&dir).unwrap().into(), Claim::ReturnsAtOnce),
     ];
+    #[cfg(feature = "sqlite")]
+    all.push((
+        butler::SqliteQueue::open(dir.with_extension("db"))
+            .unwrap()
+            .into(),
+        Claim::Blocks,
+    ));
     #[cfg(feature = "redis")]
     {
         let url = std::env::var("BUTLER_TEST_REDIS_URL")
@@ -55,12 +62,12 @@ fn claims_in_fifo_order_and_only_once() {
         let second = queue.push("b", "default", vec![json!(2)]).unwrap();
 
         let claimed = queue.claim("w1", DEFAULT, NOW).unwrap().unwrap();
-        assert_eq!(claimed.id, first, "{}", queue.describe());
-        assert_eq!(claimed.args, vec![json!(1)]);
+        assert_eq!(claimed.id(), first, "{}", queue.describe());
+        assert_eq!(claimed.args(), [json!(1)]);
         assert_eq!(queue.state(&first), Some(JobState::Processing));
 
         let next = queue.claim("w2", DEFAULT, NOW).unwrap().unwrap();
-        assert_eq!(next.id, second, "{}", queue.describe());
+        assert_eq!(next.id(), second, "{}", queue.describe());
         assert!(
             queue.claim("w1", DEFAULT, NOW).unwrap().is_none(),
             "{}",
@@ -70,22 +77,26 @@ fn claims_in_fifo_order_and_only_once() {
 }
 
 #[test]
-fn a_waiting_claim_wakes_when_a_job_arrives() {
+fn a_waiting_claim_wakes_when_a_job_arrives_on_any_of_its_queues() {
     for (queue, claim) in backends("wake") {
+        // Pushed to the worker's second queue: a backend that can only block on
+        // one queue would miss it until the wait runs out.
         let pusher = {
             let queue = queue.clone();
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(100));
-                queue.push("late", "default", vec![]).unwrap()
+                queue.push("late", "low", vec![]).unwrap()
             })
         };
         let started = Instant::now();
-        let claimed = queue.claim("w", DEFAULT, Duration::from_secs(5)).unwrap();
+        let claimed = queue
+            .claim("w", &["critical", "low"], Duration::from_secs(5))
+            .unwrap();
         let waited = started.elapsed();
         let pushed = pusher.join().unwrap();
         match claim {
             Claim::Blocks => {
-                assert_eq!(claimed.unwrap().id, pushed, "{}", queue.describe());
+                assert_eq!(claimed.unwrap().id(), pushed, "{}", queue.describe());
                 assert!(waited < Duration::from_secs(2), "{}", queue.describe());
             }
             Claim::ReturnsAtOnce => {
@@ -122,11 +133,14 @@ fn completing_stores_the_result() {
         let id = queue
             .push("sum", "default", vec![json!(2), json!(3)])
             .unwrap();
-        let mut job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
-        job.result = Some(json!({ "sum": 5 }));
-        queue.complete("w", &job).unwrap();
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        let done = queue.complete("w", job, json!({ "sum": 5 })).unwrap();
+        assert_eq!(
+            done.output::<serde_json::Value>().unwrap(),
+            json!({ "sum": 5 })
+        );
 
-        let (state, stored) = queue.get(&id).unwrap().unwrap();
+        let (state, stored) = queue.get(&id).unwrap().unwrap().into_parts();
         assert_eq!(state, JobState::Done, "{}", queue.describe());
         assert_eq!(
             stored.result,
@@ -142,19 +156,22 @@ fn failures_retry_then_die() {
     for (queue, _) in backends("fail") {
         let id = queue.push("flaky", "default", vec![]).unwrap();
         let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
-        assert_eq!(
-            queue.fail("w", job, "first".into(), 1).unwrap(),
-            JobState::Pending
-        );
+        let Failed::Retry(retry) = queue.fail("w", job, "first".into(), 1).unwrap() else {
+            panic!(
+                "{}: one failure with max_retries 1 is a retry",
+                queue.describe()
+            );
+        };
+        assert_eq!(retry.last_error(), Some("first"));
 
         let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
-        assert_eq!(job.attempts, 1, "{}", queue.describe());
-        assert_eq!(
-            queue.fail("w", job, "second".into(), 1).unwrap(),
-            JobState::Dead
-        );
+        assert_eq!(job.attempts(), 1, "{}", queue.describe());
+        let Failed::Dead(dead) = queue.fail("w", job, "second".into(), 1).unwrap() else {
+            panic!("{}: a second failure is dead", queue.describe());
+        };
+        assert_eq!(dead.error(), "second");
 
-        let (state, stored) = queue.get(&id).unwrap().unwrap();
+        let (state, stored) = queue.get(&id).unwrap().unwrap().into_parts();
         assert_eq!(state, JobState::Dead, "{}", queue.describe());
         assert_eq!(stored.last_error.as_deref(), Some("second"));
         assert!(
@@ -185,7 +202,7 @@ fn recover_requeues_only_workers_whose_heartbeat_expired() {
         assert_eq!(queue.state(&orphan), Some(JobState::Pending));
         assert_eq!(queue.state(&held), Some(JobState::Processing));
         assert_eq!(
-            queue.claim("new", DEFAULT, NOW).unwrap().unwrap().id,
+            queue.claim("new", DEFAULT, NOW).unwrap().unwrap().id(),
             orphan
         );
     }
@@ -197,7 +214,7 @@ fn a_retired_worker_leaves_nothing_to_recover() {
         queue.heartbeat("w", Duration::from_secs(60)).unwrap();
         queue.push("x", "default", vec![]).unwrap();
         let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
-        queue.complete("w", &job).unwrap();
+        queue.complete("w", job, json!(null)).unwrap();
         queue.retire("w").unwrap();
         assert_eq!(queue.recover().unwrap(), 0, "{}", queue.describe());
     }
@@ -215,13 +232,13 @@ fn claims_follow_the_given_queue_order_and_skip_unlisted_queues() {
             .claim("w", &["critical", "low"], NOW)
             .unwrap()
             .unwrap();
-        assert_eq!(first.id, critical, "{}", queue.describe());
-        assert_eq!(first.queue, "critical");
+        assert_eq!(first.id(), critical, "{}", queue.describe());
+        assert_eq!(first.queue(), "critical");
         let second = queue
             .claim("w", &["critical", "low"], NOW)
             .unwrap()
             .unwrap();
-        assert_eq!(second.id, low, "{}", queue.describe());
+        assert_eq!(second.id(), low, "{}", queue.describe());
 
         // "other" is never served unless listed.
         assert!(
@@ -249,7 +266,7 @@ fn retries_and_recovery_go_back_to_the_jobs_own_queue() {
         // A failed attempt goes back on "mailers", not "default".
         let job = queue.claim("w", mailers, NOW).unwrap().unwrap();
         assert_eq!(
-            queue.fail("w", job, "retry".into(), 3).unwrap(),
+            queue.fail("w", job, "retry".into(), 3).unwrap().state(),
             JobState::Pending
         );
         assert!(
@@ -263,7 +280,7 @@ fn retries_and_recovery_go_back_to_the_jobs_own_queue() {
             .heartbeat("crashed", Duration::from_millis(50))
             .unwrap();
         assert_eq!(
-            queue.claim("crashed", mailers, NOW).unwrap().unwrap().id,
+            queue.claim("crashed", mailers, NOW).unwrap().unwrap().id(),
             id
         );
         thread::sleep(Duration::from_millis(100));
@@ -274,6 +291,49 @@ fn retries_and_recovery_go_back_to_the_jobs_own_queue() {
             queue.describe()
         );
         let again = queue.claim("w", mailers, NOW).unwrap().unwrap();
-        assert_eq!((again.id.as_str(), again.attempts), (id.as_str(), 1));
+        assert_eq!((again.id(), again.attempts()), (id.as_str(), 1));
+    }
+}
+
+#[test]
+fn push_many_keeps_order_and_every_job_is_claimable() {
+    for (queue, _) in backends("push-many") {
+        let ids = queue
+            .push_many(vec![
+                NewJob {
+                    name: "a".into(),
+                    queue: "default".into(),
+                    args: vec![json!(1)],
+                },
+                NewJob {
+                    name: "b".into(),
+                    queue: "low".into(),
+                    args: vec![json!(2)],
+                },
+                NewJob {
+                    name: "c".into(),
+                    queue: "default".into(),
+                    args: vec![json!(3)],
+                },
+            ])
+            .unwrap();
+        assert_eq!(ids.len(), 3, "{}", queue.describe());
+        assert!(
+            ids.iter()
+                .all(|id| queue.state(id) == Some(JobState::Pending))
+        );
+
+        let first = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        let second = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        assert_eq!(
+            (first.id(), second.id()),
+            (ids[0].as_str(), ids[2].as_str()),
+            "{}",
+            queue.describe()
+        );
+        assert_eq!(second.args(), [json!(3)]);
+        let low = queue.claim("w", &["low"], NOW).unwrap().unwrap();
+        assert_eq!((low.id(), low.name()), (ids[1].as_str(), "b"));
+        assert!(queue.push_many(Vec::new()).unwrap().is_empty());
     }
 }

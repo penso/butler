@@ -15,6 +15,7 @@ lint:
     cargo clippy --locked -p butler --all-targets --no-default-features -- -D warnings
     cargo clippy --locked -p butler --all-targets --no-default-features --features tokio -- -D warnings
     cargo clippy --locked -p butler --all-targets --no-default-features --features redis -- -D warnings
+    cargo clippy --locked -p butler --all-targets --no-default-features --features sqlite -- -D warnings
 
 # The Redis test is skipped when no server is reachable; see `just redis`.
 test:

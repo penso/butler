@@ -73,7 +73,7 @@ async fn redis_roundtrip_with_retry() {
     running.await.unwrap();
 
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "via redis");
-    let dead = bad.job().await.unwrap().unwrap();
+    let dead = bad.job().await.unwrap().unwrap().record().clone();
     assert_eq!(dead.attempts, 2);
     assert_eq!(dead.last_error.as_deref(), Some("nope"));
     let _ = std::fs::remove_file(out);

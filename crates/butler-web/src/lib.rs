@@ -11,7 +11,7 @@
 //!     .layer(your_auth_layer);
 //! ```
 //!
-//! or run the `butler-web` binary, which reads `config.toml` like a worker.
+//! or run the `butler-web` binary, which reads `butler.toml` like a worker.
 //!
 //! The dashboard has no authentication of its own. Actions (retry, discard,
 //! cancel) are POSTs, and cross-site POSTs are rejected, so another site

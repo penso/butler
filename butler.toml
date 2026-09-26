@@ -1,4 +1,4 @@
-# butler settings, read by `butler::Config::load()` from the current directory.
+# Butler settings, read from ./butler.toml by `butler::Config::load()`.
 # Environment variables override any key, e.g. BUTLER_QUEUE__BACKEND=file.
 
 [queue]

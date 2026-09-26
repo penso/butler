@@ -1,4 +1,4 @@
-//! Loads settings from `config.toml`, with environment variables taking
+//! Loads settings from `butler.toml`, with environment variables taking
 //! precedence.
 //!
 //! ```toml
@@ -25,7 +25,7 @@
 //! ```
 //!
 //! The config file is `$BUTLER_CONFIG` if set (it must then exist), otherwise
-//! `./config.toml` if present. Environment variables override individual keys,
+//! `./butler.toml` if present. Environment variables override individual keys,
 //! using `__` between levels: `BUTLER_QUEUE__BACKEND=redis`,
 //! `BUTLER_QUEUE__REDIS__URL=redis://host/`, `BUTLER_WORKER__CONCURRENCY=8`.
 
@@ -247,11 +247,11 @@ impl WorkerConfig {
 }
 
 impl Config {
-    /// Loads from `$BUTLER_CONFIG`, or `./config.toml`, plus `BUTLER_*` env vars.
+    /// Loads from `$BUTLER_CONFIG`, or `./butler.toml`, plus `BUTLER_*` env vars.
     pub fn load() -> Result<Self> {
         match std::env::var_os("BUTLER_CONFIG") {
             Some(path) => Self::load_from(path, true),
-            None => Self::load_from("config.toml", false),
+            None => Self::load_from("butler.toml", false),
         }
     }
 

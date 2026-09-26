@@ -13,7 +13,7 @@
 //! butler::Worker::from_config(&butler::Config::load()?)?.run();
 //! ```
 //!
-//! `config.toml` chooses the backend: files on disk or Redis (see [`Config`]).
+//! `butler.toml` chooses the backend: files on disk or Redis (see [`Config`]).
 //!
 //! Without the `tokio` feature, it needs no async runtime: enqueuing writes a file
 //! and `Worker::run` drives each job with a minimal `block_on`. With `tokio` (the

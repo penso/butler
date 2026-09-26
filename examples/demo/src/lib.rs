@@ -60,7 +60,7 @@ pub async fn process_tick(
     })
 }
 
-/// Goes on the "critical" queue, which `config.toml` weights 3:1 over
+/// Goes on the "critical" queue, which `butler.toml` weights 3:1 over
 /// "default", so the worker picks these ahead of ticks when both are waiting.
 #[butler::job(queue = "critical")]
 pub async fn alert(tick: u64) {

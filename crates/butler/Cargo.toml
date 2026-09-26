@@ -16,9 +16,9 @@ workspace = true
 
 [features]
 default = ["redis", "sqlite", "tokio"]
-# Adds the Redis backend (`backend = "redis"` in config.toml).
+# Adds the Redis backend (`backend = "redis"` in butler.toml).
 redis = ["dep:redis"]
-# Adds the SQLite backend (`backend = "sqlite"` in config.toml), with SQLite bundled.
+# Adds the SQLite backend (`backend = "sqlite"` in butler.toml), with SQLite bundled.
 sqlite = ["dep:rusqlite"]
 # Adds `Worker::run_async` and makes enqueueing from inside a tokio runtime non-blocking.
 tokio = ["dep:tokio"]

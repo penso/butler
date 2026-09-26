@@ -216,7 +216,7 @@ progress from one place.
 just web        # or: cargo run -p butler-web   ->  http://127.0.0.1:9090
 ```
 
-It reads the same `config.toml` as the workers, so it sees whichever backend
+It reads the same `butler.toml` as the workers, so it sees whichever backend
 they use. To embed it in your own axum app, behind your own authentication:
 `butler_web::Dashboard::new(queue).base_path("/admin/jobs").router()`. It has
 a light theme too, and history for Redis, SQLite and memory (the file backend
@@ -406,7 +406,7 @@ flowchart LR
         rt1 --- enqueue
     end
 
-    subgraph backend["queue backend (from config.toml)"]
+    subgraph backend["queue backend (from butler.toml)"]
         direction TB
         redis[("redis<br/>LIST butler:queue:QUEUE")]
         sqlite[("sqlite<br/>TABLE butler_jobs")]
@@ -490,7 +490,7 @@ when it comes back. Every 7th job fails on purpose so you can see a retry,
 then a dead job, then the injector receiving the failure.
 
 ```sh
-# Redis backend (what config.toml selects):
+# Redis backend (what butler.toml selects):
 docker run -d --rm --name butler-redis -p 6379:6379 redis:8-alpine
 
 cargo run -p demo --bin worker      # terminal 1
@@ -501,7 +501,7 @@ BUTLER_QUEUE__BACKEND=file cargo run -p demo --bin worker
 BUTLER_QUEUE__BACKEND=file cargo run -p demo --bin injector
 ```
 
-Run both from the repository root, so they read the same `config.toml`. Press
+Run both from the repository root, so they read the same `butler.toml`. Press
 Ctrl-C in the worker to stop it. It stops taking jobs and waits for the ones
 already running to finish.
 
@@ -896,8 +896,13 @@ its body.
 
 ## Configuration
 
-`butler::Config::load()` reads `./config.toml`, or the file named by
-`$BUTLER_CONFIG`. Every key is optional.
+`butler::Config::load()` reads `./butler.toml`, or the file named by
+`$BUTLER_CONFIG`. Every key is optional. If `butler.toml` is absent, defaults
+and environment overrides apply; an explicit `$BUTLER_CONFIG` path must exist.
+
+Butler does not automatically read `config.toml`, so it can coexist with the
+host application's configuration. To migrate, rename your Butler config to
+`butler.toml`, or explicitly select the old file with `BUTLER_CONFIG=config.toml`.
 
 ```toml
 [queue]
@@ -945,7 +950,7 @@ To build without Redis, for example to use only the file backend:
 butler = { path = "...", default-features = false, features = ["tokio"] }
 ```
 
-If `config.toml` selects `redis` in a build without the feature,
+If `butler.toml` selects `redis` in a build without the feature,
 `Config::connect()` returns an error saying so.
 
 ## Backends
@@ -1075,7 +1080,7 @@ watcher open their own connections.
 
 `crates/butler/src/backend/memory.rs`. Everything lives in the process, behind
 one lock: no Redis, no files, nothing to set up. `MemoryQueue::new()` gives an
-isolated queue (clones share it), and `backend = "memory"` in `config.toml`
+isolated queue (clones share it), and `backend = "memory"` in `butler.toml`
 gives one shared queue per process. It follows the same rules as the other
 backends, heartbeats and recovery included, and a waiting claim wakes as soon
 as a job is pushed. Use it for tests, benchmarks, and apps whose workers run
@@ -1117,7 +1122,7 @@ crates/butler/                   the library (published as `butler`)
   src/backend/redis.rs           Redis backend (feature "redis")
   src/backend/sqlite.rs          SQLite backend (feature "sqlite")
   src/backend/memory.rs          in-process backend
-  src/config.rs                  config.toml loading
+  src/config.rs                  butler.toml loading
   src/worker.rs                  Worker: run (threads), run_async (tokio), drain
   src/executor.rs                minimal block_on for runtime-free use
   tests/                         end-to-end tests (file, tokio, redis, retries,

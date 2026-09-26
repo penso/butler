@@ -92,7 +92,7 @@ SQLite, file, memory) and the `butler-web` dashboard.
 
 - **Missing:** cron-style schedules, such as a nightly report.
 - **Approach:**
-  - `[[recurring]]` entries in `config.toml` (`job`, `cron`, `args`, `queue`),
+  - `[[recurring]]` entries in `butler.toml` (`job`, `cron`, `args`, `queue`),
     or `Worker::recurring(job::prepare(..)?, "0 3 * * *")` in code.
   - Exactly one enqueue per tick across all workers: key each tick by
     `(schedule, tick time)` and make the backend's push idempotent on that key

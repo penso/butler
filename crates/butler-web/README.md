@@ -9,7 +9,7 @@ and inspect arguments, results, errors, and saved progress.
 
 ## Run it
 
-As its own server, reading `config.toml` (or `BUTLER_*` variables) like a
+As its own server, reading `butler.toml` (or `BUTLER_*` variables) like a
 worker:
 
 ```sh

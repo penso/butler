@@ -27,7 +27,7 @@ after crashes. Reliability and correct job lifecycle semantics come first.
 | `crates/butler/src/worker.rs` | Claiming, running, retrying: `run` (threads), `run_async` (tokio), `drain` |
 | `crates/butler/src/queues.rs`, `limits.rs`, `signal.rs` | Queue priority, concurrency limits, and wake-ups |
 | `crates/butler/src/monitor.rs` | Dashboard statistics, filters, and metric history |
-| `crates/butler/src/config.rs` | `config.toml` and `BUTLER_*` environment loading |
+| `crates/butler/src/config.rs` | `butler.toml` and `BUTLER_*` environment loading |
 | `crates/butler/src/lib.rs` | Public API, the global queue, the `#[job]` enqueue helpers |
 | `crates/butler-macros/` | The `#[job]` attribute macro |
 | `crates/butler-web/` | Dashboard: axum routes, Askama templates, Tailwind CSS, uPlot charts, SSE |
@@ -123,9 +123,9 @@ after crashes. Reliability and correct job lifecycle semantics come first.
 
 ## Configuration And Local Development
 
-- `Config::load()` reads `./config.toml` or `$BUTLER_CONFIG`; `BUTLER_*`
+- `Config::load()` reads `./butler.toml` or `$BUTLER_CONFIG`; `BUTLER_*`
   environment variables override keys, with `__` between levels.
-- Update validation, defaults, the root `config.toml`, and README examples
+- Update validation, defaults, the root `butler.toml`, and README examples
   together when changing configuration. The checked-in config selects Redis;
   the library's default backend is file.
 - Run `just redis`, then `just worker`, `just injector`, and `just web` in

@@ -3,7 +3,7 @@
 //!
 //!   cargo run -p demo --bin worker
 //!
-//! Backend and worker settings come from ./config.toml (see butler::Config).
+//! Backend and worker settings come from ./butler.toml (see butler::Config).
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

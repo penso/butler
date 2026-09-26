@@ -31,7 +31,7 @@ Here's what's still missing, roughly in order of how much you'd miss it:
 
 Not needed in Rust:
 - GlobalID (passing ActiveRecord objects by reference): serde covers serialization, and passing ids is the norm anyway.
-- Choosing a queue backend per job: butler picks one backend from config.toml.
+- Choosing a queue backend per job: butler picks one backend from butler.toml.
 - Carrying locale and time zone into the job: not applicable to butler.
 
 I'd do 1 and 2 together first, since they're what makes failure handling production-grade, then 3 and 4. Want me to start?

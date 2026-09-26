@@ -64,7 +64,7 @@ impl MemoryQueue {
         Self::default()
     }
 
-    /// The queue that `backend = "memory"` in `config.toml` refers to: one per
+    /// The queue that `backend = "memory"` in `butler.toml` refers to: one per
     /// process, so an enqueuer and a worker configured separately still meet.
     pub fn shared() -> Self {
         static SHARED: OnceLock<MemoryQueue> = OnceLock::new();

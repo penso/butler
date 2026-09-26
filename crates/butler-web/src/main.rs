@@ -1,4 +1,4 @@
-//! `butler-web`: the dashboard as its own server, reading `config.toml` (or
+//! `butler-web`: the dashboard as its own server, reading `butler.toml` (or
 //! `BUTLER_*` variables) like a worker does.
 //!
 //!   butler-web                  # http://127.0.0.1:9090
@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
     let listen = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:9090".to_owned());
-    let config = butler::Config::load().context("loading config.toml")?;
+    let config = butler::Config::load().context("loading Butler configuration")?;
     let queue = config
         .connect()
         .context("connecting to the queue backend")?;

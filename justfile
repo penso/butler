@@ -54,7 +54,7 @@ check-diagrams:
 web-css:
     cd crates/butler-web && tailwindcss -i ui/input.css -o assets/app.css --minify
 
-# The dashboard, reading ./config.toml like the demo worker: http://127.0.0.1:9090
+# The dashboard, reading ./butler.toml like the demo worker: http://127.0.0.1:9090
 web:
     cargo run --locked -p butler-web
 

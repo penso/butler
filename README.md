@@ -4,8 +4,8 @@
 
 ```rust
 tokio::time::sleep(Duration::from_millis(200)).await; // runs here
-let job = generate_report(user_id).await?;          // queued for a worker
-let report: Option<Report> = job.result().await?;    // typed result, when ready
+let job = generate_report(user_id).await?;            // queued for a worker
+let report: Option<Report> = job.result().await?;     // typed result, when ready
 ```
 
 **The same `.await`. A different place to run.** Butler saves the job to a

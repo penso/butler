@@ -1,0 +1,37 @@
+[package]
+categories.workspace   = true
+description            = "Sidekiq-style background jobs: `.await` a #[job] function to enqueue it, and a worker runs it"
+edition.workspace      = true
+keywords               = ["background", "jobs", "queue", "redis", "sidekiq"]
+name                   = "butler"
+readme                 = "../../README.md"
+rust-version.workspace = true
+version.workspace      = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["redis", "tokio"]
+# Adds the Redis backend (`backend = "redis"` in config.toml).
+redis = ["dep:redis"]
+# Adds `Worker::run_async` and makes enqueueing from inside a tokio runtime non-blocking.
+tokio = ["dep:tokio"]
+
+[dependencies]
+anyhow.workspace        = true
+butler-macros.workspace = true
+config.workspace        = true
+inventory.workspace     = true
+redis                   = { optional = true, workspace = true }
+serde.workspace         = true
+serde_json.workspace    = true
+thiserror.workspace     = true
+tokio                   = { features = ["macros", "rt", "sync", "time"], optional = true, workspace = true }
+tracing.workspace       = true
+
+[dev-dependencies]
+tokio = { features = ["macros", "rt-multi-thread", "sync", "time"], workspace = true }

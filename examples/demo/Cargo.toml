@@ -1,6 +1,7 @@
 [package]
 edition.workspace      = true
 name                   = "demo"
+publish                = false
 rust-version.workspace = true
 version.workspace      = true
 

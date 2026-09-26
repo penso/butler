@@ -13,13 +13,16 @@ Engineering guidance for agents working in this repository. Read it alongside
 
 | Location | Responsibility |
 | --- | --- |
-| `src/backend/` | `Backend` trait and the file and Redis queues |
-| `src/worker.rs` | Claiming, running, retrying: `run` (threads), `run_async` (tokio), `drain` |
-| `src/config.rs` | `config.toml` and `BUTLER_*` environment loading |
-| `src/lib.rs` | Public API, the global queue, the `#[job]` enqueue helpers |
-| `butler-macros/` | The `#[job]` attribute macro |
-| `demo/` | `injector` and `worker` binaries sharing one job crate |
+| `crates/butler/src/backend/` | `Backend` trait and the file and Redis queues |
+| `crates/butler/src/worker.rs` | Claiming, running, retrying: `run` (threads), `run_async` (tokio), `drain` |
+| `crates/butler/src/config.rs` | `config.toml` and `BUTLER_*` environment loading |
+| `crates/butler/src/lib.rs` | Public API, the global queue, the `#[job]` enqueue helpers |
+| `crates/butler-macros/` | The `#[job]` attribute macro |
+| `examples/demo/` | `injector` and `worker` binaries sharing one job crate; not published |
 
+- `butler` and `butler-macros` are published together with the same version;
+  `butler` pins the macros with `=`. The macro's output may only call
+  `butler::__private` items that exist in that exact version.
 - `.await` on a `#[job]` function enqueues; it never runs the body. Keep that
   contract, and keep the enqueue return type distinct from the job's own.
 - The worker and the enqueue path only talk to storage through `Backend`. A

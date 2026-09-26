@@ -1,9 +1,10 @@
-//! Two-process demo:
+//! The same two-process flow as `examples/demo`, without tokio: the worker
+//! runs jobs on plain threads and `.await` is driven by `butler::block_on`.
 //!
-//!   cargo run --example demo -- worker            # terminal 1
-//!   cargo run --example demo -- enqueue Ada 3     # terminal 2
+//!   cargo run -p butler --example no_tokio -- worker            # terminal 1
+//!   cargo run -p butler --example no_tokio -- enqueue Ada 3     # terminal 2
 //!
-//! Both processes use `./.butler` (override with BUTLER_DIR).
+//! Both read the queue settings from ./config.toml (see `butler::Config`).
 
 use std::time::Duration;
 

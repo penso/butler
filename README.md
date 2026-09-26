@@ -156,7 +156,7 @@ stateDiagram-v2
 
 ## Running the demo
 
-`demo/` has two binaries that share one job (`demo::process_tick`). The
+`examples/demo/` has two binaries that share one job (`demo::process_tick`). The
 injector enqueues a job every second from a tokio main loop. The worker runs
 the jobs in its own tokio main loop, up to 4 at a time. Each job sleeps
 1.5s on the tokio timer, and every 7th job fails on purpose so you can see a
@@ -272,13 +272,13 @@ If `config.toml` selects `redis` in a build without the feature,
 Both backends implement `butler::Backend` (`push`, `claim`, `complete`,
 `fail`, `get`). The worker and the enqueue path only use that trait.
 
-**File** (`src/backend/file.rs`). One JSON file per job, under
+**File** (`crates/butler/src/backend/file.rs`). One JSON file per job, under
 `pending/ processing/ done/ dead/`. Each write goes to `tmp/` first and is then
 renamed into place, so a worker never reads a half-written file. A claim is a
 `rename` from `pending/` to `processing/`, which is atomic. When several
 workers race for a job, exactly one rename succeeds.
 
-**Redis** (`src/backend/redis.rs`). Uses lists, the same layout idea as Sidekiq:
+**Redis** (`crates/butler/src/backend/redis.rs`). Uses lists, the same layout idea as Sidekiq:
 
 | Key | Type | Purpose |
 |---|---|---|
@@ -312,17 +312,20 @@ connected. A list keeps each job until exactly one worker takes it.
 ## Layout
 
 ```text
-src/lib.rs               public API, global queue, enqueue helper
-src/job.rs               Job, JobId, JobState
-src/backend/mod.rs       Backend trait, Queue handle
-src/backend/file.rs      file backend
-src/backend/redis.rs     Redis backend (feature "redis")
-src/config.rs            config.toml loading
-src/worker.rs            Worker: run (threads), run_async (tokio), drain
-src/executor.rs          minimal block_on for runtime-free use
-butler-macros/           #[job] attribute macro
-demo/                    injector + worker binaries
-tests/                   end-to-end tests (file, tokio, redis, retries)
+Cargo.toml                       workspace: shared metadata, lints, dependency versions
+crates/butler/                   the library (published as `butler`)
+  src/lib.rs                     public API, global queue, enqueue helper
+  src/job.rs                     Job, JobId, JobState
+  src/backend/mod.rs             Backend trait, Queue handle
+  src/backend/file.rs            file backend
+  src/backend/redis.rs           Redis backend (feature "redis")
+  src/config.rs                  config.toml loading
+  src/worker.rs                  Worker: run (threads), run_async (tokio), drain
+  src/executor.rs                minimal block_on for runtime-free use
+  tests/                         end-to-end tests (file, tokio, redis, retries)
+  examples/no_tokio.rs           the same flow without tokio
+crates/butler-macros/            #[job] attribute macro (published as `butler-macros`)
+examples/demo/                   injector + worker binaries (not published)
 justfile                 format, lint, test, audit and demo tasks
 deny.toml, taplo.toml    dependency policy, TOML formatting
 ```
@@ -339,6 +342,7 @@ just audit-deps    # cargo deny: advisories, bans, sources
 just redis         # throwaway Redis for the demo and the Redis test
 just worker        # demo worker
 just injector      # demo injector
+just publish-dry-run  # package and verify both crates as crates.io would
 ```
 
 Workspace lints deny `unsafe_code`, `unused_qualifications`, `unwrap_used` and

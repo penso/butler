@@ -1,8 +1,11 @@
 [workspace]
-members  = ["butler-macros", "demo"]
+members  = ["crates/butler", "crates/butler-macros", "examples/demo"]
 resolver = "3"
 
+# Shared by every crate. Published crates also need `license` (and ideally
+# `repository`) here before `cargo publish`.
 [workspace.package]
+categories   = ["asynchronous", "concurrency"]
 edition      = "2024"
 rust-version = "1.96"
 version      = "0.1.0"
@@ -16,9 +19,11 @@ expect_used = "deny"
 unwrap_used = "deny"
 
 [workspace.dependencies]
-anyhow             = "1.0.104"
-butler             = { path = "." }
-butler-macros      = { path = "butler-macros", version = "0.1.0" }
+anyhow = "1.0.104"
+butler = { path = "crates/butler", version = "0.1.0" }
+# Exact: the macro expands to calls into `butler::__private`, so the two crates
+# are released in lockstep.
+butler-macros      = { path = "crates/butler-macros", version = "=0.1.0" }
 config             = { default-features = false, features = ["toml"], version = "0.15.26" }
 inventory          = "0.3.24"
 proc-macro2        = "1.0.107"
@@ -31,34 +36,3 @@ thiserror          = "2.0.19"
 tokio              = { default-features = false, version = "1.53.1" }
 tracing            = "0.1"
 tracing-subscriber = { default-features = false, features = ["ansi", "fmt", "std"], version = "0.3" }
-
-[package]
-edition.workspace      = true
-name                   = "butler"
-rust-version.workspace = true
-version.workspace      = true
-
-[lints]
-workspace = true
-
-[features]
-default = ["redis", "tokio"]
-# Adds the Redis backend (`backend = "redis"` in config.toml).
-redis = ["dep:redis"]
-# Adds `Worker::run_async` and makes enqueueing from inside a tokio runtime non-blocking.
-tokio = ["dep:tokio"]
-
-[dependencies]
-anyhow.workspace        = true
-butler-macros.workspace = true
-config.workspace        = true
-inventory.workspace     = true
-redis                   = { optional = true, workspace = true }
-serde.workspace         = true
-serde_json.workspace    = true
-thiserror.workspace     = true
-tokio                   = { features = ["macros", "rt", "sync", "time"], optional = true, workspace = true }
-tracing.workspace       = true
-
-[dev-dependencies]
-tokio = { features = ["macros", "rt-multi-thread", "sync", "time"], workspace = true }

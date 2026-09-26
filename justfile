@@ -32,6 +32,14 @@ audit-workflows:
     actionlint .github/workflows/*.yml
     zizmor .github/
 
+# Package and verify both crates the way crates.io would, without uploading.
+publish-dry-run:
+    cargo publish --locked --workspace --dry-run
+
+# Publishes butler-macros, then butler. Needs `cargo login` and a license in Cargo.toml.
+publish:
+    cargo publish --locked --workspace
+
 # A throwaway Redis for the demo and the Redis test.
 redis:
     docker run -d --rm --name butler-redis -p 6379:6379 redis:8-alpine

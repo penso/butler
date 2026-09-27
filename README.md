@@ -67,7 +67,8 @@ types, and the `reports` module belong to your application. See
 - **Resumable work.** Typed checkpoints let long jobs continue after a deploy,
   crash, or failed attempt.
 - **Controlled concurrency.** Named queues, strict or weighted priority,
-  per-queue limits, and bulk enqueueing. Async jobs run as Tokio tasks;
+  per-queue limits, per-key limits across workers ("one sync per account"),
+  unique jobs, and bulk enqueueing. Async jobs run as Tokio tasks;
   synchronous jobs use its blocking pool. A thread worker also runs without Tokio.
 - **Built-in visibility.** A live web dashboard for throughput, workers,
   queues, job details, scheduled jobs, and retry/cancel/discard/run-now actions.
@@ -103,6 +104,7 @@ crashes; storage durability still depends on the backend's configuration.
   - [Testing](#testing)
   - [Queues and priority](#queues-and-priority)
   - [Concurrency and cores](#concurrency-and-cores)
+  - [Per-key concurrency and unique jobs](#per-key-concurrency-and-unique-jobs)
 - [Configuration](#configuration)
 - [Cargo features](#cargo-features)
 - [Backends](#backends)
@@ -551,6 +553,12 @@ pub async fn send_digest(user_id: u64) { ... }
 
 #[butler::job(retries = 10, backoff = "polynomial")]  // its own retry policy
 pub async fn sync_crm(account_id: u64) -> Result<(), CrmError> { ... }
+
+#[butler::job(concurrency_key = "account_id", limit = 1)]  // one per account at a time
+pub async fn sync_account(account_id: u64, full: bool) { ... }
+
+#[butler::job(unique = "until_started")]      // one waiting at a time, per arguments
+pub async fn refresh_feed(user_id: u64) { ... }
 
 #[butler::job]                                // a plain fn: CPU-bound work
 pub fn thumbnail(path: PathBuf) -> Result<Vec<u8>, ImageError> { ... }
@@ -1120,6 +1128,54 @@ Rayon isn't needed for this: tokio already spreads jobs over cores. A single
 job that wants to split its own work across cores can still call rayon inside
 its body.
 
+### Per-key concurrency and unique jobs
+
+**"At most N at a time per key"**, like Solid Queue's `limits_concurrency`:
+one sync per account, two exports per tenant.
+
+```rust
+#[butler::job(concurrency_key = "account_id", limit = 1)]
+async fn sync_account(account_id: u64, full: bool) -> Result<(), SyncError> { ... }
+
+#[butler::job(concurrency_key = "tenant, region", limit = 2)]   // several arguments
+async fn export(tenant: String, region: String, since: u64) { ... }
+```
+
+- The key is the job's name and the named arguments' values, computed when
+  the job is enqueued and stored with it: `sync_account(42, true)` has the
+  key `sync_account:[42]`. The macro checks the names at compile time (a typo
+  or the job's `Progress` doesn't compile), and `limit` defaults to 1.
+- The limit holds **across every worker**: the backend counts the running jobs
+  of each key, and a claim skips a job whose key is full and takes the next
+  one, so a busy account never holds back the others. The skipped job stays
+  pending, in its place, and runs as soon as a job with its key finishes.
+- A job holds its key until it completes, fails (retry, backoff, dead), or
+  is interrupted at a checkpoint; a crashed worker's keys come back when
+  recovery requeues its jobs.
+
+**Unique jobs**, like Sidekiq Enterprise's: don't enqueue a job if an
+identical one (same name, same arguments) is already there.
+
+```rust
+#[butler::job(unique = "until_started")]
+async fn refresh_feed(user_id: u64) { ... }
+
+let a = refresh_feed(7).await?;
+let b = refresh_feed(7).await?;     // the same job: b.id() == a.id()
+```
+
+- `"until_started"`: identical jobs are kept out while it waits (pending or
+  scheduled); once a worker starts it, a new one can be enqueued, for
+  example to pick up changes made during the run.
+- `"until_finished"`: kept out until it is done, dead or cancelled, retries
+  included.
+- Enqueueing a duplicate stores nothing and returns a handle to the job
+  that holds the key, through every enqueue path (`.await`, `prepare(..)`,
+  `enqueue_all`, duplicates within one batch included). The check and the
+  store are one atomic step in every backend.
+- Inside `testing::perform_enqueued_jobs`, jobs run inline as before: no keys
+  apply.
+
 ## Configuration
 
 `butler::Config::load()` reads `./butler.toml`, or the file named by
@@ -1233,6 +1289,12 @@ yet due. A heartbeat is the file `workers/<worker>` holding its expiry
 time. The file backend can't block waiting for a job, so idle workers sleep
 `poll_interval_ms` between checks.
 
+A pending job with a concurrency key is named `<id>~<key hash>~<limit>.json`,
+so claims skip jobs whose key is full without reading them; running keyed
+jobs hold a slot file in `ckeys/<key hash>/`, taken by an exclusive hard link.
+A unique job's push hard-links a lock to `unique/<key hash>`; replacing a lock
+left behind by a crashed process is best effort.
+
 ### Redis
 
 `crates/butler/src/backend/redis.rs`. Stores queued job ids in Redis lists:
@@ -1247,11 +1309,22 @@ time. The file backend can't block waiting for a job, so idle workers sleep
 | `butler:dead` | LIST | ids that exhausted their retries |
 | `butler:wake` | pub/sub channel | a message per push, retry and recovery; wakes idle workers |
 | `butler:done` | pub/sub channel | a message per job done, dead or cancelled; wakes `wait_result` |
-| `butler:job:<id>` | HASH | `state`, `queue`, and `data` (job JSON); done and cancelled jobs expire after 24h |
+| `butler:job:<id>` | HASH | `state`, `queue`, and `data` (job JSON), plus `ckey`/`climit` and `ukey`/`umode` for keyed and unique jobs; done and cancelled jobs expire after 24h |
+| `butler:running:<key>` | SET | ids running with a concurrency key (by the key's hash) |
+| `butler:blocked:<key>` | LIST | ids skipped because their concurrency key was full |
+| `butler:blocked` | HASH | per queue, how many of its ids wait in blocked lists |
+| `butler:blocked_keys` | SET | concurrency keys that ever had skipped jobs |
+| `butler:unique:<key>` | STRING | the id of the job holding a unique key (by the key's hash) |
 
-A claim is an `LMOVE queue:<queue> processing:<worker>` for each queue the
-worker serves, in its priority order. Redis runs each one atomically, so only
-one worker gets each job.
+A claim is one Lua script per queue the worker serves, in its priority
+order: it moves the job's id from `queue:<queue>` to `processing:<worker>`
+and marks it processing in one step, so only one worker gets each job. A job
+whose concurrency key already has `limit` ids in `running:<key>` is parked on
+`blocked:<key>` instead, and the script takes the next one; when a job with
+that key completes, fails or is recovered, the oldest parked job goes back
+to the claim end of its queue, in the same step. Parked jobs stay pending:
+they are counted, listed and cancellable. A unique job is pushed by a script
+that checks `unique:<key>` and the job it names first.
 
 **Idle workers are woken by pub/sub, not polling.** Every push, retry and
 recovery also `PUBLISH`es to `butler:wake`. Each worker process keeps one
@@ -1286,7 +1359,7 @@ processes on the same machine:
 
 | Table | Columns | Purpose |
 |---|---|---|
-| `butler_jobs` | `id, queue, state, worker, seq, data, run_at` | every job; `data` is the job JSON, `seq` the order in its queue, `run_at` a scheduled job's time in ms |
+| `butler_jobs` | `id, queue, state, worker, seq, data, run_at, ckey, climit, ukey, umode` | every job; `data` is the job JSON, `seq` the order in its queue, `run_at` a scheduled job's time in ms, then its concurrency and unique keys |
 | `butler_workers` | `worker, expires_at_ms` | heartbeats, for crash recovery |
 
 A claim is one `UPDATE ... RETURNING` that moves the oldest pending row of a
@@ -1300,6 +1373,12 @@ promotion turns the due ones into `pending` rows at the back of their queue,
 in one transaction. It reads `MIN(run_at)` first (indexed), so it only takes
 the write lock when something is due. Databases created by earlier versions
 get the `run_at` column and its index when opened.
+
+The claim's `UPDATE` only takes a pending row whose concurrency key has fewer
+than `climit` processing rows, so it skips jobs whose key is full; nothing
+needs releasing, since only processing rows count. A unique job's push looks
+for a job holding its key and inserts in the same immediate transaction.
+Databases from before these columns get them when opened.
 
 **Waking waiters without a server.** SQLite has no pub/sub between processes:
 its hooks only see changes made through the same connection. butler combines
@@ -1333,7 +1412,10 @@ memory until the process exits.
 `crates/butler/tests/backends.rs` runs the same contract checks (FIFO claims,
 waking on push, cancel against claim, results, retries, recovery, scheduled
 jobs: not claimable early, claimable once due, promoted to their own queue,
-cancel against promotion) against all four backends.
+cancel against promotion; concurrency keys: skipped when full, never
+exceeded by concurrent claims, freed by every way out of processing and by
+recovery; unique jobs: stored once under concurrent pushes, freed at the
+right point) against all four backends.
 
 **Upgrading.** Scheduled jobs add a `scheduled` state, which retries waiting
 out their backoff use too. Deploy this version to every worker and dashboard
@@ -1342,6 +1424,17 @@ promote them, and reading one fails with `Error::UnknownState`. Jobs already
 queued need nothing: their records read as before. Retries now wait
 (exponential backoff by default); `backoff = "fixed:0s"` in `[worker]` keeps
 the old immediate retries.
+
+**Upgrading to concurrency keys and unique jobs.** Deploy this version to
+every worker and dashboard before enqueueing jobs that use them. Records
+gain optional `concurrency` and `unique` fields, which older versions ignore
+when reading but drop when they rewrite a job (a retry, a checkpoint), and
+older workers neither respect nor release keys. Storage additions: in Redis
+the `running:`, `blocked:`, `blocked`, `blocked_keys` and `unique:` keys, and
+the claim is now a script (one round trip instead of two); in SQLite four
+`butler_jobs` columns and two indexes, added when a database is opened; for
+the file backend `ckeys/` and `unique/` directories and keyed pending file
+names. Jobs without keys are stored and claimed as before.
 
 ## Limitations
 

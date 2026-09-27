@@ -8,13 +8,18 @@
 //! <prefix>:worker:<worker>       STRING  heartbeat; expires unless the worker refreshes it
 //! <prefix>:workers               SET   worker ids that may hold jobs
 //! <prefix>:dead                  LIST  ids that exhausted their retries
-//! <prefix>:job:<id>              HASH  { state, queue, data (job JSON) }
+//! <prefix>:job:<id>              HASH  { state, queue, data (job JSON), ckey, climit, ukey, umode }
+//! <prefix>:running:<key>         SET   ids running with that concurrency key (by its hash)
+//! <prefix>:blocked:<key>         LIST  ids skipped because their concurrency key was full
+//! <prefix>:blocked               HASH  per queue, how many of its ids wait in blocked lists
+//! <prefix>:blocked_keys          SET   concurrency keys that ever had skipped jobs
+//! <prefix>:unique:<key>          STRING  the id of the job holding that unique key (by its hash)
 //! ```
 //!
-//! A claim is an `LMOVE queue:<q> processing:<worker>` for each queue the
-//! worker serves, in its priority order, which Redis runs atomically, so only
-//! one worker gets each job, and the job never exists only in a worker's
-//! memory.
+//! A claim is one script per queue the worker serves, in its priority order:
+//! it pops the job's id from `queue:<q>`, pushes it on `processing:<worker>`
+//! and marks it processing, all at once, so only one worker gets each job,
+//! and the job never exists only in a worker's memory.
 //!
 //! Waiting is push-based. Every push, retry and recovery also `PUBLISH`es to
 //! `<prefix>:wake`; a listener thread per worker process turns those messages
@@ -25,14 +30,29 @@
 //! ids in its processing list back to the front of their own queues, one atomic
 //! script call per job.
 //!
-//! Cancelling is `LREM queue:<q>`, also atomic: either a worker's claim or the
-//! cancel gets the id, never both.
+//! Cancelling is one script too (`ZREM scheduled`, then `LREM queue:<q>`,
+//! then the job's blocked list): either a worker's claim or the cancel gets
+//! the id, never both.
 //!
 //! A scheduled job's id waits in the `scheduled` sorted set. Promotion is one
 //! script that moves every due id onto the back of its own queue, so a job
 //! moves exactly once however many workers promote. Cancelling a scheduled
-//! job is a `ZREM`, checked before the queue: an id only ever moves from the
-//! set to a queue, so between the two checks it can't slip past both.
+//! job is part of the cancel script, so it can't slip between the set and
+//! the queue.
+//!
+//! A claim is one script per queue: it pops the oldest id, and if the job's
+//! concurrency key already has `climit` ids in `running:<key>`, parks it on
+//! `blocked:<key>` and pops the next one, so a full key never holds back the
+//! jobs behind it. A claimed keyed job joins `running:<key>`. Completing,
+//! failing or recovering it leaves that set and moves the oldest parked job
+//! of the key back to the claim end of its queue, in the same script. Parked
+//! jobs stay `pending`: they are counted, listed and cancellable.
+//!
+//! A unique job's push is a script that stores it only if `unique:<key>` is
+//! free, or names a job that no longer holds it (done, dead, cancelled, or
+//! started for `until_started`), and returns the holder otherwise. The lock
+//! is cleared at claim (`until_started`), or when the job is done, dead or
+//! cancelled.
 //!
 //! We use lists instead of `PUBLISH`/`SUBSCRIBE` because pub/sub delivers each
 //! message to every subscriber, and messages sent while no worker is connected
@@ -94,10 +114,43 @@ end
 return 0
 ";
 
+/// Frees what job `id` holds as it leaves processing (Lua, used by the
+/// scripts below): its concurrency key, moving the oldest job parked on that
+/// key back to the claim end of its queue, and, when `finish` is true, its
+/// unique key if it still holds it.
+const RELEASE_FN: &str = r"
+local function release(p, id, finish)
+  local f = redis.call('HMGET', p .. 'job:' .. id, 'ckey', 'ukey')
+  if f[1] then
+    redis.call('SREM', p .. 'running:' .. f[1], id)
+    local parked = redis.call('RPOP', p .. 'blocked:' .. f[1])
+    if parked then
+      local queue = redis.call('HGET', p .. 'job:' .. parked, 'queue')
+      if queue then
+        redis.call('RPUSH', p .. 'queue:' .. queue, parked)
+        redis.call('HINCRBY', p .. 'blocked', queue, -1)
+        redis.call('PUBLISH', p .. 'wake', queue)
+      end
+    end
+  end
+  if finish and f[2] and redis.call('GET', p .. 'unique:' .. f[2]) == id then
+    redis.call('DEL', p .. 'unique:' .. f[2])
+  end
+end
+";
+
+/// Frees what job ARGV[2] holds; ARGV[1] is the key prefix, ARGV[3] `1`
+/// when the job finished (done or dead), `0` for a retry.
+const RELEASE: &str = r"
+release(ARGV[1], ARGV[2], ARGV[3] == '1')
+return 0
+";
+
 /// Moves the oldest id out of a processing list (KEYS[1]) to the claim end of
 /// its own queue, and marks it pending, as one atomic step: two workers
 /// recovering at once can't move the same job, or send one to the wrong queue.
-/// Returns the id, or nil once the list is empty. ARGV[1] is the key prefix.
+/// Frees its concurrency key. Returns the id, or nil once the list is empty.
+/// ARGV[1] is the key prefix.
 const RECOVER_ONE: &str = r"
 local id = redis.call('RPOP', KEYS[1])
 if not id then return false end
@@ -105,9 +158,104 @@ local job = ARGV[1] .. 'job:' .. id
 local queue = redis.call('HGET', job, 'queue') or 'default'
 redis.call('RPUSH', ARGV[1] .. 'queue:' .. queue, id)
 redis.call('HSET', job, 'state', 'pending')
+release(ARGV[1], id, false)
 redis.call('PUBLISH', ARGV[1] .. 'wake', queue)
 return id
 ";
+
+/// Claims the oldest job of a queue (KEYS[1]) that may start into a
+/// processing list (KEYS[2]), marked processing. ARGV[1] is the key prefix,
+/// ARGV[2] the queue's name. Parks jobs whose concurrency key is full on
+/// that key's blocked list, and drops ids without job data. Returns
+/// `{1, id, data}`, `{0, '', ''}` when nothing may start, or `{2, '', ''}`
+/// after skipping many jobs, to be called again.
+const CLAIM: &str = r"
+local p = ARGV[1]
+for _ = 1, 100 do
+  local id = redis.call('RPOP', KEYS[1])
+  if not id then return {0, '', ''} end
+  local job = p .. 'job:' .. id
+  local f = redis.call('HMGET', job, 'data', 'ckey', 'climit', 'ukey', 'umode')
+  if not f[1] then
+    redis.call('DEL', job)
+  elseif f[2] and redis.call('SCARD', p .. 'running:' .. f[2]) >= tonumber(f[3]) then
+    redis.call('LPUSH', p .. 'blocked:' .. f[2], id)
+    redis.call('HINCRBY', p .. 'blocked', ARGV[2], 1)
+    redis.call('SADD', p .. 'blocked_keys', f[2])
+  else
+    redis.call('LPUSH', KEYS[2], id)
+    redis.call('HSET', job, 'state', 'processing')
+    if f[2] then redis.call('SADD', p .. 'running:' .. f[2], id) end
+    if f[5] == 'until_started' and redis.call('GET', p .. 'unique:' .. f[4]) == id then
+      redis.call('DEL', p .. 'unique:' .. f[4])
+    end
+    return {1, id, f[1]}
+  end
+end
+return {2, '', ''}
+";
+
+/// Removes pending, parked or scheduled job ARGV[2] so no worker runs it,
+/// and marks it cancelled, as one step. ARGV[1] is the key prefix, ARGV[3]
+/// how long it stays, ARGV[4] how many recent cancellations are listed.
+/// Returns 1, or 0 if it wasn't waiting.
+const CANCEL: &str = r"
+local p, id = ARGV[1], ARGV[2]
+local job = p .. 'job:' .. id
+local f = redis.call('HMGET', job, 'queue', 'ckey', 'ukey')
+if not f[1] then return 0 end
+local removed = redis.call('ZREM', p .. 'scheduled', id)
+if removed == 0 then removed = redis.call('LREM', p .. 'queue:' .. f[1], 1, id) end
+if removed == 0 and f[2] then
+  removed = redis.call('LREM', p .. 'blocked:' .. f[2], 1, id)
+  if removed > 0 then redis.call('HINCRBY', p .. 'blocked', f[1], -1) end
+end
+if removed == 0 then return 0 end
+redis.call('HSET', job, 'state', 'cancelled')
+redis.call('EXPIRE', job, tonumber(ARGV[3]))
+redis.call('LPUSH', p .. 'recent:cancelled', id)
+redis.call('LTRIM', p .. 'recent:cancelled', 0, tonumber(ARGV[4]) - 1)
+if f[3] and redis.call('GET', p .. 'unique:' .. f[3]) == id then
+  redis.call('DEL', p .. 'unique:' .. f[3])
+end
+redis.call('PUBLISH', p .. 'done', id)
+return 1
+";
+
+/// Stores a unique job unless a job holds its key; returns the holder's id,
+/// or the new job's. ARGV: prefix, id, queue, data, run_at (`''` for none),
+/// concurrency key hash and limit (`''` for none), unique key hash, mode.
+const PUSH_UNIQUE: &str = r"
+local p = ARGV[1]
+local lock = p .. 'unique:' .. ARGV[8]
+local held = redis.call('GET', lock)
+if held then
+  local f = redis.call('HMGET', p .. 'job:' .. held, 'state', 'umode')
+  if f[1] == 'pending' or f[1] == 'scheduled'
+     or (f[1] == 'processing' and f[2] == 'until_finished') then
+    return held
+  end
+end
+redis.call('SET', lock, ARGV[2])
+local job = p .. 'job:' .. ARGV[2]
+local state = 'pending'
+if ARGV[5] ~= '' then state = 'scheduled' end
+redis.call('HSET', job, 'state', state, 'queue', ARGV[3], 'data', ARGV[4], 'ukey', ARGV[8], 'umode', ARGV[9])
+if ARGV[6] ~= '' then redis.call('HSET', job, 'ckey', ARGV[6], 'climit', ARGV[7]) end
+redis.call('SADD', p .. 'queues', ARGV[3])
+if state == 'scheduled' then
+  redis.call('ZADD', p .. 'scheduled', ARGV[5], ARGV[2])
+else
+  redis.call('LPUSH', p .. 'queue:' .. ARGV[3], ARGV[2])
+  redis.call('PUBLISH', p .. 'wake', ARGV[3])
+end
+return ARGV[2]
+";
+
+/// `script` with the Lua functions it calls in front.
+fn with_release(script: &str) -> String {
+    format!("{RELEASE_FN}{script}")
+}
 
 /// Moves up to ARGV[3] ids due by ARGV[1] (ms) from the scheduled set
 /// (KEYS[1]) onto the back of their own queues, as pending, soonest first.
@@ -310,60 +458,32 @@ impl RedisQueue {
         Ok(result?)
     }
 
-    /// Takes the oldest job of the first non-empty queue, in order, into
-    /// `worker`'s processing list. Never blocks.
+    /// Takes the oldest job that may start of the first queue that has one,
+    /// in order, into `worker`'s processing list: one script per queue, which
+    /// moves it and marks it processing together. Never blocks.
     fn sweep(&self, worker: &str, queues: &[&str]) -> Result<Option<JobRecord>> {
         let processing = self.processing_key(worker);
-        loop {
-            let mut id: Option<String> = None;
-            for queue in queues {
-                id = self.with_conn(|con| {
-                    redis::cmd("LMOVE")
+        for queue in queues {
+            loop {
+                let (status, _id, data): (u8, String, String) = self.with_conn(|con| {
+                    redis::cmd("EVAL")
+                        .arg(CLAIM)
+                        .arg(2)
                         .arg(self.queue_key(queue))
                         .arg(&processing)
-                        .arg("RIGHT")
-                        .arg("LEFT")
+                        .arg(format!("{}:", self.prefix))
+                        .arg(*queue)
                         .query(con)
                 })?;
-                if id.is_some() {
-                    break;
+                match status {
+                    1 => return Ok(Some(serde_json::from_str(&data)?)),
+                    // It parked many jobs of full keys: look further.
+                    2 => continue,
+                    _ => break,
                 }
             }
-            let Some(id) = id else { return Ok(None) };
-
-            // Not atomic with the move above. If this worker dies in between,
-            // the id is already in its processing list, so `recover` requeues
-            // it; the stale `pending` state is only visible until then.
-            let data: Option<String> = self.with_conn(|con| {
-                redis::pipe()
-                    .cmd("HSET")
-                    .arg(self.job_key(&id))
-                    .arg("state")
-                    .arg(JobState::Processing.as_str())
-                    .ignore()
-                    .cmd("HGET")
-                    .arg(self.job_key(&id))
-                    .arg("data")
-                    .query::<(Option<String>,)>(con)
-                    .map(|(data,)| data)
-            })?;
-            match data {
-                Some(data) => return Ok(Some(serde_json::from_str(&data)?)),
-                // An id without job data can't run: drop it and try the next one.
-                None => self.with_conn(|con| {
-                    redis::pipe()
-                        .cmd("LREM")
-                        .arg(&processing)
-                        .arg(1)
-                        .arg(&id)
-                        .ignore()
-                        .cmd("DEL")
-                        .arg(self.job_key(&id))
-                        .ignore()
-                        .exec(con)
-                })?,
-            }
         }
+        Ok(None)
     }
 
     /// Starts, once per queue, the thread that turns pub/sub messages into
@@ -385,6 +505,30 @@ impl RedisQueue {
 }
 
 impl RedisQueue {
+    /// Stores a unique job, unless a job holds its key: see [`PUSH_UNIQUE`].
+    fn push_unique(&self, job: &JobRecord, unique: &crate::UniqueKey) -> Result<JobId> {
+        let data = serde_json::to_string(job)?;
+        let (ckey, climit) = match &job.concurrency {
+            Some(concurrency) => (concurrency.hash(), concurrency.limit.to_string()),
+            None => (String::new(), String::new()),
+        };
+        self.with_conn(|con| {
+            redis::cmd("EVAL")
+                .arg(PUSH_UNIQUE)
+                .arg(0)
+                .arg(format!("{}:", self.prefix))
+                .arg(&job.id)
+                .arg(&job.queue)
+                .arg(&data)
+                .arg(job.run_at_ms.map(|at| at.to_string()).unwrap_or_default())
+                .arg(ckey)
+                .arg(climit)
+                .arg(unique.hash())
+                .arg(unique.until.as_str())
+                .query(con)
+        })
+    }
+
     fn push_pending(&self, job: JobRecord) -> Result<JobId> {
         let queue = &job.queue;
         let data = serde_json::to_string(&job)?;
@@ -399,6 +543,7 @@ impl RedisQueue {
                 .arg(queue)
                 .arg("data")
                 .arg(&data)
+                .arg(key_fields(&job))
                 .ignore()
                 .cmd("LPUSH")
                 .arg(self.queue_key(queue))
@@ -432,6 +577,7 @@ impl RedisQueue {
                 .arg(queue)
                 .arg("data")
                 .arg(&data)
+                .arg(key_fields(&job))
                 .ignore()
                 .cmd("ZADD")
                 .arg(self.key("scheduled"))
@@ -451,6 +597,9 @@ impl RedisQueue {
 impl Store for RedisQueue {
     fn push(&self, job: NewJob) -> Result<JobId> {
         let job = job.into_record();
+        if let Some(unique) = &job.unique {
+            return self.push_unique(&job, unique);
+        }
         match job.run_at_ms {
             Some(run_at) => self.push_scheduled(job, run_at),
             None => self.push_pending(job),
@@ -458,14 +607,22 @@ impl Store for RedisQueue {
     }
 
     /// One pipelined transaction for every job, and one wake-up per queue.
+    /// Unique jobs are pushed one by one afterwards, each checked and stored
+    /// in one script.
     fn push_many(&self, jobs: Vec<NewJob>) -> Result<Vec<JobId>> {
         let mut pipe = redis::pipe();
         pipe.atomic();
         let mut ids = Vec::with_capacity(jobs.len());
+        let mut unique = Vec::new();
         // Queues that got a pending job, which wakes claims, and whether it did.
         let mut queues: Vec<(String, bool)> = Vec::new();
         for new in jobs {
             let job = new.into_record();
+            if job.unique.is_some() {
+                unique.push((ids.len(), job));
+                ids.push(String::new());
+                continue;
+            }
             let state = match job.run_at_ms {
                 Some(_) => JobState::Scheduled,
                 None => JobState::Pending,
@@ -478,6 +635,7 @@ impl Store for RedisQueue {
                 .arg(&job.queue)
                 .arg("data")
                 .arg(serde_json::to_string(&job)?)
+                .arg(key_fields(&job))
                 .ignore();
             match job.run_at_ms {
                 Some(run_at) => pipe
@@ -509,6 +667,11 @@ impl Store for RedisQueue {
             }
         }
         self.with_conn(|con| pipe.exec(con))?;
+        for (index, job) in unique {
+            if let Some(key) = &job.unique {
+                ids[index] = self.push_unique(&job, key)?;
+            }
+        }
         Ok(ids)
     }
 
@@ -580,6 +743,13 @@ impl Store for RedisQueue {
                 .arg(self.job_key(&job.id))
                 .arg(DONE_TTL_SECS)
                 .ignore()
+                .cmd("EVAL")
+                .arg(with_release(RELEASE))
+                .arg(0)
+                .arg(format!("{}:", self.prefix))
+                .arg(&job.id)
+                .arg(1)
+                .ignore()
                 .cmd("LPUSH")
                 .arg(self.key("recent:done"))
                 .arg(&job.id)
@@ -613,6 +783,13 @@ impl Store for RedisQueue {
             .arg(state.as_str())
             .arg("data")
             .arg(&data)
+            .ignore()
+            .cmd("EVAL")
+            .arg(with_release(RELEASE))
+            .arg(0)
+            .arg(format!("{}:", self.prefix))
+            .arg(&job.id)
+            .arg(u8::from(state == JobState::Dead))
             .ignore();
         match state {
             // A retry that waits: nothing to wake until it is promoted.
@@ -681,68 +858,20 @@ impl Store for RedisQueue {
         })
     }
 
+    /// One script: the scheduled set, the queue, then the key's blocked
+    /// list, so a job moving between them can't slip past.
     fn cancel(&self, id: &str) -> Result<bool> {
-        let queue: Option<String> = self.with_conn(|con| {
-            redis::cmd("HGET")
-                .arg(self.job_key(id))
-                .arg("queue")
-                .query(con)
-        })?;
-        let Some(queue) = queue else {
-            return Ok(false);
-        };
-        // The scheduled set first: promotion only moves ids from it to a
-        // queue, so checking in this order can't miss one moving in between.
-        let unscheduled: usize = self.with_conn(|con| {
-            redis::cmd("ZREM")
-                .arg(self.key("scheduled"))
-                .arg(id)
-                .query(con)
-        })?;
-        let removed: usize = if unscheduled > 0 {
-            unscheduled
-        } else {
-            self.with_conn(|con| {
-                redis::cmd("LREM")
-                    .arg(self.queue_key(&queue))
-                    .arg(1)
-                    .arg(id)
-                    .query(con)
-            })?
-        };
-        if removed == 0 {
-            return Ok(false);
-        }
-        // The id is out of the pending list and the scheduled set, so no
-        // worker can claim it now.
-        self.with_conn(|con| {
-            redis::pipe()
-                .atomic()
-                .cmd("HSET")
-                .arg(self.job_key(id))
-                .arg("state")
-                .arg(JobState::Cancelled.as_str())
-                .ignore()
-                .cmd("EXPIRE")
-                .arg(self.job_key(id))
-                .arg(DONE_TTL_SECS)
-                .ignore()
-                .cmd("LPUSH")
-                .arg(self.key("recent:cancelled"))
-                .arg(id)
-                .ignore()
-                .cmd("LTRIM")
-                .arg(self.key("recent:cancelled"))
+        let cancelled: u8 = self.with_conn(|con| {
+            redis::cmd("EVAL")
+                .arg(CANCEL)
                 .arg(0)
-                .arg(RECENT_CAP - 1)
-                .ignore()
-                .cmd("PUBLISH")
-                .arg(self.key("done"))
+                .arg(format!("{}:", self.prefix))
                 .arg(id)
-                .ignore()
-                .exec(con)
+                .arg(DONE_TTL_SECS)
+                .arg(RECENT_CAP)
+                .query(con)
         })?;
-        Ok(true)
+        Ok(cancelled > 0)
     }
 
     fn heartbeat(&self, worker: &str, ttl: Duration) -> Result<()> {
@@ -785,7 +914,7 @@ impl Store for RedisQueue {
             }
             while let Some(_id) = self.with_conn(|con| {
                 redis::cmd("EVAL")
-                    .arg(RECOVER_ONE)
+                    .arg(with_release(RECOVER_ONE))
                     .arg(1)
                     .arg(self.processing_key(&worker))
                     .arg(format!("{}:", self.prefix))
@@ -817,6 +946,8 @@ impl Monitor for RedisQueue {
         let mut pipe = redis::pipe();
         for queue in &queues {
             pipe.cmd("LLEN").arg(self.queue_key(queue));
+            // Jobs parked because their concurrency key was full.
+            pipe.cmd("HGET").arg(self.key("blocked")).arg(queue);
         }
         for worker in &workers {
             pipe.cmd("LLEN").arg(self.processing_key(worker));
@@ -837,7 +968,7 @@ impl Monitor for RedisQueue {
             .into_iter()
             .map(|name| QueueStats {
                 name,
-                pending: count(next()),
+                pending: count(next()) + count(next()),
             })
             .collect();
         queue_stats.sort_by(|a, b| a.name.cmp(&b.name));
@@ -897,6 +1028,19 @@ impl Monitor for RedisQueue {
                 .map(|worker| self.processing_key(worker))
                 .collect()
             };
+            let mut lists = lists;
+            if filter.state == JobState::Pending {
+                let parked: Vec<String> = self.with_conn(|con| {
+                    redis::cmd("SMEMBERS")
+                        .arg(self.key("blocked_keys"))
+                        .query(con)
+                })?;
+                lists.extend(
+                    parked
+                        .iter()
+                        .map(|key| format!("{}:blocked:{key}", self.prefix)),
+                );
+            }
             let mut ids = Vec::new();
             for list in lists {
                 let mut some: Vec<String> = self
@@ -1121,6 +1265,29 @@ impl Watch for RedisQueue {
         self.listen_for_signals();
         Some(self.signals.finished.watch(id))
     }
+}
+
+/// The job-hash fields for its concurrency and unique keys, as `HSET`
+/// arguments: the keys by their hashes, which scripts build Redis keys from.
+fn key_fields(job: &JobRecord) -> Vec<String> {
+    let mut fields = Vec::new();
+    if let Some(concurrency) = &job.concurrency {
+        fields.extend([
+            "ckey".to_owned(),
+            concurrency.hash(),
+            "climit".to_owned(),
+            concurrency.limit.to_string(),
+        ]);
+    }
+    if let Some(unique) = &job.unique {
+        fields.extend([
+            "ukey".to_owned(),
+            unique.hash(),
+            "umode".to_owned(),
+            unique.until.as_str().to_owned(),
+        ]);
+    }
+    fields
 }
 
 /// Redis counts and lengths, which are never negative here.

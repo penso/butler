@@ -33,6 +33,7 @@ mod error;
 mod executor;
 mod handle;
 mod job;
+mod keys;
 mod limits;
 mod middleware;
 pub mod monitor;
@@ -69,6 +70,7 @@ pub use handle::JobHandle;
 pub use job::{
     AnyJob, DEFAULT_QUEUE, Failed, Job, JobId, JobRecord, JobState, is_valid_queue_name, state,
 };
+pub use keys::{ConcurrencyKey, ConcurrencyLimit, Unique, UniqueKey};
 pub use middleware::{DeadJob, JobContext, Layer, Next, RunFuture};
 pub use prepared::{PreparedJob, enqueue_all};
 pub use progress::{Interrupted, Progress};
@@ -136,6 +138,10 @@ pub struct JobDef {
     pub retries: Option<u32>,
     /// Set with `#[job(backoff = "...")]`; the worker's backoff otherwise.
     pub backoff: Option<Backoff>,
+    /// Set with `#[job(concurrency_key = "...", limit = N)]`.
+    pub concurrency: Option<ConcurrencyLimit>,
+    /// Set with `#[job(unique = "...")]`.
+    pub unique: Option<Unique>,
     #[doc(hidden)]
     pub perform: fn(progress::Invocation) -> __private::BoxFuture,
 }
@@ -286,7 +292,7 @@ pub mod __private {
         args: Vec<serde_json::Value>,
         run_at: Option<std::time::SystemTime>,
     ) -> crate::Result<crate::JobHandle<T>> {
-        let mut new = crate::NewJob::new(job.name, queue_name, args);
+        let mut new = crate::NewJob::for_job(job, queue_name, args);
         new.run_at = run_at;
         crate::enqueue::apply(&mut new)?;
         // Inside `testing::perform_enqueued_jobs`: run it now, no queue, even

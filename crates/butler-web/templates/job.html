@@ -55,6 +55,19 @@
       <pre class="code">{{ meta }}</pre>
     </div>
     {% endif %}
+    {% if concurrency.is_some() || unique.is_some() %}
+    <div class="card p-5">
+      <h2 class="mb-2 text-sm font-semibold">Keys</h2>
+      {% if let Some((key, limit)) = concurrency %}
+      <p class="text-xs text-[var(--muted)]">Concurrency: at most {{ limit }} running at once with</p>
+      <pre class="code mb-3">{{ key }}</pre>
+      {% endif %}
+      {% if let Some((key, until)) = unique %}
+      <p class="text-xs text-[var(--muted)]">Unique {{ until }}: an identical job enqueued meanwhile returns this one</p>
+      <pre class="code">{{ key }}</pre>
+      {% endif %}
+    </div>
+    {% endif %}
   </div>
   <div class="flex flex-col gap-6">
     {% if let Some(result) = result %}

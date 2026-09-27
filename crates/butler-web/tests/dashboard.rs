@@ -420,3 +420,27 @@ async fn a_retry_waiting_its_turn_shows_its_error_and_next_attempt() {
     );
     assert!(html.contains("503 from the CRM"));
 }
+
+#[tokio::test]
+async fn a_job_page_shows_its_concurrency_and_unique_keys_escaped() {
+    let f = fixture("");
+    let mut job = butler::NewJob::new("sync", "default", vec![json!("<b>7</b>")]);
+    job.concurrency = Some(butler::ConcurrencyKey {
+        key: r#"sync:["<b>7</b>"]"#.into(),
+        limit: 2,
+    });
+    job.unique = Some(butler::UniqueKey {
+        key: r#"sync:["<b>7</b>"]"#.into(),
+        until: butler::Unique::UntilFinished,
+    });
+    let id = f.queue.push_job(job).unwrap();
+    let (status, html) = get(&f.app, &format!("/jobs/{id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("at most 2 running at once"));
+    assert!(html.contains("Unique until finished"));
+    assert!(html.contains("&#60;b&#62;7&#60;/b&#62;"));
+    assert!(!html.contains("<b>7</b>"), "keys are escaped");
+
+    let (_, html) = get(&f.app, &format!("/jobs/{}", f.pending)).await;
+    assert!(!html.contains(">Keys<"), "no keys, no card");
+}

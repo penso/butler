@@ -70,6 +70,7 @@ pub(crate) fn apply(job: &mut NewJob) -> Result<()> {
             source,
         })?;
     }
+    crate::keys::validate(job.concurrency.as_ref())?;
     if !is_valid_queue_name(&job.queue) {
         return Err(Error::InvalidQueue {
             name: job.queue.clone(),

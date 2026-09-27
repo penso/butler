@@ -163,7 +163,7 @@ pub async fn enqueue_all<T>(
     let jobs = jobs
         .into_iter()
         .map(|job| {
-            let mut new = NewJob::new(job.def.name, job.queue, job.args);
+            let mut new = NewJob::for_job(job.def, job.queue, job.args);
             new.run_at = job.run_at;
             crate::enqueue::apply(&mut new)?;
             Ok((job.def, new))

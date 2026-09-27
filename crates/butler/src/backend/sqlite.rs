@@ -2,7 +2,8 @@
 //! machine can share, with no server to run.
 //!
 //! ```text
-//! butler_jobs     id, queue, state, worker, seq, data (job JSON), finished_seq, run_at
+//! butler_jobs     id, queue, state, worker, seq, data (job JSON), finished_seq, run_at,
+//!                 ckey, climit, ukey, umode
 //! butler_workers  worker, expires_at_ms (the heartbeat)
 //! ```
 //!
@@ -16,6 +17,16 @@
 //! ones at the back of their queue, in run-time order; claims only take
 //! `pending` rows, so a scheduled job can't run early. Databases created
 //! before scheduling existed get the `run_at` column when opened.
+//!
+//! A job with a concurrency key stores it in `ckey`, with its limit in
+//! `climit`. The claim's `UPDATE` only takes a pending row whose key has
+//! fewer than `climit` processing rows, so it skips jobs whose key is full
+//! and takes the next one; nothing needs releasing, since only processing
+//! rows count. A unique job stores its key in `ukey` and its mode in
+//! `umode`; a push first looks for a job holding that key (waiting, or
+//! running for `until_finished`) in the same immediate transaction, and
+//! returns it instead of inserting. Databases from before these columns get
+//! them when opened.
 //!
 //! Waking waiters, without a server to publish through:
 //!
@@ -73,7 +84,12 @@ CREATE TABLE IF NOT EXISTS butler_jobs (
     -- watcher can ask which jobs finished since it last looked.
     finished_seq INTEGER,
     -- When a scheduled job may run, in ms since the epoch.
-    run_at INTEGER
+    run_at INTEGER,
+    -- Its concurrency key and limit, and its unique key and mode.
+    ckey   TEXT,
+    climit INTEGER,
+    ukey   TEXT,
+    umode  TEXT
 );
 CREATE INDEX IF NOT EXISTS butler_jobs_claim ON butler_jobs (state, queue, seq);
 CREATE INDEX IF NOT EXISTS butler_jobs_finished ON butler_jobs (finished_seq);
@@ -102,8 +118,25 @@ CREATE TABLE IF NOT EXISTS butler_counters (
 
 /// Needs the `run_at` column, which older databases only have once
 /// [`migrate`] added it.
-const SCHEDULED_INDEX: &str =
-    "CREATE INDEX IF NOT EXISTS butler_jobs_scheduled ON butler_jobs (state, run_at);";
+const SCHEDULED_INDEX: &str = "
+CREATE INDEX IF NOT EXISTS butler_jobs_scheduled ON butler_jobs (state, run_at);
+CREATE INDEX IF NOT EXISTS butler_jobs_ckey ON butler_jobs (ckey, state) WHERE ckey IS NOT NULL;
+CREATE INDEX IF NOT EXISTS butler_jobs_ukey ON butler_jobs (ukey) WHERE ukey IS NOT NULL;";
+
+/// A pending job may start: its concurrency key, if any, has room.
+const HAS_ROOM: &str = "(j.ckey IS NULL OR j.climit > (SELECT COUNT(*) FROM butler_jobs r
+                          WHERE r.ckey = j.ckey AND r.state = 'processing'))";
+
+/// The job holding unique key `?1`: waiting, or running for `until_finished`.
+const UNIQUE_HOLDER: &str = "SELECT id FROM butler_jobs WHERE ukey = ?1
+    AND (state IN ('pending', 'scheduled') OR (state = 'processing' AND umode = 'until_finished'))
+    LIMIT 1";
+
+/// Stores a new job with its keys. `?1` id, `?2` queue, `?3` state, `?4`
+/// data, `?5` run_at, `?6` ckey, `?7` climit, `?8` ukey, `?9` umode.
+const INSERT_JOB: &str = "INSERT INTO butler_jobs
+    (id, queue, state, seq, data, run_at, ckey, climit, ukey, umode)
+    VALUES (?1, ?2, ?3, (SELECT COALESCE(MAX(seq), 0) + 1 FROM butler_jobs), ?4, ?5, ?6, ?7, ?8, ?9)";
 
 /// Takes the next sequence number: the back of every queue.
 const NEXT_SEQ: &str = "(SELECT COALESCE(MAX(seq), 0) + 1 FROM butler_jobs)";
@@ -176,11 +209,13 @@ impl SqliteQueue {
         for queue in queues {
             let data: Option<String> = self.with_conn(|conn| {
                 conn.query_row(
-                    "UPDATE butler_jobs SET state = 'processing', worker = ?1
-                     WHERE id = (SELECT id FROM butler_jobs
-                                 WHERE state = 'pending' AND queue = ?2
-                                 ORDER BY seq LIMIT 1)
-                     RETURNING data",
+                    &format!(
+                        "UPDATE butler_jobs SET state = 'processing', worker = ?1
+                         WHERE id = (SELECT j.id FROM butler_jobs j
+                                     WHERE j.state = 'pending' AND j.queue = ?2 AND {HAS_ROOM}
+                                     ORDER BY j.seq LIMIT 1)
+                         RETURNING data"
+                    ),
                     params![worker, queue],
                     |row| row.get(0),
                 )
@@ -204,6 +239,21 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         .exists([])?;
     if !has_run_at {
         tx.execute_batch("ALTER TABLE butler_jobs ADD COLUMN run_at INTEGER")?;
+    }
+    for (column, kind) in [
+        ("ckey", "TEXT"),
+        ("climit", "INTEGER"),
+        ("ukey", "TEXT"),
+        ("umode", "TEXT"),
+    ] {
+        let has = tx
+            .prepare("SELECT 1 FROM pragma_table_info('butler_jobs') WHERE name = ?1")?
+            .exists(params![column])?;
+        if !has {
+            tx.execute_batch(&format!(
+                "ALTER TABLE butler_jobs ADD COLUMN {column} {kind}"
+            ))?;
+        }
     }
     tx.execute_batch(SCHEDULED_INDEX)?;
     tx.commit()
@@ -300,26 +350,51 @@ fn now_ms() -> i64 {
     i64::try_from(ms).unwrap_or(i64::MAX)
 }
 
+/// Stores `job` unless it is unique and a job holds its key; returns the id
+/// of the job that holds it then, or `job`'s own. Call it in an immediate
+/// transaction, so the check and the insert are one step.
+fn insert(tx: &Connection, job: &JobRecord, data: &str) -> rusqlite::Result<(JobId, bool)> {
+    if let Some(unique) = &job.unique {
+        let holder: Option<String> = tx
+            .query_row(UNIQUE_HOLDER, params![unique.key], |row| row.get(0))
+            .optional()?;
+        if let Some(holder) = holder {
+            return Ok((holder, false));
+        }
+    }
+    tx.execute(
+        INSERT_JOB,
+        params![
+            job.id,
+            job.queue,
+            new_state(job).as_str(),
+            data,
+            run_at_column(job),
+            job.concurrency.as_ref().map(|c| &c.key),
+            job.concurrency.as_ref().map(|c| c.limit),
+            job.unique.as_ref().map(|u| &u.key),
+            job.unique.as_ref().map(|u| u.until.as_str()),
+        ],
+    )?;
+    Ok((job.id.clone(), true))
+}
+
 impl Store for SqliteQueue {
     fn push(&self, job: NewJob) -> Result<JobId> {
         let job = job.into_record();
         let data = serde_json::to_string(&job)?;
-        let state = new_state(&job);
-        self.with_conn(|conn| {
-            conn.execute(
-                &format!(
-                    "INSERT INTO butler_jobs (id, queue, state, seq, data, run_at)
-                     VALUES (?1, ?2, ?3, {NEXT_SEQ}, ?4, ?5)"
-                ),
-                params![job.id, job.queue, state.as_str(), data, run_at_column(&job)],
-            )
+        let (id, stored) = self.with_conn(|conn| {
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+            let pushed = insert(&tx, &job, &data)?;
+            tx.commit()?;
+            Ok(pushed)
         })?;
         // No wake-up for a scheduled job: there is nothing to claim until
         // it is promoted.
-        if state == JobState::Pending {
+        if stored && new_state(&job) == JobState::Pending {
             self.signals.pushed.notify();
         }
-        Ok(job.id)
+        Ok(id)
     }
 
     /// One transaction for every job: a commit per insert is what makes
@@ -333,25 +408,15 @@ impl Store for SqliteQueue {
                 Ok((job, data))
             })
             .collect::<Result<Vec<_>>>()?;
+        // Immediate: unique jobs are checked and stored under the write lock.
         let ids = self.with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
-            {
-                let mut insert = tx.prepare(&format!(
-                    "INSERT INTO butler_jobs (id, queue, state, seq, data, run_at)
-                     VALUES (?1, ?2, ?3, {NEXT_SEQ}, ?4, ?5)"
-                ))?;
-                for (job, data) in &records {
-                    insert.execute(params![
-                        job.id,
-                        job.queue,
-                        new_state(job).as_str(),
-                        data,
-                        run_at_column(job)
-                    ])?;
-                }
-            }
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+            let ids = records
+                .iter()
+                .map(|(job, data)| insert(&tx, job, data).map(|(id, _)| id))
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             tx.commit()?;
-            Ok(records.into_iter().map(|(job, _)| job.id).collect())
+            Ok(ids)
         })?;
         self.signals.pushed.notify();
         Ok(ids)
@@ -836,6 +901,57 @@ mod tests {
         data   TEXT NOT NULL,
         finished_seq INTEGER
     );";
+
+    #[test]
+    fn a_0_1_database_gains_concurrency_and_unique_keys_and_keeps_its_jobs() {
+        let path = std::env::temp_dir().join(format!(
+            "butler-sqlite-migrate-keys-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            // `butler_jobs` as 0.1.0 created it, with a job it wrote.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE butler_jobs (
+                    id TEXT PRIMARY KEY, queue TEXT NOT NULL, state TEXT NOT NULL,
+                    worker TEXT, seq INTEGER NOT NULL, data TEXT NOT NULL,
+                    finished_seq INTEGER, run_at INTEGER
+                );",
+            )
+            .unwrap();
+            let data = r#"{"id":"1-1-0","name":"old","queue":"default","args":[],
+                "attempts":0,"enqueued_at_ms":1,"last_error":null}"#;
+            conn.execute(
+                "INSERT INTO butler_jobs (id, queue, state, seq, data)
+                 VALUES ('1-1-0', 'default', 'pending', 1, ?1)",
+                params![data],
+            )
+            .unwrap();
+        }
+        let queue = SqliteQueue::open(&path).unwrap();
+        drop(SqliteQueue::open(&path).unwrap());
+        let keyed = || {
+            let mut job = NewJob::new("sync", "default", vec![]);
+            job.concurrency = Some(crate::ConcurrencyKey {
+                key: "sync:[1]".into(),
+                limit: 1,
+            });
+            job.unique = Some(crate::UniqueKey {
+                key: "sync:[]".into(),
+                until: crate::Unique::UntilFinished,
+            });
+            job
+        };
+        let id = queue.push(keyed()).unwrap();
+        assert_eq!(queue.push(keyed()).unwrap(), id, "unique");
+        // The old job first, then the keyed one.
+        let old = queue.claim("w", &["default"], Duration::ZERO).unwrap();
+        assert_eq!(old.unwrap().id, "1-1-0");
+        let new = queue.claim("w", &["default"], Duration::ZERO).unwrap();
+        assert_eq!(new.unwrap().id, id);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn an_older_database_gains_scheduling_and_keeps_its_jobs() {

@@ -243,9 +243,12 @@ just web        # or: cargo run -p butler-web   ->  http://127.0.0.1:9090
 
 It reads the same `butler.toml` as the workers, so it sees whichever backend
 they use. To embed it in your own axum app, behind your own authentication:
-`butler_web::Dashboard::new(queue).base_path("/admin/jobs").router()`. It has
-a light theme too, and history for Redis, SQLite and memory (the file backend
-keeps none). See [crates/butler-web](crates/butler-web/README.md) for pages,
+`butler_web::Dashboard::new(queue).base_path("/admin/jobs").router()`. Run on
+its own without a proxy, it can ask for a username and password
+(`Dashboard::basic_auth`, or `BUTLER_WEB_USERNAME` and `BUTLER_WEB_PASSWORD`
+for the binary): a convenience, not a replacement for real authentication.
+It has a light theme too, and history for Redis, SQLite and memory (the file
+backend keeps none). See [crates/butler-web](crates/butler-web/README.md) for pages,
 security, and how it's built.
 
 ## Two kinds of `.await`

@@ -159,8 +159,11 @@ after crashes. Reliability and correct job lifecycle semantics come first.
 - Preserve `Dashboard::base_path` support in links, assets, actions, and live
   updates. Share the stats sampler across clients rather than polling storage
   once per browser connection.
-- The dashboard has no built-in authentication. Preserve the localhost bind
-  default and embedding behind the host application's authentication.
+- The dashboard's only built-in authentication is the optional
+  `Dashboard::basic_auth`, off by default. Preserve the localhost bind default
+  and embedding behind the host application's authentication; basic auth must
+  keep guarding every route (assets and SSE included) and comparing in
+  constant time.
 
 ## Verification
 

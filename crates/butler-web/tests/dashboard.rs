@@ -977,3 +977,156 @@ async fn queue_and_job_pages_keep_the_base_path() {
     assert!(html.contains(r#"data-base="/admin/jobs""#));
     assert!(html.contains(r#"href="/admin/jobs/queues/default""#));
 }
+
+/// `Basic base64("admin:s3cret")`.
+const GOOD_CREDENTIALS: &str = "Basic YWRtaW46czNjcmV0";
+/// `Basic base64("admin:wrong!")`.
+const BAD_CREDENTIALS: &str = "Basic YWRtaW46d3Jvbmch";
+
+/// A request, with an `Authorization` header if given, returning the
+/// response itself (the live stream never ends).
+async fn send(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    authorization: Option<&str>,
+) -> axum::response::Response {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("sec-fetch-site", "same-origin");
+    if let Some(value) = authorization {
+        request = request.header(header::AUTHORIZATION, value);
+    }
+    app.clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+fn with_basic_auth(base: &str) -> (Fixture, Router) {
+    let f = fixture(base);
+    let app = butler_web::Dashboard::new(f.queue.clone())
+        .base_path(base)
+        .basic_auth("admin", "s3cret")
+        .router();
+    let app = if base.is_empty() {
+        app
+    } else {
+        Router::new().nest(base, app)
+    };
+    (f, app)
+}
+
+#[tokio::test]
+async fn basic_auth_guards_every_route_until_the_right_credentials() {
+    let (f, app) = with_basic_auth("");
+    let routes = [
+        ("GET", "/".to_owned()),
+        ("GET", "/jobs?state=dead".to_owned()),
+        ("GET", format!("/jobs/{}", f.dead)),
+        ("GET", "/assets/app.css".to_owned()),
+        ("GET", "/api/stats".to_owned()),
+        ("GET", "/api/metrics".to_owned()),
+        ("GET", "/events".to_owned()),
+        ("GET", "/no-such-page".to_owned()),
+        ("POST", format!("/jobs/{}/retry", f.dead)),
+        ("POST", "/queues/default/pause".to_owned()),
+    ];
+    for (method, uri) in &routes {
+        for authorization in [None, Some(BAD_CREDENTIALS), Some("Bearer YWRtaW46czNjcmV0")] {
+            let response = send(&app, method, uri, authorization).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} with {authorization:?}"
+            );
+            assert_eq!(
+                response.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+                r#"Basic realm="butler", charset="UTF-8""#,
+                "the browser asks"
+            );
+        }
+    }
+    assert_eq!(
+        f.queue.state(&f.dead),
+        Some(JobState::Dead),
+        "no action ran"
+    );
+    assert!(f.queue.paused_queues().unwrap().is_empty());
+
+    for (uri, expected) in [
+        ("/", StatusCode::OK),
+        ("/assets/app.css", StatusCode::OK),
+        ("/api/stats", StatusCode::OK),
+        ("/no-such-page", StatusCode::NOT_FOUND),
+    ] {
+        let response = send(&app, "GET", uri, Some(GOOD_CREDENTIALS)).await;
+        assert_eq!(response.status(), expected, "{uri}");
+    }
+    let response = send(&app, "GET", "/events", Some(GOOD_CREDENTIALS)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+
+    let retry = format!("/jobs/{}/retry", f.dead);
+    let response = send(&app, "POST", &retry, Some(GOOD_CREDENTIALS)).await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(f.queue.state(&f.dead), Some(JobState::Pending));
+}
+
+#[tokio::test]
+async fn basic_auth_keeps_the_cross_site_check() {
+    let (f, app) = with_basic_auth("");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/jobs/{}/retry", f.dead))
+                .header(header::AUTHORIZATION, GOOD_CREDENTIALS)
+                .header("sec-fetch-site", "cross-site")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(f.queue.state(&f.dead), Some(JobState::Dead));
+}
+
+#[tokio::test]
+async fn basic_auth_works_under_a_base_path() {
+    let (f, app) = with_basic_auth("/admin/jobs");
+    for uri in [
+        "/admin/jobs",
+        "/admin/jobs/assets/app.js",
+        "/admin/jobs/events",
+    ] {
+        let response = send(&app, "GET", uri, None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        let response = send(&app, "GET", uri, Some(GOOD_CREDENTIALS)).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    }
+    let response = send(
+        &app,
+        "POST",
+        &format!("/admin/jobs/jobs/{}/retry", f.dead),
+        Some(GOOD_CREDENTIALS),
+    )
+    .await;
+    assert_eq!(
+        response.headers().get(header::LOCATION).unwrap(),
+        "/admin/jobs/"
+    );
+    assert_eq!(f.queue.state(&f.dead), Some(JobState::Pending));
+}
+
+#[tokio::test]
+async fn without_basic_auth_nothing_asks_for_credentials() {
+    let f = fixture("");
+    let response = send(&f.app, "GET", "/", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
+}

@@ -15,13 +15,15 @@
 //!
 //! or run the `butler-web` binary, which reads `butler.toml` like a worker.
 //!
-//! The dashboard has no authentication of its own. Actions (retry, discard,
-//! cancel, run now, pause and resume a queue, remove a schedule, and their
-//! bulk forms) are POSTs, and cross-site POSTs are rejected, so another site
-//! can't trigger them through a logged-in browser.
+//! The dashboard has no authentication of its own unless you turn on
+//! [`Dashboard::basic_auth`], a convenience for running it without a proxy.
+//! Actions (retry, discard, cancel, run now, pause and resume a queue, remove a
+//! schedule, and their bulk forms) are POSTs, and cross-site POSTs are
+//! rejected, so another site can't trigger them through a logged-in browser.
 
 mod actions;
 mod assets;
+mod auth;
 mod error;
 mod events;
 mod pages;
@@ -46,6 +48,7 @@ pub use error::WebError;
 pub struct Dashboard {
     queue: Queue,
     base: String,
+    auth: Option<auth::BasicAuth>,
 }
 
 /// Shared by every request.
@@ -62,6 +65,7 @@ impl Dashboard {
         Self {
             queue: queue.into(),
             base: String::new(),
+            auth: None,
         }
     }
 
@@ -72,13 +76,26 @@ impl Dashboard {
         self
     }
 
+    /// Asks for this username and password (HTTP basic auth) on every page,
+    /// asset, action and the live stream. Off by default.
+    ///
+    /// A convenience for running the dashboard on its own, not a replacement
+    /// for your application's authentication or an authenticating proxy: there
+    /// is one shared account, no logout, no rate limiting, and the
+    /// credentials cross the network with every request, so serve it over
+    /// HTTPS (or keep it on localhost). The comparison takes constant time.
+    pub fn basic_auth(mut self, user: &str, password: &str) -> Self {
+        self.auth = Some(auth::BasicAuth::new(user, password));
+        self
+    }
+
     pub fn router(self) -> Router {
         let state = Arc::new(AppState {
             queue: self.queue,
             base: self.base,
             live: OnceLock::new(),
         });
-        Router::new()
+        let router = Router::new()
             .route("/", get(pages::dashboard))
             .route("/jobs", get(pages::jobs))
             .route("/jobs/{id}", get(pages::job))
@@ -102,7 +119,15 @@ impl Dashboard {
             .route("/api/metrics", get(pages::metrics_json))
             .route("/assets/{file}", get(assets::serve))
             .layer(middleware::from_fn(same_origin_posts))
-            .with_state(state)
+            .with_state(state);
+        match self.auth {
+            // Outermost, so nothing (errors, assets, the stream) answers first.
+            Some(auth) => router.layer(middleware::from_fn_with_state(
+                Arc::new(auth),
+                auth::require,
+            )),
+            None => router,
+        }
     }
 }
 

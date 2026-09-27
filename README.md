@@ -224,9 +224,10 @@ each. See [Concurrency and cores](#concurrency-and-cores) for tuning.
 ## Web dashboard
 
 `butler-web` shows live counts streamed over server-sent events, throughput and
-duration charts, queues with their pending and running jobs, workers, and job
-details. Retry or discard failed
-jobs, cancel pending work, run scheduled jobs now, pause and resume queues,
+duration charts (overall, per queue, and per job), queues with their pending
+and running jobs, workers, and job details. Retry or discard failed
+jobs, cancel pending work, run scheduled jobs now (one or all), pause and
+resume queues,
 see each recurring schedule's next and last run, and inspect arguments,
 results, errors, and saved progress from one place.
 

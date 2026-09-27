@@ -489,7 +489,7 @@ async fn queues_can_be_paused_and_resumed_from_the_dashboard() {
     let (_, html) = get(&f.app, "/").await;
     assert!(html.contains(">paused<"));
     assert!(html.contains(r#"action="/queues/mailers/resume""#));
-    assert!(html.contains(r#"href="/jobs?state=pending&queue=imports""#));
+    assert!(html.contains(r#"href="/queues/imports""#));
 
     let (_, location) = post(
         &f.app,
@@ -691,4 +691,294 @@ async fn removing_recurring_rejects_encoded_path_separators_and_preserves_files(
         }
     }
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Schedules `send_reminder` on each queue, an hour from now.
+fn schedule_on(queue: &Queue, queues: &[&str]) -> Vec<String> {
+    queues
+        .iter()
+        .map(|name| {
+            queue
+                .schedule(
+                    "send_reminder",
+                    name,
+                    vec![],
+                    SystemTime::now() + Duration::from_secs(3600),
+                )
+                .unwrap()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_scheduled_tab_runs_or_cancels_every_scheduled_job() {
+    let f = fixture("");
+    let (_, html) = get(&f.app, "/jobs?state=scheduled").await;
+    assert!(html.contains(r#"action="/jobs/run-now-all""#));
+    assert!(html.contains(r#"action="/jobs/cancel-all""#));
+    assert!(
+        html.contains(r#"data-confirm="Run every scheduled job now?""#),
+        "asks first"
+    );
+    assert!(html.contains(r#"data-confirm="Cancel every scheduled job? They won't run.""#));
+    for other in ["pending", "dead", "done"] {
+        let (_, html) = get(&f.app, &format!("/jobs?state={other}")).await;
+        assert!(!html.contains("run-now-all"), "{other}");
+        assert!(!html.contains("cancel-all"), "{other}");
+    }
+    let (_, html) = get(&f.app, "/jobs?state=scheduled&queue=mailers").await;
+    assert!(
+        html.contains(r#"data-confirm="Cancel every scheduled job on mailers? They won't run.""#)
+    );
+    assert!(html.contains(r#"<input type="hidden" name="queue" value="mailers">"#));
+
+    let mailers = schedule_on(&f.queue, &["mailers", "mailers"]);
+    let default = schedule_on(&f.queue, &["default", "default"]);
+
+    // Cross-site: refused, nothing changes.
+    for action in ["/jobs/run-now-all", "/jobs/cancel-all"] {
+        let (status, _) = post(&f.app, action, "cross-site", "").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{action}");
+    }
+    assert_eq!(f.queue.state(&mailers[0]), Some(JobState::Scheduled));
+
+    // Cancel all on one queue: only its scheduled jobs, never pending ones.
+    let (status, location) = post(
+        &f.app,
+        "/jobs/cancel-all",
+        "same-origin",
+        "queue=mailers&return_to=%2Fjobs%3Fstate%3Dscheduled%26queue%3Dmailers",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location.as_deref(),
+        Some("/jobs?state=scheduled&queue=mailers")
+    );
+    for id in mailers.iter().chain([&f.scheduled]) {
+        assert_eq!(f.queue.state(id), Some(JobState::Cancelled), "{id}");
+    }
+    for id in &default {
+        assert_eq!(f.queue.state(id), Some(JobState::Scheduled), "{id}");
+    }
+    assert_eq!(f.queue.state(&f.pending), Some(JobState::Pending));
+
+    // Run all now, on every queue, and never an open redirect.
+    let (_, location) = post(
+        &f.app,
+        "/jobs/run-now-all",
+        "same-origin",
+        "queue=&return_to=https%3A%2F%2Fevil.example%2F",
+    )
+    .await;
+    assert_eq!(location.as_deref(), Some("/"));
+    for id in &default {
+        assert_eq!(f.queue.state(id), Some(JobState::Pending), "{id}");
+    }
+    assert_eq!(f.queue.state(&mailers[0]), Some(JobState::Cancelled));
+}
+
+#[tokio::test]
+async fn scheduled_bulk_actions_keep_the_base_path() {
+    let f = fixture("/admin/jobs");
+    let app = Router::new().nest("/admin/jobs", f.app.clone());
+    let (_, html) = get(&app, "/admin/jobs/jobs?state=scheduled").await;
+    assert!(html.contains(r#"action="/admin/jobs/jobs/run-now-all""#));
+    assert!(html.contains(r#"action="/admin/jobs/jobs/cancel-all""#));
+    assert!(html.contains(r#"name="return_to" value="/admin/jobs/jobs?state=scheduled""#));
+    let (_, location) = post(
+        &app,
+        "/admin/jobs/jobs/run-now-all",
+        "same-origin",
+        "return_to=%2Fadmin%2Fjobs%2Fjobs%3Fstate%3Dscheduled",
+    )
+    .await;
+    assert_eq!(
+        location.as_deref(),
+        Some("/admin/jobs/jobs?state=scheduled")
+    );
+    assert_eq!(f.queue.state(&f.scheduled), Some(JobState::Pending));
+}
+
+/// Sums a JSON series' column.
+fn total(series: &Value, column: &str) -> u64 {
+    series[column]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_u64().unwrap())
+        .sum()
+}
+
+#[tokio::test]
+async fn metrics_narrow_to_a_queue_or_a_job() {
+    let f = fixture("");
+    for (job, queue) in [("send_email", "mailers"), ("charge_card", "mailers")] {
+        f.queue
+            .record_metric(&JobMetric::now(job, queue, false, 10))
+            .unwrap();
+    }
+    let series = |query: &'static str| {
+        let app = f.app.clone();
+        async move {
+            let (status, body) = get(&app, &format!("/api/metrics?minutes=5{query}")).await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+            serde_json::from_str::<Value>(&body).unwrap()
+        }
+    };
+    assert_eq!(total(&series("").await, "processed"), 4);
+    assert_eq!(total(&series("&queue=default").await, "processed"), 2);
+    assert_eq!(total(&series("&queue=default").await, "failed"), 1);
+    assert_eq!(total(&series("&queue=mailers").await, "processed"), 2);
+    assert_eq!(total(&series("&job=charge_card").await, "processed"), 3);
+    assert_eq!(
+        total(&series("&job=charge_card&queue=mailers").await, "processed"),
+        1
+    );
+    assert_eq!(total(&series("&job=nothing").await, "processed"), 0);
+    assert_eq!(
+        total(&series("&queue=&job=").await, "processed"),
+        4,
+        "empty filters"
+    );
+}
+
+#[tokio::test]
+async fn a_queue_has_its_own_page_with_live_counts_charts_and_jobs() {
+    let f = fixture("");
+    let (status, html) = get(&f.app, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(r#"href="/queues/default""#),
+        "linked from the dashboard"
+    );
+    assert!(
+        html.contains(r#"href="/metrics/charge_card""#),
+        "busiest jobs link"
+    );
+
+    let (status, html) = get(&f.app, "/queues/default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(r#"data-queue-pending="default">1<"#),
+        "live pending"
+    );
+    assert!(
+        html.contains(r#"data-queue-running="default">"#),
+        "live running"
+    );
+    assert!(html.contains(r#"id="history-chart" data-queue="default" data-job="""#));
+    assert!(html.contains(r#"id="duration-chart""#));
+    assert!(html.contains(r#"href="/metrics/charge_card?queue=default""#));
+    assert!(html.contains("50.0%"), "its failure rate");
+    assert!(html.contains(r#"action="/queues/default/pause""#));
+    assert!(html.contains(r#"name="return_to" value="/queues/default""#));
+    assert!(html.contains("data-confirm=\"Pause default?"));
+
+    // Pausing from its page comes back to it, showing Resume.
+    let (_, location) = post(
+        &f.app,
+        "/queues/default/pause",
+        "same-origin",
+        "return_to=%2Fqueues%2Fdefault",
+    )
+    .await;
+    assert_eq!(location.as_deref(), Some("/queues/default"));
+    let (_, html) = get(&f.app, "/queues/default").await;
+    assert!(html.contains(r#"action="/queues/default/resume""#));
+    assert!(html.contains("badge-scheduled\">paused"));
+
+    // A queue with no jobs yet still has a page; a bad name doesn't.
+    let (status, html) = get(&f.app, "/queues/empty").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("No job finished on empty"));
+    let (status, _) = get(&f.app, "/queues/..bad").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_job_has_its_own_charts_across_queues() {
+    let f = fixture("");
+    f.queue
+        .record_metric(&JobMetric::now("charge_card", "mailers", false, 10))
+        .unwrap();
+    let (status, html) = get(&f.app, "/metrics/charge_card").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(r#"id="history-chart" data-queue="" data-job="charge_card""#));
+    assert!(
+        html.contains(r#"href="/metrics/charge_card?queue=mailers""#),
+        "queue filter"
+    );
+    assert!(html.contains(r#"href="/queues/default""#), "by-queue table");
+    assert!(html.contains(">3<"), "processed on every queue");
+
+    let (status, html) = get(&f.app, "/metrics/charge_card?queue=default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(r#"data-queue="default" data-job="charge_card""#));
+    assert!(html.contains(">2<"), "processed on default");
+
+    // From a job's own page.
+    let (_, html) = get(&f.app, &format!("/jobs/{}", f.dead)).await;
+    assert!(html.contains(r#"href="/metrics/charge_card""#));
+    assert!(html.contains(r#"href="/queues/default""#));
+}
+
+#[tokio::test]
+async fn job_names_are_encoded_in_links_and_escaped_on_their_page() {
+    let f = fixture("");
+    let name = "billing/charge <b>&";
+    f.queue
+        .record_metric(&JobMetric::now(name, "default", false, 10))
+        .unwrap();
+    let (_, html) = get(&f.app, "/").await;
+    let link = "/metrics/billing%2Fcharge%20%3Cb%3E%26";
+    assert!(html.contains(&format!(r#"href="{link}""#)), "encoded link");
+    assert!(!html.contains("<b>&"), "escaped");
+
+    let (status, html) = get(&f.app, link).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("billing/charge &#60;b&#62;&#38;"),
+        "escaped name"
+    );
+    assert!(!html.contains("<b>"));
+}
+
+#[tokio::test]
+async fn queue_and_job_pages_keep_the_base_path() {
+    let f = fixture("/admin/jobs");
+    let app = Router::new().nest("/admin/jobs", f.app.clone());
+    let (_, html) = get(&app, "/admin/jobs").await;
+    assert!(html.contains(r#"href="/admin/jobs/queues/default""#));
+    assert!(html.contains(r#"href="/admin/jobs/metrics/charge_card""#));
+
+    let (status, html) = get(&app, "/admin/jobs/queues/default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(r#"data-base="/admin/jobs""#),
+        "live updates and charts"
+    );
+    assert!(html.contains(r#"src="/admin/jobs/assets/app.js""#));
+    assert!(html.contains(r#"action="/admin/jobs/queues/default/pause""#));
+    assert!(html.contains(r#"name="return_to" value="/admin/jobs/queues/default""#));
+    assert!(html.contains(r#"href="/admin/jobs/metrics/charge_card?queue=default""#));
+    assert!(html.contains(r#"href="/admin/jobs/jobs?state=pending&queue=default""#));
+    let (_, location) = post(
+        &app,
+        "/admin/jobs/queues/default/pause",
+        "same-origin",
+        "return_to=%2Fadmin%2Fjobs%2Fqueues%2Fdefault",
+    )
+    .await;
+    assert_eq!(location.as_deref(), Some("/admin/jobs/queues/default"));
+
+    // Back to the dashboard: axum serves a nested router's root at the bare
+    // prefix only, not "/admin/jobs/".
+    assert!(html.contains(r#"<a href="/admin/jobs" class="text-sm"#));
+
+    let (status, html) = get(&app, "/admin/jobs/metrics/charge_card").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(r#"data-base="/admin/jobs""#));
+    assert!(html.contains(r#"<a href="/admin/jobs" class="text-sm"#));
+    assert!(html.contains(r#"href="/admin/jobs/queues/default""#));
 }

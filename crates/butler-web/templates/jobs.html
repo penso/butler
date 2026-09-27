@@ -17,14 +17,24 @@
 
 <nav class="mb-4 flex gap-1 border-b border-[var(--border)]">
   {% for tab in tabs %}
-  <a class="tab {% if tab.active %}active{% endif %}" href="{{ base }}/jobs?state={{ tab.state }}{% if !queue.is_empty() %}&queue={{ queue }}{% endif %}">
+  <a class="tab {% if tab.active %}active{% endif %}" href="{{ base }}/jobs?state={{ tab.state }}{% if !queue.is_empty() %}&queue={{ queue|urlencode_strict }}{% endif %}">
     {{ tab.label }} <span class="count">{{ tab.count }}</span>
   </a>
   {% endfor %}
 </nav>
 
-{% if can_retry || can_discard %}
+{% if can_retry || can_discard || can_bulk_schedule %}
 <div class="mb-3 flex justify-end gap-2">
+  {% if can_bulk_schedule %}
+  <form method="post" action="{{ base }}/jobs/run-now-all" data-confirm="Run every scheduled job{% if !queue.is_empty() %} on {{ queue }}{% endif %} now?">
+    <input type="hidden" name="queue" value="{{ queue }}"><input type="hidden" name="return_to" value="{{ return_to }}">
+    <button class="btn btn-accent" {% if rows.is_empty() %}disabled{% endif %}>Run all now</button>
+  </form>
+  <form method="post" action="{{ base }}/jobs/cancel-all" data-confirm="Cancel every scheduled job{% if !queue.is_empty() %} on {{ queue }}{% endif %}? They won't run.">
+    <input type="hidden" name="queue" value="{{ queue }}"><input type="hidden" name="return_to" value="{{ return_to }}">
+    <button class="btn btn-danger" {% if rows.is_empty() %}disabled{% endif %}>Cancel all</button>
+  </form>
+  {% endif %}
   {% if can_retry %}
   <form method="post" action="{{ base }}/jobs/retry-all" data-confirm="Retry every {{ label|lower }} job{% if !queue.is_empty() %} on {{ queue }}{% endif %}?">
     <input type="hidden" name="state" value="{{ state }}"><input type="hidden" name="queue" value="{{ queue }}"><input type="hidden" name="return_to" value="{{ return_to }}">
@@ -52,7 +62,7 @@
           <a class="link mono" href="{{ base }}/jobs/{{ row.id }}">{{ row.name }}</a>
           <div class="mono text-xs text-[var(--muted)]">…{{ row.short_id }}</div>
         </td>
-        <td class="mono text-[var(--muted)]">{{ row.queue }}</td>
+        <td><a class="mono text-[var(--muted)] hover:underline" href="{{ base }}/queues/{{ row.queue|urlencode_strict }}">{{ row.queue }}</a></td>
         <td class="whitespace-nowrap text-[var(--muted)]" data-ms="{{ row.enqueued_ms }}">{{ row.enqueued_ago }}</td>
         {% if show_run_at %}
         <td class="whitespace-nowrap text-[var(--info)]" data-until-ms="{{ row.run_at_ms }}">{{ row.runs_in }}</td>

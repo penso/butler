@@ -1,9 +1,10 @@
 # butler-web
 
 A web dashboard for [butler](https://crates.io/crates/butler-jobs)'s background jobs:
-live counts over server-sent events, throughput and duration charts, queues,
-workers, and job details. Retry or discard failed jobs, cancel pending work,
-run scheduled jobs now, pause and resume queues, see recurring schedules'
+live counts over server-sent events, throughput and duration charts (overall,
+per queue, and per job), queues, workers, and job details. Retry or discard
+failed jobs, cancel pending work, run scheduled jobs now (one or all), pause
+and resume queues, see recurring schedules'
 next and last run, and inspect arguments, results, errors, and saved progress.
 
 ![The dashboard](https://raw.githubusercontent.com/penso/butler/main/docs/images/dashboard-dark.png)
@@ -35,15 +36,18 @@ let app = Router::new()
 |---|---|
 | `/` | Stat cards, live throughput (per second, over SSE), 24 h / 7 d history, duration (average and slowest), queues with pause and resume, busiest jobs |
 | `/jobs?state=dead` | Jobs by state and queue, paged; retry, discard, cancel; retry all / discard all |
-| `/jobs?state=scheduled` | Scheduled jobs and retries waiting out their backoff, soonest first, with when they run next and their last error; run now, cancel |
+| `/jobs?state=scheduled` | Scheduled jobs and retries waiting out their backoff, soonest first, with when they run next and their last error; run now, cancel; run all now / cancel all (on the selected queue, if any) |
 | `/jobs/{id}` | Arguments, attempts, the full error chain, result, saved progress |
+| `/queues/{queue}` | One queue: live pending and running counts, pause or resume, its history and duration charts, and its jobs over the day |
+| `/metrics/{job}` | One job name: its totals, history and duration charts, on every queue or one (`?queue=`) |
 | `/recurring` | Recurring schedules: job, queue, cron and time zone, arguments, next run, last run (linking to its job); schedules no running worker registered for three minutes are marked and can be removed |
 | `/workers` | Workers, their heartbeat, and the jobs they hold |
 | `/events` | The live stream (`text/event-stream`), one snapshot per second |
-| `/api/stats`, `/api/metrics?minutes=1440` | The same data as JSON |
+| `/api/stats`, `/api/metrics?minutes=1440` | The same data as JSON; `/api/metrics` takes `queue=` and `job=` to narrow its series |
 
 One sampler reads the backend once a second, and only while a page is open,
-however many are.
+however many are. Queue and job pages use the same stream for their live
+counts, and read their charts' history once per load and once a minute.
 
 ## Security
 

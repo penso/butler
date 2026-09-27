@@ -1194,8 +1194,13 @@ How it behaves:
 - It needs no runtime: `butler::block_on(perform_enqueued_jobs(...))` works
   in a plain `#[test]`.
 - Inline mode is on while the future you pass is being polled. Work you
-  `tokio::spawn` from inside is a separate task, so its jobs are enqueued
-  normally.
+  `tokio::spawn` from inside is a separate task, polled by the runtime, so its
+  jobs are enqueued normally, not run. Spawn it with `butler::testing::spawn`
+  instead, or wrap the future in `butler::testing::propagate` (for
+  `tokio::spawn`, `JoinSet`, or another thread's `block_on`), and its jobs run
+  inline too. Both are no-ops outside a test scope, so application code can
+  use them. Join the task before the block ends. See
+  [Spawned tasks](#spawned-tasks-in-tests) for why this is opt-in.
 
 To check what code enqueues without running anything, like ActiveJob's
 `assert_enqueued_with`, record it with `RecordedJobs`:
@@ -1237,7 +1242,34 @@ jobs.assert_no_enqueued_jobs();
 - Scopes nest and the innermost decides: `record` inside `perform` records,
   `perform` inside `record` runs inline (and the recording doesn't see those
   jobs). Recording follows the future you pass, like inline mode, so work you
-  `tokio::spawn` from inside enqueues normally. It needs no runtime.
+  `tokio::spawn` from inside enqueues normally, unless it is spawned with
+  `testing::spawn` or wrapped in `testing::propagate`. It needs no runtime.
+
+#### Spawned tasks in tests
+
+```rust
+perform_enqueued_jobs(async {
+    // Handled like a request handler that notifies in the background:
+    butler::testing::spawn(async move { send_welcome(user_id).await.unwrap() })
+        .await
+        .unwrap();
+})
+.await;
+```
+
+A test scope is a thread-local set while its future is polled. A task given to
+`tokio::spawn` is polled by the runtime instead, often on another thread, so it
+can't see it, and nothing can carry it there automatically:
+
+- tokio's task-locals (`task_local!`) aren't inherited by spawned tasks either;
+- stable tokio has no hook that runs when a task is spawned;
+- a process-wide scope would capture the jobs of other tests, which run in
+  parallel.
+
+So spawned work opts in. `propagate(future)` captures the scope where it is
+called and enters it on every poll of `future`, wherever that happens, and
+`testing::spawn` is `tokio::spawn(propagate(future))`. Outside a scope, they
+wrap the future and change nothing else.
 
 ### Queues and priority
 
@@ -1827,7 +1859,7 @@ crates/butler/                   the library (published as `butler`)
   src/progress.rs                Progress, Interrupted (job continuations)
   src/retry.rs                   Backoff, Retry, Retryable, RetryPolicy
   src/recurring.rs               Cron, Recurring, RecurringRecord (recurring jobs)
-  src/testing.rs                 perform_enqueued_jobs, InlineJobs
+  src/testing.rs                 perform_enqueued_jobs, InlineJobs, spawn/propagate
   src/testing/recorded.rs        RecordedJobs (assert what was enqueued)
   src/backend/mod.rs             Backend traits (Store, Monitor, Watch), Queue handle
   src/backend/file.rs            file backend

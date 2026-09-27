@@ -22,9 +22,32 @@
 //! Rails' block.
 //!
 //! Inline mode follows the future you pass: it is on while that future is
-//! being polled, on whatever thread polls it. Work you `tokio::spawn` from
-//! inside is a separate task, so it enqueues normally. It needs no worker, no
+//! being polled, on whatever thread polls it. It needs no worker, no
 //! configured queue, and no runtime (it also works under [`block_on`](crate::block_on)).
+//!
+//! # Spawned tasks
+//!
+//! Work you `tokio::spawn` from inside is a separate task, polled by the
+//! runtime rather than by your future, often on another thread. It doesn't
+//! see the scope, so its jobs are enqueued normally. The scope can't follow it
+//! on its own: tokio's task-locals aren't inherited by spawned tasks either,
+//! stable tokio has no hook on spawn, and a process-wide scope would capture
+//! the jobs of other tests running in parallel. So spawned work opts in:
+//! [`spawn`] instead of `tokio::spawn`, or [`propagate`] around any future
+//! (for `tokio::spawn`, `JoinSet::spawn`, or a thread's `block_on`).
+//!
+//! ```ignore
+//! perform_enqueued_jobs(async {
+//!     butler::testing::spawn(async { send_welcome(user_id).await.unwrap() })
+//!         .await
+//!         .unwrap();
+//! })
+//! .await;
+//! ```
+//!
+//! Both are no-ops outside a scope, so application code can use them in
+//! production. Join spawned work before the scope ends, as the scope's
+//! assertions only see what finished.
 //!
 //! To check what code enqueues without running it, use [`RecordedJobs`]
 //! instead: like ActiveJob's `assert_enqueued_with`.
@@ -239,6 +262,52 @@ impl<F: Future> Future for Performing<F> {
         let this = &mut *self;
         let _restore = enter(Scope::Inline(this.jobs.clone()));
         this.body.as_mut().poll(cx)
+    }
+}
+
+/// Carries the testing scope active where this is called, if any, into
+/// `future`: jobs it enqueues run inline or are recorded, as they would be in
+/// the scope itself, whichever task or thread polls it. Call it inside the
+/// scope, where the future is created, then spawn the result:
+///
+/// ```ignore
+/// tokio::spawn(butler::testing::propagate(async move { notify(user).await }));
+/// ```
+///
+/// The scope it carries applies even where another scope polls it. Created
+/// outside any scope, it changes nothing: whichever scope polls it applies,
+/// if any.
+pub fn propagate<F: Future>(future: F) -> Propagated<F> {
+    Propagated {
+        future: Box::pin(future),
+        scope: current(),
+    }
+}
+
+/// `tokio::spawn`, carrying the current testing scope into the task (see
+/// [`propagate`]). Outside a scope it is `tokio::spawn`.
+#[cfg(feature = "tokio")]
+pub fn spawn<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::spawn(propagate(future))
+}
+
+/// The future returned by [`propagate`].
+pub struct Propagated<F> {
+    future: Pin<Box<F>>,
+    scope: Option<Scope>,
+}
+
+impl<F: Future> Future for Propagated<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let this = &mut *self;
+        let _restore = this.scope.clone().map(enter);
+        this.future.as_mut().poll(cx)
     }
 }
 

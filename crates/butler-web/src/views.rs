@@ -17,9 +17,13 @@ pub(crate) fn chain(err: &(dyn std::error::Error + 'static)) -> String {
 }
 
 pub(crate) fn now_ms() -> u64 {
+    epoch_ms(SystemTime::now())
+}
+
+/// `at` in milliseconds since the Unix epoch.
+pub(crate) fn epoch_ms(at: SystemTime) -> u64 {
     u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+        at.duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis(),
     )

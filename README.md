@@ -64,13 +64,16 @@ types, and the `reports` module belong to your application. See
   metadata, vetoes, a tracing span per run, and an `on_dead` hook for alerts.
 - **Scheduled jobs.** Run a job in five minutes or at 03:00 with
   `prepare(..)?.run_in(..)` or `.run_at(..)`, and cancel it while it waits.
+- **Recurring jobs.** Cron schedules in `butler.toml` or code, in UTC or a
+  named time zone, enqueued exactly once per tick however many workers run.
 - **Resumable work.** Typed checkpoints let long jobs continue after a deploy,
   crash, or failed attempt.
 - **Controlled concurrency.** Named queues, strict or weighted priority,
   per-queue limits, and bulk enqueueing. Async jobs run as Tokio tasks;
   synchronous jobs use its blocking pool. A thread worker also runs without Tokio.
 - **Built-in visibility.** A live web dashboard for throughput, workers,
-  queues, job details, scheduled jobs, and retry/cancel/discard/run-now actions.
+  queues, job details, scheduled and recurring jobs, and
+  retry/cancel/discard/run-now actions.
 
 Delivery is **at least once**: jobs must be safe to repeat, including work done
 since the last saved checkpoint. Durable backends recover work after worker
@@ -95,6 +98,7 @@ crashes; storage durability still depends on the backend's configuration.
   - [Running a job now](#running-a-job-now)
   - [Bulk enqueuing](#bulk-enqueuing)
   - [Scheduling jobs](#scheduling-jobs)
+  - [Recurring jobs](#recurring-jobs)
   - [Retries and backoff](#retries-and-backoff)
   - [Results](#results)
   - [Running a worker](#running-a-worker)
@@ -213,8 +217,9 @@ each. See [Concurrency and cores](#concurrency-and-cores) for tuning.
 
 `butler-web` shows live counts streamed over server-sent events, throughput and
 duration charts, queues, workers, and job details. Retry or discard failed
-jobs, cancel pending work, run scheduled jobs now, and inspect arguments,
-results, errors, and saved progress from one place.
+jobs, cancel pending work, run scheduled jobs now, see each recurring
+schedule's next and last run, and inspect arguments, results, errors, and
+saved progress from one place.
 
 ![butler-web dashboard, dark theme](https://raw.githubusercontent.com/penso/butler/main/docs/images/dashboard-dark.png)
 
@@ -701,6 +706,64 @@ promotes them every 250 ms, so they move even while every worker is busy. How
 each backend stores them is under [Backends](#backends). The dashboard lists
 them in a Scheduled tab, with "Run now" and "Cancel".
 
+### Recurring jobs
+
+Jobs enqueued on a cron schedule, like Solid Queue's `recurring.yml`: a
+nightly report, an hourly cleanup. Declare them in `butler.toml`:
+
+```toml
+[[recurring]]
+job = "nightly_report"        # the job's name: its function, or #[job(name = "...")]
+cron = "0 3 * * *"            # minute hour day-of-month month day-of-week
+args = ["summary"]            # optional: its arguments, in order
+queue = "reports"             # optional: default, the job's own queue
+timezone = "Europe/Paris"     # optional: default, UTC
+key = "nightly"               # optional: see below
+```
+
+or in code, from a prepared job:
+
+```rust
+let worker = butler::Worker::from_config(&config)?
+    .recurring(nightly_report::prepare("summary")?, "0 3 * * *")?;
+
+// With a time zone or a key of its own:
+let schedule = butler::Recurring::new(cleanup::prepare()?, "*/15 * * * *")?
+    .in_time_zone("America/New_York")?
+    .with_key("cleanup")?;
+let worker = worker.add_recurring(schedule)?;
+```
+
+- **Cron.** Five fields, as in crontab, with lists, ranges, steps and names
+  (`"*/15 9-17 * * mon-fri"`). In the day of week, `0` and `7` are Sunday and
+  `1` is Monday; when both day fields are restricted, either one matching is
+  enough: `"0 0 1 * 1"` runs on the first of each month and every Monday.
+  If either day field starts with `*` (including `*/2`), both fields must
+  match. Expressions are checked when `butler.toml` loads.
+- **Time zones.** UTC unless `timezone` names an IANA zone. In a zone with
+  daylight saving time, a local time skipped in spring doesn't run that day,
+  and one repeated in autumn runs at both instants.
+- **Exactly once per tick.** Every worker with the schedule evaluates it, and
+  the backend enqueues each tick once between them: the push is idempotent on
+  `(schedule, tick time)`. The job then runs like any other, with its queue,
+  retries and at-least-once delivery.
+- **Missed ticks.** A tick that passed while no worker was running is
+  enqueued once, late, when a worker starts: only the latest one, never a
+  backlog. A schedule doesn't run for ticks from before it first existed.
+- **Keys.** A schedule is identified by its key, derived by default from the
+  job, queue, arguments, cron and time zone, so changing any of them makes a
+  new schedule. Give it a `key` to keep its history across such changes, and
+  so that old and new workers can't both run one tick during a rolling
+  deploy.
+- **The job must be known** to the worker when the schedule is read. Jobs from
+  another crate need registering first:
+  `Worker::new(config.connect()?).register(lib::job::JOB).with_config(&config.worker).with_recurring_config(&config.recurring)?`.
+
+Workers register their schedules with the backend every minute. The
+dashboard's Recurring page lists them with their next and last run, and marks
+the ones no running worker has registered for three minutes; those can be
+removed.
+
 ### Retries and backoff
 
 A failed job is retried up to `max_retries` times, waiting longer before each
@@ -1157,6 +1220,14 @@ claimers = 16                # claim loops side by side (default: the number of 
 
 [worker.queue_limits]        # optional: jobs running at once, per queue
 mailers = 20
+
+[[recurring]]                # optional, any number: see "Recurring jobs"
+job = "nightly_report"
+cron = "0 3 * * *"
+args = ["summary"]           # optional
+queue = "reports"            # optional: default, the job's own queue
+timezone = "Europe/Paris"    # optional: default, UTC
+key = "nightly"              # optional: default, derived from the fields above
 ```
 
 Environment variables override any key, with `__` between levels:
@@ -1222,6 +1293,7 @@ without crashing can also see its job run a second time elsewhere.
 
 ```text
 pending/<queue>/  scheduled/  processing/<worker>/  workers/<worker>  done/  dead/  cancelled/
+recurring/schedules/<key>.json  recurring/ticks/<key>/<tick time>
 ```
 
 Each write goes to `tmp/` first and is then renamed into place, so nothing ever
@@ -1232,6 +1304,12 @@ promotion reads the directory in run-time order and stops at the first one not
 yet due. A heartbeat is the file `workers/<worker>` holding its expiry
 time. The file backend can't block waiting for a job, so idle workers sleep
 `poll_interval_ms` between checks.
+
+A recurring tick is claimed by hard-linking a marker file, already holding the
+job id, to `recurring/ticks/<key>/<tick time>`: a link fails if the name
+exists, so exactly one worker creates it and enqueues the job. The job file is
+written under `tmp/` first and renamed into its queue after the link; a crash
+between the two loses that one tick.
 
 ### Redis
 
@@ -1248,6 +1326,9 @@ time. The file backend can't block waiting for a job, so idle workers sleep
 | `butler:wake` | pub/sub channel | a message per push, retry and recovery; wakes idle workers |
 | `butler:done` | pub/sub channel | a message per job done, dead or cancelled; wakes `wait_result` |
 | `butler:job:<id>` | HASH | `state`, `queue`, and `data` (job JSON); done and cancelled jobs expire after 24h |
+| `butler:recurring` | SET | keys of the recurring schedules workers registered |
+| `butler:recurring:<key>` | HASH | `data` (schedule JSON), `created_at`, `seen_at`, `last_tick`, `last_job` |
+| `butler:recurring:tick:<key>:<ms>` | STRING | the job enqueued for that tick; expires after 24h |
 
 A claim is an `LMOVE queue:<queue> processing:<worker>` for each queue the
 worker serves, in its priority order. Redis runs each one atomically, so only
@@ -1268,8 +1349,10 @@ recovering at once can't requeue a job twice. Promotion is a Lua script too:
 it takes the due ids from `butler:scheduled` (`ZRANGEBYSCORE`) and `LPUSH`es
 each onto its own queue, atomically, so a job moves exactly once. Cancelling a
 scheduled job is a `ZREM`, tried before the queue list: ids only move from the
-set to a queue, so a job can't slip past both checks. Calls use a small connection
-pool, so concurrent claims don't wait on each other.
+set to a queue, so a job can't slip past both checks. A recurring tick is a
+script too: `SET recurring:tick:<key>:<ms> NX`, and the job's push only if
+that succeeded. Calls use a small connection pool, so concurrent claims don't
+wait on each other.
 
 The job's return value goes into the job hash's `data`, next to its arguments.
 
@@ -1288,6 +1371,8 @@ processes on the same machine:
 |---|---|---|
 | `butler_jobs` | `id, queue, state, worker, seq, data, run_at` | every job; `data` is the job JSON, `seq` the order in its queue, `run_at` a scheduled job's time in ms |
 | `butler_workers` | `worker, expires_at_ms` | heartbeats, for crash recovery |
+| `butler_recurring` | `key, data, created_at_ms, seen_at_ms, last_tick_ms, last_job_id` | recurring schedules and their last run |
+| `butler_recurring_ticks` | `key, tick_ms, job_id` | ticks enqueued; the primary key `(key, tick_ms)` makes each one run once |
 
 A claim is one `UPDATE ... RETURNING` that moves the oldest pending row of a
 queue to `processing` under the claiming worker. SQLite runs it under its write
@@ -1300,6 +1385,11 @@ promotion turns the due ones into `pending` rows at the back of their queue,
 in one transaction. It reads `MIN(run_at)` first (indexed), so it only takes
 the write lock when something is due. Databases created by earlier versions
 get the `run_at` column and its index when opened.
+
+A recurring tick is an `INSERT OR IGNORE` into `butler_recurring_ticks` and
+the job's insert, in one transaction: only the worker whose tick row went in
+enqueues the job. Databases from before recurring jobs get both tables when
+opened.
 
 **Waking waiters without a server.** SQLite has no pub/sub between processes:
 its hooks only see changes made through the same connection. butler combines
@@ -1333,7 +1423,8 @@ memory until the process exits.
 `crates/butler/tests/backends.rs` runs the same contract checks (FIFO claims,
 waking on push, cancel against claim, results, retries, recovery, scheduled
 jobs: not claimable early, claimable once due, promoted to their own queue,
-cancel against promotion) against all four backends.
+cancel against promotion; recurring ticks enqueued once however many workers
+push them) against all four backends.
 
 **Upgrading.** Scheduled jobs add a `scheduled` state, which retries waiting
 out their backoff use too. Deploy this version to every worker and dashboard
@@ -1342,6 +1433,14 @@ promote them, and reading one fails with `Error::UnknownState`. Jobs already
 queued need nothing: their records read as before. Retries now wait
 (exponential backoff by default); `backoff = "fixed:0s"` in `[worker]` keeps
 the old immediate retries.
+
+**Upgrading to recurring jobs.** They add storage and nothing else changes:
+new Redis keys under `<prefix>:recurring`, two new SQLite tables (created
+when a database is opened), and a `recurring/` directory for the file
+backend. Workers without `[[recurring]]` entries never touch them. Only
+workers running this version enqueue recurring jobs; while older workers run
+next to them, they simply don't take part. A dashboard of an older version
+lacks the Recurring page but works otherwise.
 
 ## Limitations
 
@@ -1367,6 +1466,7 @@ crates/butler/                   the library (published as `butler`)
   src/prepared.rs                PreparedJob, enqueue_all (bulk enqueuing)
   src/progress.rs                Progress, Interrupted (job continuations)
   src/retry.rs                   Backoff, Retry, Retryable, RetryPolicy
+  src/recurring.rs               Cron, Recurring, RecurringRecord (recurring jobs)
   src/testing.rs                 perform_enqueued_jobs, InlineJobs
   src/backend/mod.rs             Backend traits (Store, Monitor, Watch), Queue handle
   src/backend/file.rs            file backend

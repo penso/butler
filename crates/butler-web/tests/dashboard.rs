@@ -420,3 +420,166 @@ async fn a_retry_waiting_its_turn_shows_its_error_and_next_attempt() {
     );
     assert!(html.contains("503 from the CRM"));
 }
+
+/// Registers two recurring schedules on `queue`: "nightly", seen by a
+/// worker just now and run once, and "retired", last seen an hour ago.
+/// Returns the id of nightly's last job.
+fn recurring_schedules(queue: &Queue) -> String {
+    let schedule = |name: &str, key: &str| {
+        butler::Recurring::from_parts(
+            name.into(),
+            "reports".into(),
+            vec![json!("<script>alert(1)</script>")],
+            butler::Cron::parse("0 3 * * *")
+                .unwrap()
+                .in_time_zone("Europe/Paris")
+                .unwrap(),
+        )
+        .unwrap()
+        .with_key(key)
+        .unwrap()
+    };
+    let now = SystemTime::now();
+    queue
+        .register_recurring(&[
+            schedule("nightly_report", "nightly").record(now),
+            schedule("old_report", "retired").record(now - Duration::from_secs(3600)),
+        ])
+        .unwrap();
+    queue
+        .push_recurring(
+            "nightly",
+            now - Duration::from_secs(60),
+            butler::NewJob::new("nightly_report", "reports", vec![]),
+        )
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn recurring_schedules_show_their_next_and_last_run() {
+    let f = fixture("");
+    let (status, html) = get(&f.app, "/recurring").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("No recurring schedules"));
+
+    let last_job = recurring_schedules(&f.queue);
+    let (status, html) = get(&f.app, "/recurring").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(r#"href="/recurring" class="nav-link active""#));
+    assert!(html.contains("nightly_report") && html.contains("old_report"));
+    assert!(html.contains("0 3 * * *") && html.contains("Europe/Paris"));
+    assert!(html.contains("data-until-ms="), "next run");
+    assert!(
+        html.contains(&format!(r#"href="/jobs/{last_job}""#)),
+        "last run links to its job"
+    );
+    assert!(html.contains("not yet"), "retired never ran");
+    assert!(
+        !html.contains("<script>alert(1)</script>"),
+        "arguments are escaped"
+    );
+    assert!(html.contains("&#60;script&#62;"));
+    // Only the schedule no worker runs anymore can be removed.
+    assert!(html.contains(r#"action="/recurring/retired/remove""#));
+    assert!(!html.contains(r#"action="/recurring/nightly/remove""#));
+}
+
+#[tokio::test]
+async fn removing_a_recurring_schedule_is_a_same_site_post_that_redirects_back() {
+    let f = fixture("");
+    recurring_schedules(&f.queue);
+    let keys = |queue: &Queue| {
+        queue
+            .recurring()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.key)
+            .collect::<Vec<_>>()
+    };
+
+    let (status, _) = post(&f.app, "/recurring/retired/remove", "cross-site", "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(keys(&f.queue), ["nightly", "retired"], "unchanged");
+
+    let (status, location) = post(
+        &f.app,
+        "/recurring/retired/remove",
+        "same-origin",
+        "return_to=%2Frecurring",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location.as_deref(), Some("/recurring"));
+    assert_eq!(keys(&f.queue), ["nightly"]);
+
+    let (_, location) = post(
+        &f.app,
+        "/recurring/nightly/remove",
+        "same-origin",
+        "return_to=https%3A%2F%2Fevil.example%2F",
+    )
+    .await;
+    assert_eq!(location.as_deref(), Some("/"), "never an open redirect");
+}
+
+#[tokio::test]
+async fn recurring_links_and_actions_keep_the_base_path() {
+    let f = fixture("/admin/jobs");
+    let last_job = recurring_schedules(&f.queue);
+    let app = Router::new().nest("/admin/jobs", f.app.clone());
+    let (status, html) = get(&app, "/admin/jobs/recurring").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(r#"href="/admin/jobs/recurring" class="nav-link active""#));
+    assert!(html.contains(&format!(r#"href="/admin/jobs/jobs/{last_job}""#)));
+    assert!(html.contains(r#"action="/admin/jobs/recurring/retired/remove""#));
+    assert!(html.contains(r#"name="return_to" value="/admin/jobs/recurring""#));
+    let (_, location) = post(
+        &app,
+        "/admin/jobs/recurring/retired/remove",
+        "same-origin",
+        "return_to=%2Fadmin%2Fjobs%2Frecurring",
+    )
+    .await;
+    assert_eq!(location.as_deref(), Some("/admin/jobs/recurring"));
+    assert_eq!(f.queue.recurring().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn removing_recurring_rejects_encoded_path_separators_and_preserves_files() {
+    let dir = std::env::temp_dir().join(format!(
+        "butler-dashboard-recurring-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let queue: Queue = butler::FileQueue::new(&dir).unwrap().into();
+    let id = queue.push("report", "default", vec![]).unwrap();
+    recurring_schedules(&queue);
+    for base in ["", "/admin/jobs"] {
+        let app = butler_web::Dashboard::new(queue.clone())
+            .base_path(base)
+            .router();
+        let app = if base.is_empty() {
+            app
+        } else {
+            Router::new().nest(base, app)
+        };
+        for key in ["..%2F..%2Fpending", "%2Fpending", "a%5Cb"] {
+            let (status, _) = post(
+                &app,
+                &format!("{base}/recurring/{key}/remove"),
+                "same-origin",
+                "",
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{key}");
+            assert!(dir.join("pending").is_dir());
+            assert_eq!(queue.state(&id), Some(JobState::Pending));
+            assert_eq!(queue.recurring().unwrap().len(), 2);
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

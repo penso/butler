@@ -4,6 +4,8 @@
 //! ```text
 //! butler_jobs     id, queue, state, worker, seq, data (job JSON), finished_seq, run_at
 //! butler_workers  worker, expires_at_ms (the heartbeat)
+//! butler_recurring        key, data (schedule JSON), created_at_ms, seen_at_ms, last_tick_ms, last_job_id
+//! butler_recurring_ticks  key, tick_ms, job_id: primary key (key, tick_ms)
 //! ```
 //!
 //! A claim is one `UPDATE ... RETURNING` that moves the oldest pending row of
@@ -16,6 +18,11 @@
 //! ones at the back of their queue, in run-time order; claims only take
 //! `pending` rows, so a scheduled job can't run early. Databases created
 //! before scheduling existed get the `run_at` column when opened.
+//!
+//! A recurring tick is an `INSERT OR IGNORE` into `butler_recurring_ticks`,
+//! whose primary key is `(key, tick_ms)`, and the job's insert, in one
+//! transaction: only the worker whose tick row went in enqueues the job.
+//! Databases from before recurring jobs get both tables when opened.
 //!
 //! Waking waiters, without a server to publish through:
 //!
@@ -43,9 +50,9 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use super::{Monitor, NewJob, Promoted, Store, Watch};
+use super::{Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
 use crate::{
-    Error, JobId, JobRecord, JobState, Result, Signal,
+    Error, JobId, JobRecord, JobState, RecurringRecord, Result, Signal,
     job::{from_millis, millis},
     monitor::{
         JobMetric, ListFilter, METRICS_RETENTION_MINUTES, MetricBucket, QueueStats, Stats,
@@ -97,6 +104,22 @@ CREATE TABLE IF NOT EXISTS butler_metrics (
 CREATE TABLE IF NOT EXISTS butler_counters (
     name  TEXT PRIMARY KEY,
     value INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS butler_recurring (
+    key           TEXT PRIMARY KEY,
+    -- The schedule's definition, as JSON; the columns below win over it.
+    data          TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    seen_at_ms    INTEGER NOT NULL,
+    last_tick_ms  INTEGER,
+    last_job_id   TEXT
+);
+-- One row per tick enqueued: the primary key is what makes a tick run once.
+CREATE TABLE IF NOT EXISTS butler_recurring_ticks (
+    key     TEXT NOT NULL,
+    tick_ms INTEGER NOT NULL,
+    job_id  TEXT NOT NULL,
+    PRIMARY KEY (key, tick_ms)
 );
 ";
 
@@ -273,6 +296,37 @@ fn watch_once(path: &Path, signals: &Weak<Signals>) -> rusqlite::Result<()> {
     }
 }
 
+/// A stored time or count as a SQLite integer.
+fn int(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// A `butler_recurring` row: `data`, `[created_at_ms, seen_at_ms]`,
+/// `last_tick_ms`, `last_job_id`.
+type RecurringRow = (String, [i64; 2], Option<i64>, Option<String>);
+
+/// Reads a `butler_recurring` row: `data`, `created_at_ms`, `seen_at_ms`,
+/// `last_tick_ms`, `last_job_id`, in that order.
+fn recurring_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecurringRow> {
+    Ok((
+        row.get(0)?,
+        [row.get(1)?, row.get(2)?],
+        row.get(3)?,
+        row.get(4)?,
+    ))
+}
+
+fn from_recurring_row(
+    (data, [created, seen], last_tick, last_job): RecurringRow,
+) -> Result<RecurringRecord> {
+    let mut schedule: RecurringRecord = serde_json::from_str(&data)?;
+    schedule.created_at_ms = count(created);
+    schedule.seen_at_ms = count(seen);
+    schedule.last_tick_ms = last_tick.map(count);
+    schedule.last_job_id = last_job;
+    Ok(schedule)
+}
+
 /// SQLite integers are signed; counts and durations are never negative.
 fn count(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
@@ -290,6 +344,10 @@ fn new_state(job: &JobRecord) -> JobState {
 fn run_at_column(job: &JobRecord) -> Option<i64> {
     job.run_at_ms
         .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX))
+}
+
+fn millis_of(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn now_ms() -> i64 {
@@ -568,6 +626,83 @@ impl Store for SqliteQueue {
         Ok(recovered)
     }
 
+    /// One transaction: an existing schedule keeps its creation time and
+    /// last run.
+    fn register_recurring(&self, schedules: &[RecurringRecord]) -> Result<Vec<RecurringRecord>> {
+        let rows = schedules
+            .iter()
+            .map(|schedule| Ok((schedule, serde_json::to_string(schedule)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let stored = self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut stored = Vec::with_capacity(rows.len());
+            {
+                let mut upsert = tx.prepare(
+                    "INSERT INTO butler_recurring (key, data, created_at_ms, seen_at_ms)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (key) DO UPDATE SET
+                         data = excluded.data, seen_at_ms = excluded.seen_at_ms
+                     RETURNING data, created_at_ms, seen_at_ms, last_tick_ms, last_job_id",
+                )?;
+                for (schedule, data) in &rows {
+                    stored.push(upsert.query_row(
+                        params![
+                            schedule.key,
+                            data,
+                            int(schedule.created_at_ms),
+                            int(schedule.seen_at_ms)
+                        ],
+                        recurring_row,
+                    )?);
+                }
+            }
+            tx.commit()?;
+            Ok(stored)
+        })?;
+        stored.into_iter().map(from_recurring_row).collect()
+    }
+
+    fn push_recurring(&self, key: &str, tick: SystemTime, job: NewJob) -> Result<Option<JobId>> {
+        let job = job.into_record();
+        let data = serde_json::to_string(&job)?;
+        let tick = int(millis(tick));
+        let oldest = tick.saturating_sub(int(millis_of(TICK_RETENTION)));
+        let pushed = self.with_conn(|conn| {
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+            let taken = tx.execute(
+                "INSERT OR IGNORE INTO butler_recurring_ticks (key, tick_ms, job_id)
+                 VALUES (?1, ?2, ?3)",
+                params![key, tick, job.id],
+            )?;
+            if taken == 0 {
+                return Ok(false);
+            }
+            tx.execute(
+                &format!(
+                    "INSERT INTO butler_jobs (id, queue, state, seq, data)
+                     VALUES (?1, ?2, 'pending', {NEXT_SEQ}, ?3)"
+                ),
+                params![job.id, job.queue, data],
+            )?;
+            tx.execute(
+                "UPDATE butler_recurring SET last_tick_ms = ?2, last_job_id = ?3
+                 WHERE key = ?1 AND (last_tick_ms IS NULL OR last_tick_ms < ?2)",
+                params![key, tick, job.id],
+            )?;
+            tx.execute(
+                "DELETE FROM butler_recurring_ticks WHERE key = ?1 AND tick_ms < ?2",
+                params![key, oldest],
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })?;
+        if !pushed {
+            return Ok(None);
+        }
+        self.signals.pushed.notify();
+        Ok(Some(job.id))
+    }
+
     fn describe(&self) -> String {
         format!("sqlite:{}", self.path.display())
     }
@@ -742,6 +877,34 @@ impl Monitor for SqliteQueue {
         Ok(changed > 0)
     }
 
+    fn recurring(&self) -> Result<Vec<RecurringRecord>> {
+        let rows = self.with_conn(|conn| {
+            conn.prepare(
+                "SELECT data, created_at_ms, seen_at_ms, last_tick_ms, last_job_id
+                 FROM butler_recurring ORDER BY key",
+            )?
+            .query_map([], recurring_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        rows.into_iter().map(from_recurring_row).collect()
+    }
+
+    fn remove_recurring(&self, key: &str) -> Result<bool> {
+        crate::recurring::validate_key(key)?;
+        let removed = self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let removed =
+                tx.execute("DELETE FROM butler_recurring WHERE key = ?1", params![key])?;
+            tx.execute(
+                "DELETE FROM butler_recurring_ticks WHERE key = ?1",
+                params![key],
+            )?;
+            tx.commit()?;
+            Ok(removed)
+        })?;
+        Ok(removed > 0)
+    }
+
     /// One transaction: the bucket and both lifetime counters.
     fn record_metric(&self, metric: &JobMetric) -> Result<()> {
         let prune = self
@@ -836,6 +999,84 @@ mod tests {
         data   TEXT NOT NULL,
         finished_seq INTEGER
     );";
+
+    /// The whole schema as 0.1.0 (before recurring jobs) created it.
+    const SCHEMA_0_1: &str = "
+    CREATE TABLE butler_jobs (
+        id TEXT PRIMARY KEY, queue TEXT NOT NULL, state TEXT NOT NULL, worker TEXT,
+        seq INTEGER NOT NULL, data TEXT NOT NULL, finished_seq INTEGER, run_at INTEGER
+    );
+    CREATE INDEX butler_jobs_claim ON butler_jobs (state, queue, seq);
+    CREATE INDEX butler_jobs_finished ON butler_jobs (finished_seq);
+    CREATE INDEX butler_jobs_seq ON butler_jobs (seq);
+    CREATE INDEX butler_jobs_scheduled ON butler_jobs (state, run_at);
+    CREATE TABLE butler_workers (worker TEXT PRIMARY KEY, expires_at_ms INTEGER NOT NULL);
+    CREATE TABLE butler_metrics (
+        minute INTEGER NOT NULL, queue TEXT NOT NULL, job TEXT NOT NULL,
+        processed INTEGER NOT NULL, failed INTEGER NOT NULL, total_ms INTEGER NOT NULL,
+        max_ms INTEGER NOT NULL, PRIMARY KEY (minute, queue, job)
+    );
+    CREATE TABLE butler_counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);";
+
+    #[test]
+    fn a_0_1_database_gains_recurring_jobs_and_keeps_its_jobs() {
+        let path = std::env::temp_dir().join(format!(
+            "butler-sqlite-migrate-0-1-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let (pending, scheduled) = ("1-1-0", "2-1-0");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_0_1).unwrap();
+            // A pending and a scheduled job, as 0.1.0 wrote them.
+            let later = now_ms() + 3_600_000;
+            let pending_data = r#"{"id":"1-1-0","name":"old","queue":"default","args":[],
+                "attempts":0,"enqueued_at_ms":1,"last_error":null}"#;
+            let scheduled_data = format!(
+                r#"{{"id":"2-1-0","name":"later","queue":"default","args":[],
+                "attempts":0,"enqueued_at_ms":1,"last_error":null,"run_at_ms":{later}}}"#
+            );
+            conn.execute(
+                "INSERT INTO butler_jobs (id, queue, state, seq, data)
+                 VALUES ('1-1-0', 'default', 'pending', 1, ?1)",
+                params![pending_data],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO butler_jobs (id, queue, state, seq, data, run_at)
+                 VALUES ('2-1-0', 'default', 'scheduled', 2, ?1, ?2)",
+                params![scheduled_data, later],
+            )
+            .unwrap();
+        }
+        let queue = SqliteQueue::open(&path).unwrap();
+        drop(SqliteQueue::open(&path).unwrap());
+        assert_eq!(queue.get(pending).unwrap().unwrap().0, JobState::Pending);
+        assert_eq!(
+            queue.get(scheduled).unwrap().unwrap().0,
+            JobState::Scheduled
+        );
+
+        let schedule = crate::Recurring::from_parts(
+            "report".into(),
+            "default".into(),
+            vec![],
+            crate::Cron::parse("0 * * * *").unwrap(),
+        )
+        .unwrap()
+        .record(SystemTime::now());
+        queue.register_recurring(&[schedule]).unwrap();
+        let key = queue.recurring().unwrap()[0].key.clone();
+        let tick = SystemTime::now();
+        let job = || NewJob::new("report", "default", vec![]);
+        assert!(queue.push_recurring(&key, tick, job()).unwrap().is_some());
+        assert!(queue.push_recurring(&key, tick, job()).unwrap().is_none());
+        // The old pending job is still first in line.
+        let claimed = queue.claim("w", &["default"], Duration::ZERO).unwrap();
+        assert_eq!(claimed.unwrap().id, pending);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn an_older_database_gains_scheduling_and_keeps_its_jobs() {

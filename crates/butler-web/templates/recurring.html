@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Recurring{% endblock %}
+{% block content %}
+<h1 class="mb-1 text-xl font-semibold tracking-tight">Recurring</h1>
+<p class="mb-6 text-sm text-[var(--muted)]">Jobs enqueued on a cron schedule. Every worker with a schedule evaluates it, and each tick is enqueued once between them. A tick missed while no worker ran is enqueued once, late, when one starts.</p>
+<div class="card overflow-x-auto">
+  <table class="table">
+    <thead><tr><th>Schedule</th><th>Queue</th><th>Cron</th><th>Arguments</th><th>Next run</th><th>Last run</th><th>Status</th><th class="text-right">Actions</th></tr></thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td>
+          <span class="mono">{{ row.name }}</span>
+          <div class="mono text-xs text-[var(--muted)]">{{ row.key }}</div>
+        </td>
+        <td class="mono text-[var(--muted)]">{{ row.queue }}</td>
+        <td class="whitespace-nowrap">
+          <span class="mono">{{ row.cron }}</span>
+          <div class="text-xs text-[var(--muted)]">{{ row.time_zone }}</div>
+        </td>
+        <td class="max-w-xs truncate mono text-xs text-[var(--muted)]" title="{{ row.args }}">{{ row.args }}</td>
+        <td class="whitespace-nowrap text-[var(--info)]">
+          {% if let Some((next_ms, next_in)) = row.next %}<span data-until-ms="{{ next_ms }}" data-local-ms="{{ next_ms }}">{{ next_in }}</span>{% else %}<span class="text-[var(--muted)]">never</span>{% endif %}
+        </td>
+        <td class="whitespace-nowrap text-[var(--muted)]">
+          {% if let Some((last_ms, last_ago, job)) = row.last %}<a class="link" href="{{ base }}/jobs/{{ job }}" data-ms="{{ last_ms }}" data-local-ms="{{ last_ms }}">{{ last_ago }}</a>{% else %}not yet{% endif %}
+        </td>
+        <td>{% if row.active %}<span class="badge badge-done"><span class="dot bg-[var(--accent)]"></span>active</span>{% else %}<span class="badge badge-dead" title="No running worker registered it in the last {{ window }}">no worker</span>{% endif %}</td>
+        <td class="text-right">
+          {% if !row.active %}
+          <form method="post" action="{{ base }}/recurring/{{ row.key }}/remove" data-confirm="Forget the schedule {{ row.key }}? A worker that still has it registers it again, as new.">
+            <input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn btn-danger">Remove</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="py-10 text-center text-[var(--muted)]">No recurring schedules. Add them with <span class="mono">[[recurring]]</span> in butler.toml or <span class="mono">Worker::recurring</span>.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

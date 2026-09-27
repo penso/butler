@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use super::{Monitor, NewJob, Promoted, Store, Watch};
+use super::{GlobalLimit, Monitor, NewJob, Promoted, Store, Watch};
 use crate::{
     JobId, JobRecord, JobState, Result, Signal,
     job::{from_millis, millis},
@@ -50,6 +50,8 @@ struct State {
     /// Per worker. A set: a worker can hold a great many jobs at once, and
     /// finishing one must not scan the others.
     processing: HashMap<String, HashSet<JobId>>,
+    /// Per queue with a global limit, the jobs running in one of its slots.
+    slots: HashMap<String, HashSet<JobId>>,
     /// When each worker's heartbeat expires.
     heartbeats: HashMap<String, Instant>,
     /// History, per (minute, queue, job).
@@ -85,10 +87,22 @@ impl MemoryQueue {
 }
 
 impl State {
-    fn release(&mut self, worker: &str, id: &str) {
-        if let Some(held) = self.processing.get_mut(worker) {
-            held.remove(id);
-        }
+    /// Takes job `id` out of `worker`'s processing area, and frees its
+    /// global-limit slot if it held one. Returns whether a slot was freed.
+    /// A worker that no longer holds the job (it was recovered and claimed
+    /// again) frees nothing: the slot is the new claim's.
+    fn release(&mut self, worker: &str, id: &str, queue: &str) -> bool {
+        let held = self
+            .processing
+            .get_mut(worker)
+            .is_some_and(|held| held.remove(id));
+        held && self.free_slot(queue, id)
+    }
+
+    fn free_slot(&mut self, queue: &str, id: &str) -> bool {
+        self.slots
+            .get_mut(queue)
+            .is_some_and(|slots| slots.remove(id))
     }
 
     /// Stores a new job: pending on its queue, or scheduled if it has a run
@@ -170,12 +184,38 @@ impl Store for MemoryQueue {
     }
 
     fn claim(&self, worker: &str, queues: &[&str], wait: Duration) -> Result<Option<JobRecord>> {
+        self.claim_within_limits(worker, queues, &[], wait)
+    }
+
+    /// Counting and claiming happen under the one lock. A freed slot wakes
+    /// waiting claims, like a push.
+    fn claim_within_limits(
+        &self,
+        worker: &str,
+        queues: &[&str],
+        limits: &[GlobalLimit<'_>],
+        wait: Duration,
+    ) -> Result<Option<JobRecord>> {
         let deadline = Instant::now() + wait;
         let mut state = self.lock();
         loop {
-            let next = queues
-                .iter()
-                .find_map(|queue| state.pending.get_mut(*queue)?.pop_front());
+            let locked = &mut *state;
+            let next = queues.iter().find_map(|queue| {
+                let limit = GlobalLimit::of(limits, queue);
+                let used = locked.slots.get(*queue).map_or(0, HashSet::len);
+                if limit.is_some_and(|max| used >= max) {
+                    return None;
+                }
+                let id = locked.pending.get_mut(*queue)?.pop_front()?;
+                if limit.is_some() {
+                    locked
+                        .slots
+                        .entry((*queue).to_owned())
+                        .or_default()
+                        .insert(id.clone());
+                }
+                Some(id)
+            });
             if let Some(id) = next {
                 state
                     .processing
@@ -203,7 +243,9 @@ impl Store for MemoryQueue {
 
     fn complete(&self, worker: &str, job: &JobRecord) -> Result<()> {
         let mut state = self.lock();
-        state.release(worker, &job.id);
+        if state.release(worker, &job.id, &job.queue) {
+            self.inner.pushed.notify_all();
+        }
         state
             .jobs
             .insert(job.id.clone(), (JobState::Done, job.clone()));
@@ -213,7 +255,9 @@ impl Store for MemoryQueue {
 
     fn fail(&self, worker: &str, job: &JobRecord, next: JobState) -> Result<()> {
         let mut state = self.lock();
-        state.release(worker, &job.id);
+        if state.release(worker, &job.id, &job.queue) {
+            self.inner.pushed.notify_all();
+        }
         if next == JobState::Scheduled {
             state.insert_scheduled(job.clone());
             return Ok(());
@@ -324,6 +368,7 @@ impl Store for MemoryQueue {
                 };
                 *job_state = JobState::Pending;
                 let queue = job.queue.clone();
+                state.free_slot(&queue, &id);
                 // Claimed before anything still pending, so it goes first.
                 state.pending.entry(queue).or_default().push_front(id);
                 recovered += 1;

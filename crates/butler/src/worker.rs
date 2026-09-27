@@ -12,8 +12,8 @@ use std::{
 use tracing::{Instrument, Span, field};
 
 use crate::{
-    Backoff, Config, DeadJob, Failed, Job, JobContext, JobDef, JobError, Layer, Next, Queue,
-    QueuePriority, Result, RetryPolicy, RunFuture, WorkerConfig, block_on,
+    Backoff, Config, DeadJob, Failed, GlobalLimit, Job, JobContext, JobDef, JobError, Layer, Next,
+    Queue, QueuePriority, Result, RetryPolicy, RunFuture, WorkerConfig, block_on,
     error::Chain,
     executor::panic_message,
     job::millis,
@@ -74,6 +74,9 @@ pub struct Worker {
     id: Arc<str>,
     queues: QueuePriority,
     limits: QueueLimits,
+    /// Per queue, the most of its jobs running at once across every worker
+    /// with the same limit, enforced by the backend.
+    global_limits: Arc<HashMap<String, usize>>,
     claimers: usize,
     concurrency: usize,
     max_retries: u32,
@@ -125,6 +128,7 @@ impl Worker {
             id: new_worker_id().into(),
             queues: defaults.priority(),
             limits: QueueLimits::default(),
+            global_limits: Arc::default(),
             claimers: defaults.claimers,
             concurrency: defaults.concurrency,
             max_retries: defaults.max_retries,
@@ -145,6 +149,12 @@ impl Worker {
             .queue_limits
             .iter()
             .fold(self, |worker, (queue, max)| worker.queue_limit(queue, *max));
+        let worker = config
+            .global_queue_limits
+            .iter()
+            .fold(worker, |worker, (queue, max)| {
+                worker.global_queue_limit(queue, *max)
+            });
         worker
             .queues(config.priority())
             .concurrency(config.concurrency)
@@ -231,12 +241,38 @@ impl Worker {
         self
     }
 
-    /// Caps how many jobs from `queue` run at once, on top of the overall
-    /// [`concurrency`](Worker::concurrency). When `queue` is at its limit, the
-    /// worker skips it and keeps taking jobs from its other queues.
+    /// Caps how many jobs from `queue` run at once in this worker process, on
+    /// top of the overall [`concurrency`](Worker::concurrency). When `queue`
+    /// is at its limit, the worker skips it and keeps taking jobs from its
+    /// other queues. Each process counts its own jobs, so limits add up
+    /// across workers; see [`global_queue_limit`](Worker::global_queue_limit)
+    /// for one limit shared by all of them.
     pub fn queue_limit(mut self, queue: &str, max: usize) -> Self {
         self.limits.set(queue, max);
         self
+    }
+
+    /// Caps how many jobs from `queue` run at once **across every worker**
+    /// that has this limit, rather than within this one process as
+    /// [`queue_limit`](Worker::queue_limit) does. The backend keeps the
+    /// count, checked and taken atomically with each claim, and frees a slot
+    /// when its job completes, fails, is interrupted, or is recovered from a
+    /// crashed worker. Set the same limit on every worker serving `queue`:
+    /// claims without it neither take a slot nor respect the limit.
+    pub fn global_queue_limit(mut self, queue: &str, max: usize) -> Self {
+        Arc::make_mut(&mut self.global_limits).insert(queue.to_owned(), max.max(1));
+        self
+    }
+
+    /// The global per-queue limits, sorted by queue name.
+    pub fn global_queue_limits(&self) -> Vec<(&str, usize)> {
+        let mut limits: Vec<_> = self
+            .global_limits
+            .iter()
+            .map(|(queue, max)| (queue.as_str(), *max))
+            .collect();
+        limits.sort_unstable();
+        limits
     }
 
     /// The per-queue limits, sorted by queue name.
@@ -453,7 +489,17 @@ impl Worker {
             wait
         };
         let queues: Vec<&str> = reserved.iter().map(|(queue, _)| *queue).collect();
-        let Some(job) = self.queue.claim(&self.id, &queues, wait)? else {
+        let global: Vec<GlobalLimit<'_>> = queues
+            .iter()
+            .filter_map(|queue| {
+                let max = *self.global_limits.get(*queue)?;
+                Some(GlobalLimit { queue, max })
+            })
+            .collect();
+        let Some(job) = self
+            .queue
+            .claim_within_limits(&self.id, &queues, &global, wait)?
+        else {
             return Ok(Claimed::Nothing { throttled: skipped });
         };
         let permit = reserved

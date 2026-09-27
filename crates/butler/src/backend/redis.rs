@@ -9,6 +9,7 @@
 //! <prefix>:workers               SET   worker ids that may hold jobs
 //! <prefix>:dead                  LIST  ids that exhausted their retries
 //! <prefix>:job:<id>              HASH  { state, queue, data (job JSON) }
+//! <prefix>:slots:<queue>         SET   ids running in one of the queue's global-limit slots
 //! ```
 //!
 //! A claim is an `LMOVE queue:<q> processing:<worker>` for each queue the
@@ -34,6 +35,11 @@
 //! job is a `ZREM`, checked before the queue: an id only ever moves from the
 //! set to a queue, so between the two checks it can't slip past both.
 //!
+//! A claim under a global queue limit is one script: `SCARD slots:<q>`,
+//! and only below the limit, the `LMOVE` and an `SADD` of the id. Completing
+//! or failing a job `SREM`s it, and so does recovery, which frees a crashed
+//! worker's slots.
+//!
 //! We use lists instead of `PUBLISH`/`SUBSCRIBE` because pub/sub delivers each
 //! message to every subscriber, and messages sent while no worker is connected
 //! are lost.
@@ -47,7 +53,7 @@ use std::{
 
 use redis::{Client, Connection, RedisResult};
 
-use super::{Monitor, NewJob, Promoted, Store, Watch};
+use super::{GlobalLimit, Monitor, NewJob, Promoted, Store, Watch};
 use crate::{
     Error, JobId, JobRecord, JobState, Result, Signal,
     job::{from_millis, millis},
@@ -105,7 +111,19 @@ local job = ARGV[1] .. 'job:' .. id
 local queue = redis.call('HGET', job, 'queue') or 'default'
 redis.call('RPUSH', ARGV[1] .. 'queue:' .. queue, id)
 redis.call('HSET', job, 'state', 'pending')
+redis.call('SREM', ARGV[1] .. 'slots:' .. queue, id)
 redis.call('PUBLISH', ARGV[1] .. 'wake', queue)
+return id
+";
+
+/// Claims the oldest id of a queue (KEYS[1]) into a processing list
+/// (KEYS[2]) only while the queue's slot set (KEYS[3]) holds fewer than
+/// ARGV[1] ids, and adds the id to it. Returns the id, or nil when the queue
+/// is empty or at its limit.
+const CLAIM_WITHIN_LIMIT: &str = r"
+if redis.call('SCARD', KEYS[3]) >= tonumber(ARGV[1]) then return false end
+local id = redis.call('LMOVE', KEYS[1], KEYS[2], 'RIGHT', 'LEFT')
+if id then redis.call('SADD', KEYS[3], id) end
 return id
 ";
 
@@ -277,6 +295,10 @@ impl RedisQueue {
             .collect()
     }
 
+    fn slots_key(&self, queue: &str) -> String {
+        format!("{}:slots:{queue}", self.prefix)
+    }
+
     fn processing_key(&self, worker: &str) -> String {
         format!("{}:processing:{worker}", self.prefix)
     }
@@ -311,25 +333,43 @@ impl RedisQueue {
     }
 
     /// Takes the oldest job of the first non-empty queue, in order, into
-    /// `worker`'s processing list. Never blocks.
-    fn sweep(&self, worker: &str, queues: &[&str]) -> Result<Option<JobRecord>> {
+    /// `worker`'s processing list, skipping queues at their global limit.
+    /// Never blocks.
+    fn sweep(
+        &self,
+        worker: &str,
+        queues: &[&str],
+        limits: &[GlobalLimit<'_>],
+    ) -> Result<Option<JobRecord>> {
         let processing = self.processing_key(worker);
         loop {
-            let mut id: Option<String> = None;
+            let mut claimed: Option<(String, &str)> = None;
             for queue in queues {
-                id = self.with_conn(|con| {
-                    redis::cmd("LMOVE")
-                        .arg(self.queue_key(queue))
-                        .arg(&processing)
-                        .arg("RIGHT")
-                        .arg("LEFT")
-                        .query(con)
-                })?;
-                if id.is_some() {
+                let id: Option<String> =
+                    self.with_conn(|con| match GlobalLimit::of(limits, queue) {
+                        None => redis::cmd("LMOVE")
+                            .arg(self.queue_key(queue))
+                            .arg(&processing)
+                            .arg("RIGHT")
+                            .arg("LEFT")
+                            .query(con),
+                        Some(max) => redis::cmd("EVAL")
+                            .arg(CLAIM_WITHIN_LIMIT)
+                            .arg(3)
+                            .arg(self.queue_key(queue))
+                            .arg(&processing)
+                            .arg(self.slots_key(queue))
+                            .arg(max)
+                            .query(con),
+                    })?;
+                if let Some(id) = id {
+                    claimed = Some((id, queue));
                     break;
                 }
             }
-            let Some(id) = id else { return Ok(None) };
+            let Some((id, queue)) = claimed else {
+                return Ok(None);
+            };
 
             // Not atomic with the move above. If this worker dies in between,
             // the id is already in its processing list, so `recover` requeues
@@ -355,6 +395,10 @@ impl RedisQueue {
                         .cmd("LREM")
                         .arg(&processing)
                         .arg(1)
+                        .arg(&id)
+                        .ignore()
+                        .cmd("SREM")
+                        .arg(self.slots_key(queue))
                         .arg(&id)
                         .ignore()
                         .cmd("DEL")
@@ -537,6 +581,16 @@ impl Store for RedisQueue {
     }
 
     fn claim(&self, worker: &str, queues: &[&str], wait: Duration) -> Result<Option<JobRecord>> {
+        self.claim_within_limits(worker, queues, &[], wait)
+    }
+
+    fn claim_within_limits(
+        &self,
+        worker: &str,
+        queues: &[&str],
+        limits: &[GlobalLimit<'_>],
+        wait: Duration,
+    ) -> Result<Option<JobRecord>> {
         if queues.is_empty() {
             return Ok(None);
         }
@@ -548,7 +602,7 @@ impl Store for RedisQueue {
             // Read before sweeping: a push that lands during the sweep changes
             // it, so the wait below returns at once instead of missing the job.
             let seen = self.signals.pushed.generation();
-            if let Some(job) = self.sweep(worker, queues)? {
+            if let Some(job) = self.sweep(worker, queues, limits)? {
                 return Ok(Some(job));
             }
             let now = Instant::now();
@@ -567,6 +621,10 @@ impl Store for RedisQueue {
                 .cmd("LREM")
                 .arg(self.processing_key(worker))
                 .arg(1)
+                .arg(&job.id)
+                .ignore()
+                .cmd("SREM")
+                .arg(self.slots_key(&job.queue))
                 .arg(&job.id)
                 .ignore()
                 .cmd("HSET")
@@ -605,6 +663,10 @@ impl Store for RedisQueue {
             .cmd("LREM")
             .arg(self.processing_key(worker))
             .arg(1)
+            .arg(&job.id)
+            .ignore()
+            .cmd("SREM")
+            .arg(self.slots_key(&job.queue))
             .arg(&job.id)
             .ignore()
             .cmd("HSET")

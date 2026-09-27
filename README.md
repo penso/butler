@@ -67,7 +67,7 @@ types, and the `reports` module belong to your application. See
 - **Resumable work.** Typed checkpoints let long jobs continue after a deploy,
   crash, or failed attempt.
 - **Controlled concurrency.** Named queues, strict or weighted priority,
-  per-queue limits, and bulk enqueueing. Async jobs run as Tokio tasks;
+  per-queue limits per worker or across all workers, and bulk enqueueing. Async jobs run as Tokio tasks;
   synchronous jobs use its blocking pool. A thread worker also runs without Tokio.
 - **Built-in visibility.** A live web dashboard for throughput, workers,
   queues, job details, scheduled jobs, and retry/cancel/discard/run-now actions.
@@ -1089,10 +1089,21 @@ of CPUs), each on the multi-threaded tokio runtime:
 concurrency = 100_000     # jobs running at once, across all queues
 claimers = 16             # claim loops side by side (default: CPU count)
 
-[worker.queue_limits]     # optional: at most this many at once, per queue
-mailers = 20              # e.g. an SMTP provider allowing 20 connections
-reports = 2               # heavy jobs that shouldn't pile up
+[worker.queue_limits]     # optional: at most this many at once, per queue, IN EACH WORKER
+mailers = 20              # e.g. 20 SMTP connections per process
+reports = 2               # heavy jobs that shouldn't pile up on one machine
+
+[worker.global_queue_limits]  # optional: at most this many at once, per queue, ACROSS ALL WORKERS
+exports = 5               # e.g. an API allowing 5 concurrent requests in total
 ```
+
+> **Per-process or global?** `[worker.queue_limits]` counts inside each
+> worker process, so the limits add up: three workers with `mailers = 20` can
+> run **60** mailer jobs at once. `[worker.global_queue_limits]` is counted by
+> the backend, so three workers with `exports = 5` run **5** export jobs at
+> once between them. Use the per-process limit to protect one machine (memory,
+> CPU, connections from one host), and the global one to protect a shared
+> resource (a rate-limited API, a database).
 
 - **`concurrency`** caps every queue together. It is a tokio `Semaphore`: each
   running job holds a permit until it finishes.
@@ -1105,6 +1116,20 @@ reports = 2               # heavy jobs that shouldn't pile up
   ran all 40 of its jobs at once. A job kept waiting only by its queue's limit
   starts within about 10 ms of a slot freeing up. Code:
   `worker.queue_limit("mailers", 20)`.
+- **`[worker.global_queue_limits]`** caps a queue across every worker. The
+  backend keeps the count of that queue's running jobs and checks it in the
+  same atomic step as the claim (a Lua script in Redis, one `UPDATE` in
+  SQLite, exclusive slot files for the file backend, the lock for memory), so
+  the limit holds however many workers race. A job holds its slot until it
+  completes, fails (retry, backoff, dead), or is interrupted at a checkpoint,
+  and a crashed worker's slots come back when recovery requeues its jobs
+  (after `heartbeat_ttl_secs`, at the next `recover_interval_secs`). A full
+  queue is skipped like a locally full one, and a freed slot is used within
+  about 100 ms. It costs a little more per claim than the per-process limit,
+  which stays the cheap default. Set the same global limit on every worker
+  serving the queue: a worker without it neither takes a slot nor respects
+  the limit. Both kinds can apply to one queue. Code:
+  `worker.global_queue_limit("exports", 5)`.
 - **`claimers`** is how many claim loops run side by side. Each takes one job
   at a time from the backend, so more of them start jobs faster; this is what
   lets a very high `concurrency` actually fill up. Raise it for Redis, where
@@ -1155,8 +1180,11 @@ checkpoint_interval_ms = 1000  # jobs with a Progress: how often it is saved
 queues = ["default"]         # or ["critical", "default"], or [["critical", 6], ["default", 1]]
 claimers = 16                # claim loops side by side (default: the number of CPUs)
 
-[worker.queue_limits]        # optional: jobs running at once, per queue
+[worker.queue_limits]        # optional: jobs running at once, per queue, in each worker process
 mailers = 20
+
+[worker.global_queue_limits] # optional: jobs running at once, per queue, across all workers
+exports = 5
 ```
 
 Environment variables override any key, with `__` between levels:
@@ -1222,6 +1250,7 @@ without crashing can also see its job run a second time elsewhere.
 
 ```text
 pending/<queue>/  scheduled/  processing/<worker>/  workers/<worker>  done/  dead/  cancelled/
+slots/<queue>/<n>
 ```
 
 Each write goes to `tmp/` first and is then renamed into place, so nothing ever
@@ -1232,6 +1261,13 @@ promotion reads the directory in run-time order and stops at the first one not
 yet due. A heartbeat is the file `workers/<worker>` holding its expiry
 time. The file backend can't block waiting for a job, so idle workers sleep
 `poll_interval_ms` between checks.
+
+A claim under a global queue limit of `max` first takes one of the slot names
+`0` to `max - 1` in `slots/<queue>/` by hard-linking a file naming the worker
+(a link fails if the name exists, so each slot has one holder), then claims a
+job and records its id in the slot, or gives the slot back if there was none.
+The holding worker frees it when the job finishes; recovery frees every slot
+of a stopped worker.
 
 ### Redis
 
@@ -1248,6 +1284,7 @@ time. The file backend can't block waiting for a job, so idle workers sleep
 | `butler:wake` | pub/sub channel | a message per push, retry and recovery; wakes idle workers |
 | `butler:done` | pub/sub channel | a message per job done, dead or cancelled; wakes `wait_result` |
 | `butler:job:<id>` | HASH | `state`, `queue`, and `data` (job JSON); done and cancelled jobs expire after 24h |
+| `butler:slots:<queue>` | SET | ids running in one of the queue's global-limit slots |
 
 A claim is an `LMOVE queue:<queue> processing:<worker>` for each queue the
 worker serves, in its priority order. Redis runs each one atomically, so only
@@ -1269,7 +1306,9 @@ it takes the due ids from `butler:scheduled` (`ZRANGEBYSCORE`) and `LPUSH`es
 each onto its own queue, atomically, so a job moves exactly once. Cancelling a
 scheduled job is a `ZREM`, tried before the queue list: ids only move from the
 set to a queue, so a job can't slip past both checks. Calls use a small connection
-pool, so concurrent claims don't wait on each other.
+pool, so concurrent claims don't wait on each other. A claim under a global
+queue limit is a script too: `SCARD slots:<queue>`, and only below the limit
+the `LMOVE` and an `SADD`; completing, failing and recovering a job `SREM` it.
 
 The job's return value goes into the job hash's `data`, next to its arguments.
 
@@ -1286,7 +1325,7 @@ processes on the same machine:
 
 | Table | Columns | Purpose |
 |---|---|---|
-| `butler_jobs` | `id, queue, state, worker, seq, data, run_at` | every job; `data` is the job JSON, `seq` the order in its queue, `run_at` a scheduled job's time in ms |
+| `butler_jobs` | `id, queue, state, worker, seq, data, run_at, slot` | every job; `data` is the job JSON, `seq` the order in its queue, `run_at` a scheduled job's time in ms, `slot` set while it holds a global-limit slot |
 | `butler_workers` | `worker, expires_at_ms` | heartbeats, for crash recovery |
 
 A claim is one `UPDATE ... RETURNING` that moves the oldest pending row of a
@@ -1300,6 +1339,11 @@ promotion turns the due ones into `pending` rows at the back of their queue,
 in one transaction. It reads `MIN(run_at)` first (indexed), so it only takes
 the write lock when something is due. Databases created by earlier versions
 get the `run_at` column and its index when opened.
+
+A claim under a global queue limit is the same single `UPDATE`, with one more
+condition: fewer than the limit of the queue's `processing` rows have `slot`
+set. Any move out of `processing` frees the slot, since only processing rows
+count. Databases from before global limits get the `slot` column when opened.
 
 **Waking waiters without a server.** SQLite has no pub/sub between processes:
 its hooks only see changes made through the same connection. butler combines
@@ -1333,7 +1377,9 @@ memory until the process exits.
 `crates/butler/tests/backends.rs` runs the same contract checks (FIFO claims,
 waking on push, cancel against claim, results, retries, recovery, scheduled
 jobs: not claimable early, claimable once due, promoted to their own queue,
-cancel against promotion) against all four backends.
+cancel against promotion; global queue limits: never exceeded by concurrent
+claims, freed by every way out of processing and by crash recovery) against
+all four backends.
 
 **Upgrading.** Scheduled jobs add a `scheduled` state, which retries waiting
 out their backoff use too. Deploy this version to every worker and dashboard
@@ -1343,6 +1389,14 @@ queued need nothing: their records read as before. Retries now wait
 (exponential backoff by default); `backoff = "fixed:0s"` in `[worker]` keeps
 the old immediate retries.
 
+**Upgrading to global queue limits.** They add storage only: `slots:<queue>`
+sets in Redis, a `slot` column in SQLite's `butler_jobs` (added when a
+database is opened), and a `slots/` directory for the file backend. Nothing
+changes for queues without a global limit. Workers of an older version, or
+without the limit configured, don't take slots and aren't bounded by the
+limit, so deploy the new version with the limit to every worker serving the
+queue before relying on it.
+
 ## Limitations
 
 - **At-least-once delivery.** A job interrupted by a crash runs again (see
@@ -1350,8 +1404,10 @@ the old immediate retries.
 - **Polling on the file backend.** Idle file-backed workers check every
   `poll_interval_ms`, and `wait_result` every interval it is given. Redis,
   SQLite, and memory support wake-ups, with polling as a fallback.
-- **Worker-local limits.** Concurrency and per-queue limits apply to each
-  worker, not across a fleet. They are not global rate limits.
+- **Mostly worker-local limits.** `concurrency` and `[worker.queue_limits]`
+  apply to each worker, not across a fleet; `[worker.global_queue_limits]`
+  caps concurrent jobs of a queue across all workers. None of them is a rate
+  limit (jobs per second).
 - **Job names are the contract.** Renaming a function strands jobs already
   queued under the old name. Use `#[job(name = "...")]` for names that need to
   stay stable.

@@ -69,7 +69,17 @@ async fn main() -> anyhow::Result<()> {
     let queue: Queue = MemoryQueue::new().into();
     butler::configure(queue.clone());
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    println!("{cores} CPUs\n");
+    // Printed with the results, since they only mean something next to it.
+    let build = if cfg!(debug_assertions) {
+        "debug build: use --release for meaningful numbers"
+    } else {
+        "release build"
+    };
+    println!(
+        "{cores} CPUs, {} {}, {build}\n",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
 
     // 1. I/O-bound.
     let (count, wait_ms) = (2_000, 50);

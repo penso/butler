@@ -786,6 +786,7 @@ impl Store for SqliteQueue {
     /// One transaction: an existing schedule keeps its creation time and
     /// last run.
     fn register_recurring(&self, schedules: &[RecurringRecord]) -> Result<Vec<RecurringRecord>> {
+        crate::recurring::validate_keys(schedules)?;
         let rows = schedules
             .iter()
             .map(|schedule| Ok((schedule, serde_json::to_string(schedule)?)))
@@ -820,6 +821,7 @@ impl Store for SqliteQueue {
     }
 
     fn push_recurring(&self, key: &str, tick: SystemTime, job: NewJob) -> Result<Option<JobId>> {
+        crate::recurring::validate_key(key)?;
         let job = job.into_record();
         let data = serde_json::to_string(&job)?;
         let tick = int(millis(tick));

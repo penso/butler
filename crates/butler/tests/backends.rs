@@ -13,9 +13,9 @@ use std::{
 };
 
 use butler::{
-    AnyJob, Backoff, ConcurrencyKey, Cron, Failed, FileQueue, GlobalLimit, JITTER, JobState, Keep,
-    MemoryQueue, NewJob, Queue, Recurring, RecurringRecord, Retention, Retry, RetryPolicy, Unique,
-    UniqueKey,
+    AnyJob, Backend, Backoff, ConcurrencyKey, Cron, Failed, FileQueue, GlobalLimit, JITTER,
+    JobState, Keep, MemoryQueue, NewJob, Queue, Recurring, RecurringRecord, Retention, Retry,
+    RetryPolicy, Unique, UniqueKey,
     monitor::{JobMetric, ListFilter},
 };
 use serde_json::json;
@@ -1642,6 +1642,125 @@ fn removing_a_schedule_rejects_invalid_keys_without_changing_jobs() {
         }
         assert_eq!(queue.claim("w", DEFAULT, NOW).unwrap().unwrap().id(), id);
     }
+}
+
+/// Every backend on its own, not behind a `Queue`, for contracts a backend
+/// must keep when used directly. Also returns the directory the file backend
+/// lives in.
+fn raw_backends(test: &str) -> (Vec<Box<dyn Backend>>, PathBuf) {
+    static RUN: AtomicU32 = AtomicU32::new(0);
+    let run = RUN.fetch_add(1, Ordering::Relaxed);
+    let unique = format!("raw-{test}-{}-{run}", std::process::id());
+
+    let dir: PathBuf = std::env::temp_dir()
+        .join(format!("butler-backends-{unique}"))
+        .join("root");
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    #[cfg_attr(not(any(feature = "redis", feature = "sqlite")), allow(unused_mut))]
+    let mut all: Vec<Box<dyn Backend>> = vec![
+        Box::new(MemoryQueue::new()),
+        Box::new(FileQueue::new(&dir).unwrap()),
+    ];
+    #[cfg(feature = "sqlite")]
+    all.push(Box::new(
+        butler::SqliteQueue::open(dir.with_extension("db")).unwrap(),
+    ));
+    #[cfg(feature = "redis")]
+    {
+        let url = std::env::var("BUTLER_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379/".into());
+        match butler::RedisQueue::connect(&url, &format!("butler-backends-{unique}")) {
+            Ok(q) => all.push(Box::new(q)),
+            Err(e) => eprintln!("skipping redis: {e}"),
+        }
+    }
+    (all, dir)
+}
+
+/// Keys that could leave the schedule store if used as paths or key parts.
+const BAD_RECURRING_KEYS: &[&str] = &[
+    "",
+    ".",
+    "..",
+    "../pending/default/zz",
+    "../../pending/default/zz",
+    "../../escaped",
+    "/pending",
+    "a/b",
+    "a\\b",
+    "a b",
+];
+
+fn is_invalid_key<T: std::fmt::Debug>(result: &butler::Result<T>) -> bool {
+    matches!(result, Err(butler::Error::InvalidRecurringKey { .. }))
+}
+
+#[test]
+fn registering_or_pushing_a_schedule_rejects_invalid_keys_and_writes_nothing() {
+    let now = SystemTime::now();
+    let long = "a".repeat(129);
+    let bad_keys = BAD_RECURRING_KEYS.iter().copied().chain([long.as_str()]);
+    // `Recurring::with_key` refuses these, so build the records by hand.
+    let with_key = |key: &str| RecurringRecord {
+        key: key.into(),
+        ..hourly("report", "good", now)
+    };
+
+    for (queue, _) in backends("recurring-invalid-keys") {
+        let name = queue.describe();
+        for key in bad_keys.clone() {
+            // One bad key rejects the whole batch.
+            let batch = [hourly("report", "good", now), with_key(key)];
+            assert!(
+                is_invalid_key(&queue.register_recurring(&batch)),
+                "{name}: {key:?}"
+            );
+            let job = NewJob::new("report", "default", vec![]);
+            assert!(
+                is_invalid_key(&queue.push_recurring(key, now, job)),
+                "{name}: {key:?}"
+            );
+        }
+        assert!(queue.recurring().unwrap().is_empty(), "{name}");
+        assert!(queue.claim("w", DEFAULT, NOW).unwrap().is_none(), "{name}");
+    }
+
+    let (raw, dir) = raw_backends("recurring-invalid-keys");
+    for backend in raw {
+        let name = backend.describe();
+        for key in bad_keys.clone() {
+            let batch = [hourly("report", "good", now), with_key(key)];
+            assert!(
+                is_invalid_key(&backend.register_recurring(&batch)),
+                "{name}: {key:?}"
+            );
+            let job = NewJob::new("report", "default", vec![]);
+            assert!(
+                is_invalid_key(&backend.push_recurring(key, now, job)),
+                "{name}: {key:?}"
+            );
+            assert!(
+                is_invalid_key(&backend.remove_recurring(key)),
+                "{name}: {key:?}"
+            );
+        }
+        assert!(backend.recurring().unwrap().is_empty(), "{name}");
+        assert!(
+            backend.claim("w", DEFAULT, NOW).unwrap().is_none(),
+            "{name}"
+        );
+    }
+    // Nothing was created beside the file backend's root.
+    let beside: Vec<_> = std::fs::read_dir(dir.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|entry| {
+            entry != "root"
+                && entry != "root.db"
+                && !entry.to_string_lossy().starts_with("root.db-")
+        })
+        .collect();
+    assert!(beside.is_empty(), "{beside:?}");
 }
 
 #[test]

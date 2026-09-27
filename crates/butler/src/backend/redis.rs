@@ -1091,6 +1091,7 @@ impl Store for RedisQueue {
     /// One transaction: `HSETNX` keeps an existing schedule's creation time,
     /// and its last run is left alone.
     fn register_recurring(&self, schedules: &[RecurringRecord]) -> Result<Vec<RecurringRecord>> {
+        crate::recurring::validate_keys(schedules)?;
         if schedules.is_empty() {
             return Ok(Vec::new());
         }
@@ -1125,6 +1126,7 @@ impl Store for RedisQueue {
     }
 
     fn push_recurring(&self, key: &str, tick: SystemTime, job: NewJob) -> Result<Option<JobId>> {
+        crate::recurring::validate_key(key)?;
         let job = job.into_record();
         let data = serde_json::to_string(&job)?;
         let tick = millis(tick);

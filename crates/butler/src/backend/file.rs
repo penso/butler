@@ -867,6 +867,7 @@ impl Store for FileQueue {
     }
 
     fn register_recurring(&self, schedules: &[RecurringRecord]) -> Result<Vec<RecurringRecord>> {
+        crate::recurring::validate_keys(schedules)?;
         fs::create_dir_all(self.root.join(SCHEDULES))?;
         let mut stored = Vec::with_capacity(schedules.len());
         for schedule in schedules {
@@ -888,6 +889,7 @@ impl Store for FileQueue {
     }
 
     fn push_recurring(&self, key: &str, tick: SystemTime, job: NewJob) -> Result<Option<JobId>> {
+        crate::recurring::validate_key(key)?;
         let job = job.into_record();
         let tick = millis(tick);
         let dir = self.ticks_dir(key);

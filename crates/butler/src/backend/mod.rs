@@ -631,6 +631,7 @@ impl Queue {
         &self,
         schedules: &[RecurringRecord],
     ) -> Result<Vec<RecurringRecord>> {
+        crate::recurring::validate_keys(schedules)?;
         self.0.register_recurring(schedules)
     }
 
@@ -643,6 +644,7 @@ impl Queue {
         tick: SystemTime,
         mut job: NewJob,
     ) -> Result<Option<JobId>> {
+        crate::recurring::validate_key(key)?;
         job.run_at = None;
         self.0.push_recurring(key, tick, job)
     }
@@ -659,6 +661,7 @@ impl Queue {
     }
 
     pub fn remove_recurring(&self, key: &str) -> Result<bool> {
+        crate::recurring::validate_key(key)?;
         self.0.remove_recurring(key)
     }
 

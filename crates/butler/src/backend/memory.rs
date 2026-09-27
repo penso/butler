@@ -519,6 +519,7 @@ impl Monitor for MemoryQueue {
     }
 
     fn remove_recurring(&self, key: &str) -> Result<bool> {
+        crate::recurring::validate_key(key)?;
         let mut state = self.lock();
         state.ticks.remove(key);
         Ok(state.recurring.remove(key).is_some())

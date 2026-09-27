@@ -737,7 +737,9 @@ let worker = worker.add_recurring(schedule)?;
 - **Cron.** Five fields, as in crontab, with lists, ranges, steps and names
   (`"*/15 9-17 * * mon-fri"`). In the day of week, `0` and `7` are Sunday and
   `1` is Monday; when both day fields are restricted, either one matching is
-  enough. Expressions are checked when `butler.toml` loads.
+  enough: `"0 0 1 * 1"` runs on the first of each month and every Monday.
+  If either day field starts with `*` (including `*/2`), both fields must
+  match. Expressions are checked when `butler.toml` loads.
 - **Time zones.** UTC unless `timezone` names an IANA zone. In a zone with
   daylight saving time, a local time skipped in spring doesn't run that day,
   and one repeated in autumn runs at both instants.

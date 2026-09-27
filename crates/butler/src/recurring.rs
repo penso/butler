@@ -52,26 +52,53 @@ pub const ACTIVE_WINDOW: Duration = Duration::from_secs(3 * 60);
 /// Fields take numbers, `*`, lists (`1,15`), ranges (`1-5`), steps (`*/15`)
 /// and names (`jan`-`dec`, `sun`-`sat`); in the day of week, `0` and `7` are
 /// both Sunday. When both day fields are restricted, a day matching either
-/// one matches, as in crontab. In a zone with daylight saving time, a time
+/// one matches, as in crontab. A day field starting with `*` (including
+/// `*/2`) instead requires both day fields to match.
+/// In a zone with daylight saving time, a time
 /// skipped by the spring change doesn't run that day, and one repeated in the
 /// autumn runs at both instants.
 #[derive(Clone, Debug)]
 pub struct Cron {
-    schedule: cron_parser::Schedule,
+    expression: String,
+    schedules: Vec<cron_parser::Schedule>,
     zone: Tz,
 }
 
 impl Cron {
     /// Parses `expression`, evaluated in UTC.
     pub fn parse(expression: &str) -> Result<Self> {
-        let schedule = cron_parser::Schedule::parse(expression.trim()).map_err(|source| {
-            Error::InvalidCron {
-                expression: expression.to_owned(),
-                source: source.into(),
+        let parse = cron_parser::Schedule::parse;
+        let invalid = |source: cron_parser::ParseError| Error::InvalidCron {
+            expression: expression.to_owned(),
+            source: source.into(),
+        };
+        let fields: Vec<_> = expression.split_whitespace().collect();
+        let schedules = match fields.as_slice() {
+            [minute, hour, dom, month, dow] if !dom.starts_with('*') && !dow.starts_with('*') => {
+                // The parser intersects day fields. Crontab instead takes their
+                // union when neither starts with a wildcard (including steps).
+                let days = parse(&format!("{minute} {hour} {dom} {month} *"));
+                let weekdays =
+                    parse(&format!("{minute} {hour} * {month} {dow}")).map_err(invalid)?;
+                match days {
+                    Ok(days) => vec![days, weekdays],
+                    // E.g. February 31 OR Monday still runs on Mondays.
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            cron_parser::ParseErrorKind::ImpossibleSchedule
+                        ) =>
+                    {
+                        vec![weekdays]
+                    }
+                    Err(error) => return Err(invalid(error)),
+                }
             }
-        })?;
+            _ => vec![parse(expression.trim()).map_err(invalid)?],
+        };
         Ok(Self {
-            schedule,
+            expression: expression.trim().to_owned(),
+            schedules,
             zone: Tz::UTC,
         })
     }
@@ -86,7 +113,7 @@ impl Cron {
     }
 
     pub fn expression(&self) -> &str {
-        self.schedule.source()
+        &self.expression
     }
 
     /// The time zone's IANA name, `"UTC"` by default.
@@ -96,14 +123,23 @@ impl Cron {
 
     /// The first tick strictly after `at`.
     pub fn next_after(&self, at: SystemTime) -> Option<SystemTime> {
-        let next = self.schedule.next_after(&self.zoned(at)?)?;
+        let at = self.zoned(at)?;
+        let next = self
+            .schedules
+            .iter()
+            .filter_map(|schedule| schedule.next_after(&at))
+            .min()?;
         Some(from_millis(u64::try_from(next.timestamp_millis()).ok()?))
     }
 
     /// The latest tick at or before `at`.
     pub fn latest_until(&self, at: SystemTime) -> Option<SystemTime> {
         let just_after = self.zoned(at)? + chrono::Duration::milliseconds(1);
-        let tick = self.schedule.previous_before(&just_after)?;
+        let tick = self
+            .schedules
+            .iter()
+            .filter_map(|schedule| schedule.previous_before(&just_after))
+            .max()?;
         Some(from_millis(u64::try_from(tick.timestamp_millis()).ok()?))
     }
 
@@ -308,6 +344,15 @@ pub fn is_valid_key(key: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }
 
+pub(crate) fn validate_key(key: &str) -> Result<()> {
+    if !is_valid_key(key) {
+        return Err(Error::InvalidRecurringKey {
+            key: key.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// A recurring schedule as a backend stores it: its definition, when workers
 /// registered it, and its last run. Times are milliseconds since the Unix
 /// epoch.
@@ -434,8 +479,82 @@ mod tests {
     }
 
     #[test]
+    fn restricted_days_are_a_union_in_both_directions() {
+        let cron = Cron::parse("0 0 1 * 1").unwrap();
+        assert_eq!(cron.expression(), "0 0 1 * 1");
+        let paris = cron.clone().in_time_zone("Europe/Paris").unwrap();
+        assert_eq!(
+            paris.next_after(at("2026-09-26T00:00:00Z")),
+            Some(at("2026-09-27T22:00:00Z"))
+        );
+        assert_eq!(
+            paris.latest_until(at("2026-09-28T00:00:00Z")),
+            Some(at("2026-09-27T22:00:00Z"))
+        );
+        for (before, tick) in [
+            ("2026-09-26T00:00:00Z", "2026-09-28T00:00:00Z"),
+            ("2026-09-28T00:00:00Z", "2026-10-01T00:00:00Z"),
+            ("2026-10-01T00:00:00Z", "2026-10-05T00:00:00Z"),
+            ("2027-01-31T00:00:00Z", "2027-02-01T00:00:00Z"),
+            ("2027-02-01T00:00:00Z", "2027-02-08T00:00:00Z"),
+        ] {
+            assert_eq!(cron.next_after(at(before)), Some(at(tick)));
+            assert_eq!(cron.latest_until(at(tick)), Some(at(tick)));
+            assert_eq!(
+                cron.latest_until(at(tick) + Duration::from_secs(60)),
+                Some(at(tick))
+            );
+        }
+        assert_eq!(
+            cron.latest_until(at("2026-09-26T00:00:00Z")),
+            Some(at("2026-09-21T00:00:00Z"))
+        );
+        assert_eq!(
+            cron.latest_until(at("2026-10-04T00:00:00Z")),
+            Some(at("2026-10-01T00:00:00Z"))
+        );
+
+        // An impossible day of month must not suppress valid weekdays.
+        let february = Cron::parse("0 0 31 2 mon").unwrap();
+        assert_eq!(
+            february.next_after(at("2027-02-01T00:00:00Z")),
+            Some(at("2027-02-08T00:00:00Z"))
+        );
+        assert_eq!(
+            february.latest_until(at("2027-02-09T00:00:00Z")),
+            Some(at("2027-02-08T00:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn wildcard_days_remain_intersections() {
+        for expression in ["0 0 * * mon", "0 0 */2 * mon", "0 0 1 * *"] {
+            let cron = Cron::parse(expression).unwrap();
+            let expected = if expression.ends_with("mon") {
+                "2026-10-05T00:00:00Z"
+            } else {
+                "2026-10-01T00:00:00Z"
+            };
+            assert_eq!(
+                cron.next_after(at("2026-09-30T00:00:00Z")),
+                Some(at(expected)),
+                "{expression}"
+            );
+        }
+    }
+
+    #[test]
     fn bad_expressions_are_typed_errors() {
-        for bad in ["", "* * * *", "61 * * * *", "0 3 * * * *", "*/0 * * * *"] {
+        for bad in [
+            "",
+            "* * * *",
+            "61 * * * *",
+            "0 3 * * * *",
+            "*/0 * * * *",
+            "0 0 32 * 1",
+            "0 0 1 * 8",
+            "0 0 31 2 *",
+        ] {
             assert!(
                 matches!(Cron::parse(bad), Err(Error::InvalidCron { .. })),
                 "{bad:?}"

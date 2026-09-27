@@ -1179,6 +1179,7 @@ impl Monitor for RedisQueue {
     }
 
     fn remove_recurring(&self, key: &str) -> Result<bool> {
+        crate::recurring::validate_key(key)?;
         let (removed,): (u8,) = self.with_conn(|con| {
             redis::pipe()
                 .atomic()

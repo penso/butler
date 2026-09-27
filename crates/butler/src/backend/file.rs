@@ -705,6 +705,7 @@ impl Monitor for FileQueue {
     }
 
     fn remove_recurring(&self, key: &str) -> Result<bool> {
+        crate::recurring::validate_key(key)?;
         let removed = match fs::remove_file(self.schedule_path(key)) {
             Ok(()) => true,
             Err(e) if e.kind() == io::ErrorKind::NotFound => false,

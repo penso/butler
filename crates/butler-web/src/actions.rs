@@ -91,6 +91,9 @@ pub(crate) async fn remove_recurring(
     Path(key): Path<String>,
     Form(form): Form<Back>,
 ) -> Result<Redirect, WebError> {
+    if !butler::recurring::is_valid_key(&key) {
+        return Err(butler::Error::InvalidRecurringKey { key }.into());
+    }
     let removed = act(&state, {
         let key = key.clone();
         move |queue| queue.remove_recurring(&key)

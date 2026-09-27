@@ -544,3 +544,42 @@ async fn recurring_links_and_actions_keep_the_base_path() {
     assert_eq!(location.as_deref(), Some("/admin/jobs/recurring"));
     assert_eq!(f.queue.recurring().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn removing_recurring_rejects_encoded_path_separators_and_preserves_files() {
+    let dir = std::env::temp_dir().join(format!(
+        "butler-dashboard-recurring-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let queue: Queue = butler::FileQueue::new(&dir).unwrap().into();
+    let id = queue.push("report", "default", vec![]).unwrap();
+    recurring_schedules(&queue);
+    for base in ["", "/admin/jobs"] {
+        let app = butler_web::Dashboard::new(queue.clone())
+            .base_path(base)
+            .router();
+        let app = if base.is_empty() {
+            app
+        } else {
+            Router::new().nest(base, app)
+        };
+        for key in ["..%2F..%2Fpending", "%2Fpending", "a%5Cb"] {
+            let (status, _) = post(
+                &app,
+                &format!("{base}/recurring/{key}/remove"),
+                "same-origin",
+                "",
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{key}");
+            assert!(dir.join("pending").is_dir());
+            assert_eq!(queue.state(&id), Some(JobState::Pending));
+            assert_eq!(queue.recurring().unwrap().len(), 2);
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

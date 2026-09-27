@@ -890,6 +890,7 @@ impl Monitor for SqliteQueue {
     }
 
     fn remove_recurring(&self, key: &str) -> Result<bool> {
+        crate::recurring::validate_key(key)?;
         let removed = self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
             let removed =

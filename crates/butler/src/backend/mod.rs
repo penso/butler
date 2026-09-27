@@ -187,7 +187,9 @@ pub trait Monitor: Send + Sync + 'static {
 
     /// Forgets a recurring schedule and its last run. A worker that still
     /// runs it registers it again, as new. Returns `false` if `key` is
-    /// unknown.
+    /// unknown. Implementations must reject invalid keys with
+    /// [`Error::InvalidRecurringKey`] before touching storage (see
+    /// [`recurring::is_valid_key`](crate::recurring::is_valid_key)).
     fn remove_recurring(&self, _key: &str) -> Result<bool> {
         Err(Error::Unsupported("removing recurring jobs"))
     }

@@ -1117,3 +1117,35 @@ fn removing_a_schedule_forgets_it_and_its_last_run() {
         assert_eq!(stored[0].last_tick_ms, None, "{name}");
     }
 }
+
+#[test]
+fn removing_a_schedule_rejects_invalid_keys_without_changing_jobs() {
+    for (queue, _) in backends("recurring-remove-invalid") {
+        let id = queue.push("report", "default", vec![]).unwrap();
+        queue
+            .register_recurring(&[hourly("report", "hourly", SystemTime::now())])
+            .unwrap();
+        for key in [
+            "",
+            ".",
+            "..",
+            "../../pending",
+            "/pending",
+            "a/b",
+            "a\\b",
+            &"a".repeat(129),
+        ] {
+            assert!(
+                matches!(
+                    queue.remove_recurring(key),
+                    Err(butler::Error::InvalidRecurringKey { .. })
+                ),
+                "{}: {key:?}",
+                queue.describe()
+            );
+            assert_eq!(queue.state(&id), Some(JobState::Pending));
+            assert_eq!(queue.recurring().unwrap().len(), 1);
+        }
+        assert_eq!(queue.claim("w", DEFAULT, NOW).unwrap().unwrap().id(), id);
+    }
+}

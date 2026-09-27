@@ -122,6 +122,7 @@ pub trait Store: Send + Sync + 'static {
     /// Moves every job held by a worker whose heartbeat expired back to the
     /// front of its own queue, and returns how many. Safe to run from several workers at once:
     /// each job moves exactly once.
+    /// Interrupted retry transitions preserve their recorded schedule.
     fn recover(&self) -> Result<usize>;
 
     /// Whether calls can block on I/O (network, disk). Async callers send
@@ -234,6 +235,10 @@ pub struct Promoted {
 /// that slips into the past between two calls can't make it spin.
 const MIN_SCHEDULE_WAIT: Duration = Duration::from_millis(1);
 
+// Schedules can change from another process while a backend waits for pending
+// work. Periodically return to promotion even when no due time was known.
+const MAX_SCHEDULE_WAIT: Duration = Duration::from_millis(100);
+
 /// Whether `at` has passed, to the millisecond backends store.
 fn is_due(at: SystemTime) -> bool {
     millis(at) <= millis(SystemTime::now())
@@ -313,7 +318,8 @@ impl Queue {
     ///
     /// When no job is waiting, it promotes the scheduled jobs that are due,
     /// and a waiting claim also wakes when the next scheduled job comes due,
-    /// rather than at the end of `wait`.
+    /// rather than at the end of `wait`. While blocked, it checks for newly
+    /// scheduled jobs at least every 100 ms (plus backend latency).
     pub fn claim(
         &self,
         worker: &str,
@@ -328,7 +334,9 @@ impl Queue {
         }
         loop {
             let promoted = self.0.promote(SystemTime::now())?;
-            let left = deadline.saturating_duration_since(Instant::now());
+            let left = deadline
+                .saturating_duration_since(Instant::now())
+                .min(MAX_SCHEDULE_WAIT);
             let until = match promoted.next {
                 _ if promoted.moved > 0 => Duration::ZERO,
                 Some(next) => left.min(
@@ -342,9 +350,10 @@ impl Queue {
             if let Some(record) = self.0.claim(worker, queues, until)? {
                 return Ok(Some(Job::from_record(record)));
             }
-            // Out of time, or a backend whose claims never wait (it returned
-            // before `until`): the worker polls it instead.
-            if Instant::now() >= deadline || started.elapsed() < until {
+            // After the last wait, make one final promotion/nonblocking claim:
+            // a job scheduled during that wait may now be due. Backends whose
+            // claims never wait still return at once for the worker to poll.
+            if left.is_zero() || started.elapsed() < until {
                 return Ok(None);
             }
         }

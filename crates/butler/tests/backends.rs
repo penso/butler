@@ -598,6 +598,51 @@ fn cancel_works_while_scheduled() {
 }
 
 #[test]
+fn a_waiting_claim_notices_new_and_earlier_schedules() {
+    for existing in [false, true] {
+        for (queue, claim) in backends("schedule-during-claim") {
+            if claim == Claim::ReturnsAtOnce {
+                continue;
+            }
+            let name = queue.describe();
+            if existing {
+                queue
+                    .schedule("later", "default", vec![], SystemTime::now() + HOUR)
+                    .unwrap();
+            }
+            let (send, receive) = std::sync::mpsc::channel();
+            let waiter = thread::spawn({
+                let queue = queue.clone();
+                move || {
+                    send.send(()).unwrap();
+                    queue.claim("w", DEFAULT, Duration::from_secs(5)).unwrap()
+                }
+            });
+            receive.recv_timeout(Duration::from_secs(2)).unwrap();
+            // Give the claim time to enter its backend wait, as in the
+            // pending-job wakeup contract test above.
+            thread::sleep(Duration::from_millis(100));
+            let at = SystemTime::now() + Duration::from_millis(100);
+            let started = Instant::now();
+            let id = queue.schedule("sooner", "default", vec![], at).unwrap();
+            let job = waiter
+                .join()
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name}: missed new schedule"));
+            assert_eq!(job.id(), id, "{name}");
+            assert!(
+                millis(SystemTime::now()) >= millis(at),
+                "{name}: claimed early"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{name}: waited for stale deadline"
+            );
+        }
+    }
+}
+
+#[test]
 fn cancel_and_promotion_never_both_take_a_scheduled_job() {
     for (queue, claim) in backends("scheduled-race") {
         let name = queue.describe();
@@ -792,6 +837,11 @@ fn a_failed_attempt_waits_for_its_retry_on_its_own_queue() {
         assert_eq!(millis(stored.run_at()), millis(run_at), "{name}");
         assert_eq!(stored.last_error(), Some("timeout"), "{name}");
         assert!(queue.claim("w", mailers, NOW).unwrap().is_none(), "{name}");
+
+        // A failed worker leaves only the scheduled retry, not a processing
+        // copy that recovery could make runnable before the backoff expires.
+        assert_eq!(queue.recover().unwrap(), 0, "{name}");
+        assert_eq!(queue.state(&id), Some(JobState::Scheduled), "{name}");
 
         assert_eq!(queue.promote(run_at).unwrap().moved, 1, "{name}");
         assert!(queue.claim("w", DEFAULT, NOW).unwrap().is_none(), "{name}");

@@ -18,7 +18,9 @@
 //! Cancelling is a rename from `pending/<queue>/` or `scheduled/` to
 //! `cancelled/`, promoting a due job is a rename from `scheduled/` to
 //! `pending/<queue>/`, and recovering a crashed worker's job is a rename from
-//! its `processing/<worker>/` back to `pending/<queue>/`. They all race with
+//! its `processing/<worker>/` back to `pending/<queue>/`. Interrupted retry
+//! transitions use `<id>.retry.json` in the processing directory and recover
+//! to `scheduled/` when they carry a run time. They all race with
 //! other renames the way two claims do: exactly one succeeds.
 
 use std::{
@@ -39,7 +41,7 @@ use crate::{
 };
 
 /// Checked in this order. During a retry, a job is briefly in both
-/// `processing/` and `pending/` (or `scheduled/`), and `processing/` wins.
+/// `processing/` and `pending/`, and `processing/` wins.
 const LOOKUP_ORDER: [JobState; 6] = [
     JobState::Cancelled,
     JobState::Done,
@@ -182,6 +184,12 @@ impl FileQueue {
                     if path.exists() {
                         return Ok(Some((state, path)));
                     }
+                    if state == JobState::Processing {
+                        let retry = path.with_file_name(format!("{id}.retry.json"));
+                        if retry.exists() {
+                            return Ok(Some((state, retry)));
+                        }
+                    }
                 }
                 continue;
             }
@@ -203,6 +211,14 @@ impl FileQueue {
         Ok(())
     }
 
+    fn scheduled_path(&self, job: &JobRecord) -> PathBuf {
+        self.dir(JobState::Scheduled).join(format!(
+            "{:020}_{}.json",
+            job.run_at_ms.unwrap_or_default(),
+            job.id
+        ))
+    }
+
     fn write(&self, state: JobState, job: &JobRecord) -> Result<()> {
         let to = match state {
             JobState::Pending => {
@@ -210,11 +226,7 @@ impl FileQueue {
                 fs::create_dir_all(&dir)?;
                 dir.join(format!("{}.json", job.id))
             }
-            JobState::Scheduled => self.dir(state).join(format!(
-                "{:020}_{}.json",
-                job.run_at_ms.unwrap_or_default(),
-                job.id
-            )),
+            JobState::Scheduled => self.scheduled_path(job),
             _ => self.dir(state).join(format!("{}.json", job.id)),
         };
         self.write_atomic(&to, &serde_json::to_vec_pretty(job)?)
@@ -309,6 +321,16 @@ impl Store for FileQueue {
     }
 
     fn fail(&self, worker: &str, job: &JobRecord, next: JobState) -> Result<()> {
+        if next == JobState::Scheduled {
+            // Keep exactly one recoverable copy. The first rename records the
+            // transition intent; recovery can finish it at either later step.
+            let held = self.processing(worker).join(format!("{}.json", job.id));
+            let retry = held.with_file_name(format!("{}.retry.json", job.id));
+            fs::rename(held, &retry)?;
+            self.write_atomic(&retry, &serde_json::to_vec_pretty(job)?)?;
+            fs::rename(&retry, self.scheduled_path(job))?;
+            return Ok(());
+        }
         self.write(next, job)?;
         self.remove_processing(worker, job)
     }
@@ -385,15 +407,22 @@ impl Store for FileQueue {
             }
             for held in fs::read_dir(entry.path())? {
                 let held = held?;
-                let queue = match fs::read(held.path()) {
-                    Ok(bytes) => serde_json::from_slice::<JobRecord>(&bytes)?.queue,
+                let job = match fs::read(held.path()) {
+                    Ok(bytes) => serde_json::from_slice::<JobRecord>(&bytes)?,
                     // Another recover moved it first.
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                     Err(e) => return Err(e.into()),
                 };
-                let dir = self.pending(&queue);
-                fs::create_dir_all(&dir)?;
-                match fs::rename(held.path(), dir.join(held.file_name())) {
+                let to = if held.file_name().to_string_lossy().ends_with(".retry.json")
+                    && job.run_at_ms.is_some()
+                {
+                    self.scheduled_path(&job)
+                } else {
+                    let dir = self.pending(&job.queue);
+                    fs::create_dir_all(&dir)?;
+                    dir.join(format!("{}.json", job.id))
+                };
+                match fs::rename(held.path(), to) {
                     Ok(()) => recovered += 1,
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e.into()),

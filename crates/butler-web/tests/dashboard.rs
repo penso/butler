@@ -149,6 +149,15 @@ async fn html_from_jobs_is_escaped() {
     // Askama escapes with numeric entities.
     assert!(html.contains("&#60;script&#62;alert(1)"));
     assert!(!html.contains("<img src=x>"), "arguments are escaped too");
+    assert!(!html.contains("Metadata"), "no metadata, no card");
+
+    let mut job = butler::NewJob::new("tagged", "default", vec![]);
+    job.meta.insert("tenant".into(), json!("<b>acme</b>"));
+    let id = f.queue.push_job(job).unwrap();
+    let (_, html) = get(&f.app, &format!("/jobs/{id}")).await;
+    assert!(html.contains("Metadata"));
+    assert!(html.contains("&#60;b&#62;acme&#60;/b&#62;"));
+    assert!(!html.contains("<b>acme</b>"), "metadata is escaped too");
 }
 
 #[tokio::test]

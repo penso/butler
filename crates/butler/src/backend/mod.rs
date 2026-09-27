@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[cfg(feature = "redis")]
 pub use self::redis::RedisQueue;
@@ -48,31 +48,19 @@ impl<T: Store + Monitor + Watch> Backend for T {}
 /// crashed or hung), `recover` puts that worker's jobs back in the queue, so a
 /// job interrupted by a crash runs again. Job bodies should be safe to repeat.
 pub trait Store: Send + Sync + 'static {
-    /// Stores a new pending job on `queue` and returns its id.
-    fn push(&self, name: &str, queue: &str, args: Vec<Value>) -> Result<JobId>;
-
-    /// Stores a new job that no worker can claim before `run_at`, and
-    /// returns its id. It stays `Scheduled` until [`promote`](Store::promote)
-    /// moves it onto `queue`.
-    fn schedule(
-        &self,
-        name: &str,
-        queue: &str,
-        args: Vec<Value>,
-        run_at: SystemTime,
-    ) -> Result<JobId>;
+    /// Stores a new job and returns its id. Without a `run_at`, it is
+    /// pending on its queue. With one, no worker can claim it before then:
+    /// it stays `Scheduled` until [`promote`](Store::promote) moves it onto
+    /// its queue. [`NewJob::into_record`] builds the record to store, with
+    /// its metadata.
+    fn push(&self, job: NewJob) -> Result<JobId>;
 
     /// Stores many new jobs, in order, and returns their ids in the same
-    /// order: pending, or scheduled for those with a `run_at`. Backends that
-    /// can should do it in one step (one round trip, one transaction); the
-    /// default stores them one by one.
+    /// order, as [`push`](Store::push) would. Backends that can should do it
+    /// in one step (one round trip, one transaction); the default stores
+    /// them one by one.
     fn push_many(&self, jobs: Vec<NewJob>) -> Result<Vec<JobId>> {
-        jobs.into_iter()
-            .map(|job| match job.run_at {
-                Some(run_at) => self.schedule(&job.name, &job.queue, job.args, run_at),
-                None => self.push(&job.name, &job.queue, job.args),
-            })
-            .collect()
+        jobs.into_iter().map(|job| self.push(job)).collect()
     }
 
     /// Moves every scheduled job due by `now` onto its own queue, as pending,
@@ -194,7 +182,8 @@ pub trait Watch: Send + Sync + 'static {
     }
 }
 
-/// A job to push, for [`Store::push_many`].
+/// A job to push, for [`Store::push`] and [`Store::push_many`]. It is also
+/// what [enqueue layers](crate::EnqueueLayer) see and may change.
 #[derive(Debug, Clone)]
 pub struct NewJob {
     pub name: String,
@@ -202,6 +191,9 @@ pub struct NewJob {
     pub args: Vec<Value>,
     /// Scheduled for this time, or pending at once if `None`.
     pub run_at: Option<SystemTime>,
+    /// Stored with the job as its [`JobRecord::meta`]: what enqueue layers
+    /// add, such as a tenant or a trace id, for worker layers to read.
+    pub meta: Map<String, Value>,
 }
 
 impl NewJob {
@@ -212,6 +204,7 @@ impl NewJob {
             queue: queue.into(),
             args,
             run_at: None,
+            meta: Map::new(),
         }
     }
 
@@ -219,6 +212,15 @@ impl NewJob {
     pub fn run_at(mut self, at: SystemTime) -> Self {
         self.run_at = Some(at);
         self
+    }
+
+    /// The record a backend stores for it: a new id, its run time and
+    /// metadata.
+    pub fn into_record(self) -> JobRecord {
+        let mut job = JobRecord::owned(self.name, self.queue, self.args);
+        job.run_at_ms = self.run_at.map(millis);
+        job.meta = self.meta;
+        job
     }
 }
 
@@ -278,7 +280,14 @@ impl Queue {
     }
 
     pub fn push(&self, name: &str, queue: &str, args: Vec<Value>) -> Result<JobId> {
-        self.0.push(name, queue, args)
+        self.0.push(NewJob::new(name, queue, args))
+    }
+
+    /// Stores one job: pending, or scheduled if it has a `run_at` still in
+    /// the future, with its metadata.
+    pub fn push_job(&self, mut job: NewJob) -> Result<JobId> {
+        job.run_at = job.run_at.filter(|at| !is_due(*at));
+        self.0.push(job)
     }
 
     /// Stores jobs in one step where the backend allows it. A `run_at`
@@ -299,10 +308,7 @@ impl Queue {
         args: Vec<Value>,
         run_at: SystemTime,
     ) -> Result<JobId> {
-        if is_due(run_at) {
-            return self.0.push(name, queue, args);
-        }
-        self.0.schedule(name, queue, args, run_at)
+        self.push_job(NewJob::new(name, queue, args).run_at(run_at))
     }
 
     /// Moves the scheduled jobs due by `now` onto their queues. Claims do it

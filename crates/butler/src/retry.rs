@@ -195,11 +195,91 @@ pub enum Retry {
 
 /// Implement it on a job's error type to decide, per error, whether and when
 /// the job is retried. Error types that don't implement it get
-/// [`Retry::Default`]. It is read where the `#[job]` macro sees the concrete
-/// error type, so it applies to the error the job returns itself, not to one
-/// boxed into `anyhow::Error` or [`BoxError`](crate::BoxError).
+/// [`Retry::Default`].
+///
+/// The `#[job]` macro reads it on the error type the job returns. For an
+/// error that reaches the worker wrapped, in an `anyhow::Error`, a
+/// [`BoxError`](crate::BoxError), or as the `source` of another error,
+/// register its type with [`retryable!`](crate::retryable): the error and
+/// its sources are then searched, outermost first, for one whose type is
+/// registered.
 pub trait Retryable {
     fn retry(&self) -> Retry;
+}
+
+/// Registers error types that implement [`Retryable`] (and
+/// `std::error::Error`), so their classification applies when they are
+/// wrapped: returned as an `anyhow::Error` or a [`BoxError`](crate::BoxError),
+/// or found in the source chain of the job's error.
+///
+/// ```
+/// #[derive(Debug, thiserror::Error)]
+/// #[error("account {0} was deleted")]
+/// struct AccountDeleted(u64);
+///
+/// impl butler::Retryable for AccountDeleted {
+///     fn retry(&self) -> butler::Retry {
+///         butler::Retry::Never
+///     }
+/// }
+///
+/// butler::retryable!(AccountDeleted);
+///
+/// #[butler::job]
+/// async fn sync_account(id: u64) -> Result<(), butler::BoxError> {
+///     Err(AccountDeleted(id).into()) // dead at once, not retried
+/// }
+/// # fn main() {}
+/// ```
+///
+/// Like jobs, registrations are collected when the program links: one made
+/// in a library crate is only seen if the binary uses something from it.
+#[macro_export]
+macro_rules! retryable {
+    ($($error:ty),+ $(,)?) => {
+        $(
+            $crate::__private::inventory::submit! {
+                $crate::__private::RetryableType::of::<$error>()
+            }
+        )+
+    };
+}
+
+/// An error type registered with [`retryable!`].
+#[doc(hidden)]
+pub struct RetryableType {
+    classify: fn(&(dyn std::error::Error + 'static)) -> Option<Retry>,
+}
+
+impl RetryableType {
+    pub const fn of<E: Retryable + std::error::Error + 'static>() -> Self {
+        Self {
+            classify: classify_as::<E>,
+        }
+    }
+}
+
+inventory::collect!(RetryableType);
+
+fn classify_as<E: Retryable + std::error::Error + 'static>(
+    error: &(dyn std::error::Error + 'static),
+) -> Option<Retry> {
+    error.downcast_ref::<E>().map(Retryable::retry)
+}
+
+/// What the first error of a registered type in `error`'s source chain,
+/// starting with `error` itself, asks for.
+pub(crate) fn classify_chain(error: &(dyn std::error::Error + 'static)) -> Option<Retry> {
+    let mut next = Some(error);
+    while let Some(error) = next {
+        for registered in inventory::iter::<RetryableType> {
+            if let Some(retry) = (registered.classify)(error) {
+                return Some(retry);
+            }
+        }
+        next = error.source();
+    }
+    None
 }
 
 /// How many times a failed job is retried, and how long it waits before each

@@ -9,19 +9,20 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use tracing::{Instrument, Span, field};
+
 use crate::{
-    __private::BoxFuture,
-    Backoff, Config, Failed, Job, JobDef, JobError, Queue, QueuePriority, Result, RetryPolicy,
-    WorkerConfig, block_on,
+    Backoff, Config, DeadJob, Failed, Job, JobContext, JobDef, JobError, Layer, Next, Queue,
+    QueuePriority, Result, RetryPolicy, RunFuture, WorkerConfig, block_on,
     error::Chain,
     executor::panic_message,
+    job::millis,
     limits::{Permit, QueueLimits},
+    middleware::{DeadHook, Handler, run_dead_hooks, run_handler},
     monitor::JobMetric,
     progress::{Checkpoints, Invocation},
     state::Processing,
 };
-
-type Handler = fn(Invocation) -> BoxFuture;
 
 /// What one pass of a worker thread did.
 enum Step {
@@ -85,6 +86,10 @@ pub struct Worker {
     /// at their next checkpoint and go back on their queue.
     stopping: Arc<AtomicBool>,
     checkpoint_interval: Duration,
+    /// Run around every job, outermost first.
+    layers: Arc<Vec<Arc<dyn Layer>>>,
+    /// Run when a job dies, in order.
+    dead_hooks: Arc<Vec<DeadHook>>,
 }
 
 /// When this worker last refreshed its heartbeat, recovered jobs, and
@@ -130,6 +135,8 @@ impl Worker {
             upkeep: Arc::default(),
             stopping: Arc::default(),
             checkpoint_interval: defaults.checkpoint_interval(),
+            layers: Arc::default(),
+            dead_hooks: Arc::default(),
         }
     }
 
@@ -164,6 +171,43 @@ impl Worker {
     /// `.register(my_lib::my_job::JOB)`, or the linker may drop them.
     pub fn register(mut self, job: JobDef) -> Self {
         Arc::make_mut(&mut self.jobs).insert(job.name, job);
+        self
+    }
+
+    /// Adds a [`Layer`] around every job this worker runs, like ActiveJob's
+    /// `around_perform`. The first layer added is the outermost: with
+    /// `.wrap(a).wrap(b)`, `a` starts first and finishes last.
+    ///
+    /// ```ignore
+    /// worker.wrap(|job: JobContext, next: Next| async move {
+    ///     let started = Instant::now();
+    ///     let result = next.run().await;
+    ///     record_duration(job.name(), started.elapsed());
+    ///     result
+    /// })
+    /// ```
+    pub fn wrap(mut self, layer: impl Layer) -> Self {
+        Arc::make_mut(&mut self.layers).push(Arc::new(layer));
+        self
+    }
+
+    /// Runs `hook` whenever a job dies, for alerting: when it used all its
+    /// retries, and when its error said never to retry
+    /// ([`Retry::Never`](crate::Retry::Never)). It runs after the job is
+    /// stored as dead, in the job's tracing span; several hooks run in the
+    /// order they were added. A panic in a hook is logged, and doesn't stop
+    /// the worker.
+    ///
+    /// Under [`run_async`](Worker::run_async) it is a task on the runtime;
+    /// under [`run`](Worker::run) and [`drain`](Worker::drain), it runs on
+    /// the job's thread with the built-in `block_on`.
+    pub fn on_dead<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn(DeadJob) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let hook: DeadHook = Arc::new(move |dead| Box::pin(hook(dead)));
+        Arc::make_mut(&mut self.dead_hooks).push(hook);
         self
     }
 
@@ -366,21 +410,23 @@ impl Worker {
             Claimed::Nothing { throttled: true } => return Ok(Step::Throttled),
             Claimed::Nothing { throttled: false } => return Ok(Step::Idle),
         };
+        let span = self.span(&job);
         let checkpoints = self.checkpoints(&job);
         let started = Instant::now();
-        let result = self.handler(&job).and_then(|handler| {
-            let fut = handler(Invocation {
-                args: job.args().to_vec(),
-                checkpoints: checkpoints.clone(),
-            });
-            catch_unwind(AssertUnwindSafe(|| block_on(fut))).unwrap_or_else(|panic| {
-                Err(JobError::Panicked {
-                    message: panic_message(&*panic),
-                })
+        let fut = self.perform(&job, &checkpoints).instrument(span.clone());
+        let result = catch_unwind(AssertUnwindSafe(|| block_on(fut))).unwrap_or_else(|panic| {
+            Err(JobError::Panicked {
+                message: panic_message(&*panic),
             })
         });
-        self.finish(job, result, &checkpoints, started)?;
+        let dead = self.finish(job, result, &checkpoints, started, &span)?;
         drop(permit);
+        if let Some(dead) = dead.filter(|_| !self.dead_hooks.is_empty()) {
+            let hooks = run_dead_hooks(Arc::clone(&self.dead_hooks), dead).instrument(span.clone());
+            if catch_unwind(AssertUnwindSafe(|| block_on(hooks))).is_err() {
+                span.in_scope(|| tracing::error!("an on_dead hook panicked"));
+            }
+        }
         Ok(Step::Ran)
     }
 
@@ -490,13 +536,40 @@ impl Worker {
         }
     }
 
-    fn handler(&self, job: &Job<Processing>) -> Result<Handler, JobError> {
-        self.jobs
-            .get(job.name())
-            .map(|def| def.perform)
-            .ok_or_else(|| JobError::UnknownJob {
-                name: job.name().to_owned(),
-            })
+    /// The span every run of `job` is in, with its id, name, queue and
+    /// attempt. `outcome` (`done`, `retry`, `dead` or `interrupted`) and,
+    /// for a retry, `retry_at_ms` (ms since the Unix epoch) are recorded
+    /// when it finishes.
+    fn span(&self, job: &Job<Processing>) -> Span {
+        tracing::info_span!(
+            "job",
+            id = job.id(),
+            name = job.name(),
+            queue = job.queue(),
+            attempt = job.attempts().saturating_add(1),
+            worker = &*self.id,
+            outcome = field::Empty,
+            retry_at_ms = field::Empty,
+        )
+    }
+
+    /// The job's run: its layers, outermost first, around its generated
+    /// code, or `UnknownJob` if this worker doesn't have it.
+    fn perform(&self, job: &Job<Processing>, checkpoints: &Checkpoints) -> RunFuture {
+        let handler: Option<Handler> = self.jobs.get(job.name()).map(|def| def.perform);
+        let invocation = Invocation {
+            args: job.args().to_vec(),
+            checkpoints: checkpoints.clone(),
+        };
+        if self.layers.is_empty() {
+            return run_handler(handler, job.name(), invocation);
+        }
+        let context = JobContext::new(
+            job.record().clone(),
+            self.retry_policy(job.name()),
+            Arc::clone(&self.id),
+        );
+        Next::start(Arc::clone(&self.layers), context, handler, invocation)
     }
 
     /// What a job run gets for its `Progress`: the progress to resume from,
@@ -530,24 +603,28 @@ impl Worker {
     /// a checkpoint interrupted it, otherwise a retry (after the job's
     /// backoff, or when its error asks) or `dead`. A failed or interrupted job
     /// keeps its latest progress, so the next run resumes from there. The
-    /// error's full cause chain becomes the job's `last_error`.
+    /// error's full cause chain becomes the job's `last_error`. Logs in the
+    /// job's `span`, and records its outcome there. Returns the job if it
+    /// died, for the `on_dead` hooks.
     fn finish(
         &self,
         job: Job<Processing>,
         result: Result<serde_json::Value, JobError>,
         checkpoints: &Checkpoints,
         started: Instant,
-    ) -> Result<()> {
+        span: &Span,
+    ) -> Result<Option<DeadJob>> {
+        let _entered = span.enter();
         let (job_name, job_queue) = (job.name().to_owned(), job.queue().to_owned());
-        let metric = |failed| {
-            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            JobMetric::now(&job_name, &job_queue, failed, duration_ms)
-        };
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let metric = |failed| JobMetric::now(&job_name, &job_queue, failed, duration_ms);
         let err = match result {
             Ok(output) => {
                 self.queue.complete(&self.id, job, output)?;
+                span.record("outcome", "done");
+                tracing::debug!(duration_ms, "job done");
                 self.record(&metric(false));
-                return Ok(());
+                return Ok(None);
             }
             Err(err) => err,
         };
@@ -556,13 +633,10 @@ impl Worker {
             None => job,
         };
         if checkpoints.interrupted() {
-            let job = self.queue.interrupt(&self.id, job)?;
-            tracing::info!(
-                job = job.name(),
-                id = job.id(),
-                "job interrupted at a checkpoint; it will resume from there"
-            );
-            return Ok(());
+            self.queue.interrupt(&self.id, job)?;
+            span.record("outcome", "interrupted");
+            tracing::info!("job interrupted at a checkpoint; it will resume from there");
+            return Ok(None);
         }
         let error = Chain(&err).to_string();
         self.record(&metric(true));
@@ -571,32 +645,32 @@ impl Worker {
             .queue
             .fail_with(&self.id, job, error, err.retry(), policy)?
         {
-            Failed::Dead(job) => tracing::error!(
-                job = job.name(),
-                id = job.id(),
-                error = %Chain(&err),
-                "job failed and is dead"
-            ),
-            Failed::Scheduled(job) => tracing::warn!(
-                job = job.name(),
-                id = job.id(),
-                attempts = job.attempts(),
-                retry_in_ms = job
-                    .run_at()
-                    .duration_since(SystemTime::now())
-                    .unwrap_or_default()
-                    .as_millis(),
-                error = %Chain(&err),
-                "job failed and will retry later"
-            ),
-            Failed::Retry(job) => tracing::warn!(
-                job = job.name(),
-                id = job.id(),
-                error = %Chain(&err),
-                "job failed and will retry"
-            ),
+            Failed::Dead(job) => {
+                span.record("outcome", "dead");
+                tracing::error!(duration_ms, error = %Chain(&err), "job failed and is dead");
+                return Ok(Some(DeadJob::new(job, err)));
+            }
+            Failed::Scheduled(job) => {
+                span.record("outcome", "retry");
+                span.record("retry_at_ms", millis(job.run_at()));
+                tracing::warn!(
+                    duration_ms,
+                    retry_in_ms = job
+                        .run_at()
+                        .duration_since(SystemTime::now())
+                        .unwrap_or_default()
+                        .as_millis(),
+                    error = %Chain(&err),
+                    "job failed and will retry later"
+                );
+            }
+            Failed::Retry(_) => {
+                span.record("outcome", "retry");
+                span.record("retry_at_ms", millis(SystemTime::now()));
+                tracing::warn!(duration_ms, error = %Chain(&err), "job failed and will retry");
+            }
         }
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -717,31 +791,40 @@ impl Worker {
     }
 
     async fn execute_async(&self, job: Job<Processing>) {
+        let span = self.span(&job);
         let checkpoints = self.checkpoints(&job);
         let started = Instant::now();
-        let invocation = Invocation {
-            args: job.args().to_vec(),
-            checkpoints: checkpoints.clone(),
-        };
-        let result = match self.handler(&job) {
-            // A separate task, so a panic in the job surfaces as a JoinError.
-            Ok(handler) => match tokio::spawn(handler(invocation)).await {
-                Ok(result) => result,
-                Err(e) if e.is_panic() => Err(JobError::Panicked {
-                    message: panic_message(&*e.into_panic()),
-                }),
-                Err(e) => Err(JobError::Cancelled(e)),
-            },
-            Err(e) => Err(e),
+        // A separate task, so a panic in the job or a layer surfaces as a
+        // JoinError.
+        let run = self.perform(&job, &checkpoints).instrument(span.clone());
+        let result = match tokio::spawn(run).await {
+            Ok(result) => result,
+            Err(e) if e.is_panic() => Err(JobError::Panicked {
+                message: panic_message(&*e.into_panic()),
+            }),
+            Err(e) => Err(JobError::Cancelled(e)),
         };
 
         let worker = self.clone();
+        let finishing = span.clone();
         let stored = crate::executor::unblock(self.queue.blocks(), move || {
-            worker.finish(job, result, &checkpoints, started)
+            worker.finish(job, result, &checkpoints, started, &finishing)
         })
         .await;
-        if let Err(err) = stored {
-            tracing::error!(error = %Chain(&err), "could not store job result");
+        let dead = match stored {
+            Ok(dead) => dead,
+            Err(err) => {
+                span.in_scope(
+                    || tracing::error!(error = %Chain(&err), "could not store job result"),
+                );
+                None
+            }
+        };
+        if let Some(dead) = dead.filter(|_| !self.dead_hooks.is_empty()) {
+            let hooks = run_dead_hooks(Arc::clone(&self.dead_hooks), dead).instrument(span.clone());
+            if let Err(err) = tokio::spawn(hooks).await {
+                span.in_scope(|| tracing::error!(error = %err, "an on_dead hook panicked"));
+            }
         }
     }
 }

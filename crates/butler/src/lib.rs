@@ -28,11 +28,13 @@ mod arg;
 mod backend;
 mod call;
 mod config;
+mod enqueue;
 mod error;
 mod executor;
 mod handle;
 mod job;
 mod limits;
+mod middleware;
 pub mod monitor;
 mod prepared;
 mod progress;
@@ -60,12 +62,14 @@ pub use config::{
     BackendKind, Config, FileConfig, QueueConfig, QueueEntry, RedisConfig, SqliteConfig,
     WorkerConfig,
 };
+pub use enqueue::{EnqueueLayer, configure_enqueue};
 pub use error::{BoxError, Error, Failure, JobError, Result};
 pub use executor::block_on;
 pub use handle::JobHandle;
 pub use job::{
     AnyJob, DEFAULT_QUEUE, Failed, Job, JobId, JobRecord, JobState, is_valid_queue_name, state,
 };
+pub use middleware::{DeadJob, JobContext, Layer, Next, RunFuture};
 pub use prepared::{PreparedJob, enqueue_all};
 pub use progress::{Interrupted, Progress};
 pub use queues::QueuePriority;
@@ -166,36 +170,42 @@ pub fn queue() -> Result<Queue> {
 /// Used by the `#[job]` macro. Not public API.
 #[doc(hidden)]
 pub mod __private {
-    use std::{future::Future, pin::Pin};
-
     pub use inventory;
     pub use serde_json;
 
-    pub use crate::progress::{Checkpoints, Invocation};
+    pub use crate::{
+        progress::{Checkpoints, Invocation},
+        retry::RetryableType,
+    };
 
     use crate::JobError;
 
     /// A job run: its output as JSON, or why it failed.
-    pub type BoxFuture = Pin<Box<dyn Future<Output = Result<serde_json::Value, JobError>> + Send>>;
+    pub type BoxFuture = crate::RunFuture;
 
     /// Turns a job body's return value into the JSON the worker stores, or
-    /// its error, with what `classify` says about retrying it.
+    /// its error, with what `classify` says about retrying it. When the
+    /// error's own type isn't [`Retryable`](crate::Retryable), its source
+    /// chain is searched for one that is (see [`retryable!`](crate::retryable)).
     pub fn output<R: crate::IntoJobResult>(
         returned: R,
-        classify: impl FnOnce(&R::Error) -> crate::Retry,
+        classify: impl FnOnce(&R::Error) -> Option<crate::Retry>,
     ) -> Result<serde_json::Value, JobError> {
         match returned.into_result() {
             Ok(value) => serde_json::to_value(value).map_err(JobError::Output),
             Err(error) => {
-                let retry = classify(&error);
-                Err(JobError::Failed(crate::Failure::new(error, retry)))
+                let failure = match classify(&error) {
+                    Some(retry) => crate::Failure::new(error, retry),
+                    None => crate::Failure::from(error.into()),
+                };
+                Err(JobError::Failed(failure))
             }
         }
     }
 
     /// Reads a job error's [`Retryable`](crate::Retryable) classification
-    /// when its type has one, and [`Retry::Default`](crate::Retry::Default)
-    /// otherwise, without requiring the trait: the macro calls
+    /// when its type has one, and `None` otherwise, without requiring the
+    /// trait: the macro calls
     /// `(&Classify(&error)).retry_policy()` with both traits below in scope.
     /// Method lookup tries `Classify<E>` (needs `E: Retryable`) before
     /// `&Classify<E>` (any `E`), so the first applies whenever it can. That
@@ -203,22 +213,22 @@ pub mod __private {
     pub struct Classify<'a, E>(pub &'a E);
 
     pub trait ClassifyRetry {
-        fn retry_policy(&self) -> crate::Retry;
+        fn retry_policy(&self) -> Option<crate::Retry>;
     }
 
     impl<E: crate::Retryable> ClassifyRetry for Classify<'_, E> {
-        fn retry_policy(&self) -> crate::Retry {
-            self.0.retry()
+        fn retry_policy(&self) -> Option<crate::Retry> {
+            Some(self.0.retry())
         }
     }
 
     pub trait DefaultRetry {
-        fn retry_policy(&self) -> crate::Retry;
+        fn retry_policy(&self) -> Option<crate::Retry>;
     }
 
     impl<E> DefaultRetry for &Classify<'_, E> {
-        fn retry_policy(&self) -> crate::Retry {
-            crate::Retry::Default
+        fn retry_policy(&self) -> Option<crate::Retry> {
+            None
         }
     }
 
@@ -276,19 +286,17 @@ pub mod __private {
         args: Vec<serde_json::Value>,
         run_at: Option<std::time::SystemTime>,
     ) -> crate::Result<crate::JobHandle<T>> {
+        let mut new = crate::NewJob::new(job.name, queue_name, args);
+        new.run_at = run_at;
+        crate::enqueue::apply(&mut new)?;
         // Inside `testing::perform_enqueued_jobs`: run it now, no queue, even
         // if it was scheduled for later.
         if let Some(inline) = crate::testing::current() {
-            return inline.run(job, queue_name, args).await;
+            return inline.run(job, new).await;
         }
-        let queue_name = queue_name.to_owned();
         let queue = crate::queue()?;
         let pushing = queue.clone();
-        let id = crate::executor::unblock(queue.blocks(), move || match run_at {
-            Some(run_at) => pushing.schedule(job.name, &queue_name, args, run_at),
-            None => pushing.push(job.name, &queue_name, args),
-        })
-        .await?;
+        let id = crate::executor::unblock(queue.blocks(), move || pushing.push_job(new)).await?;
         Ok(crate::JobHandle::new(queue, id))
     }
 

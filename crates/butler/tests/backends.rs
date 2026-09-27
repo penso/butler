@@ -900,3 +900,71 @@ fn an_error_can_refuse_retries_or_pick_the_delay() {
         assert_eq!(failed.state(), JobState::Dead, "{name}");
     }
 }
+
+#[test]
+fn metadata_is_kept_through_scheduling_claims_retries_and_recovery() {
+    for (queue, _) in backends("meta") {
+        let name = queue.describe();
+        let with_meta = |job: NewJob| {
+            let mut job = job;
+            job.meta.insert("tenant".into(), json!("acme"));
+            job.meta.insert("trace".into(), json!({ "id": 7 }));
+            job
+        };
+        let expected = json!({ "tenant": "acme", "trace": { "id": 7 } });
+        let meta_of = |id: &str| {
+            let record = queue.get(id).unwrap().unwrap().record().meta.clone();
+            serde_json::Value::Object(record)
+        };
+
+        let pending = queue
+            .push_job(with_meta(NewJob::new("a", "default", vec![])))
+            .unwrap();
+        let later = SystemTime::now() + HOUR;
+        let scheduled = queue
+            .push_job(with_meta(NewJob::new("b", "default", vec![]).run_at(later)))
+            .unwrap();
+        let batch = queue
+            .push_many(vec![
+                with_meta(NewJob::new("c", "default", vec![])),
+                with_meta(NewJob::new("d", "default", vec![]).run_at(later)),
+                NewJob::new("plain", "default", vec![]),
+            ])
+            .unwrap();
+        for id in [&pending, &scheduled, &batch[0], &batch[1]] {
+            assert_eq!(meta_of(id), expected, "{name}: {id}");
+        }
+        assert!(
+            queue
+                .get(&batch[2])
+                .unwrap()
+                .unwrap()
+                .record()
+                .meta
+                .is_empty(),
+            "{name}"
+        );
+        assert_eq!(queue.state(&scheduled), Some(JobState::Scheduled), "{name}");
+
+        // Claimed, failed back to the queue, recovered after a crash, and
+        // promoted: the metadata goes wherever the job goes.
+        let job = queue.claim("w1", DEFAULT, NOW).unwrap().unwrap();
+        assert_eq!(job.id(), pending, "{name}");
+        assert_eq!(
+            serde_json::Value::Object(job.record().meta.clone()),
+            expected
+        );
+        queue.fail("w1", job, "boom".into(), 3).unwrap();
+        assert_eq!(meta_of(&pending), expected, "{name}");
+
+        queue.heartbeat("w2", Duration::from_millis(30)).unwrap();
+        let held = queue.claim("w2", DEFAULT, NOW).unwrap().unwrap();
+        thread::sleep(Duration::from_millis(80));
+        assert!(queue.recover().unwrap() >= 1, "{name}");
+        assert_eq!(meta_of(held.id()), expected, "{name}");
+
+        queue.promote(later).unwrap();
+        assert_eq!(queue.state(&scheduled), Some(JobState::Pending), "{name}");
+        assert_eq!(meta_of(&scheduled), expected, "{name}");
+    }
+}

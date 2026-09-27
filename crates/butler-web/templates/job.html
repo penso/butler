@@ -44,9 +44,17 @@
 {% endif %}
 
 <section class="mt-6 grid gap-6 lg:grid-cols-2">
-  <div class="card p-5">
-    <h2 class="mb-2 text-sm font-semibold">Arguments</h2>
-    <pre class="code">{{ args }}</pre>
+  <div class="flex flex-col gap-6">
+    <div class="card p-5">
+      <h2 class="mb-2 text-sm font-semibold">Arguments</h2>
+      <pre class="code">{{ args }}</pre>
+    </div>
+    {% if let Some(meta) = meta %}
+    <div class="card p-5">
+      <h2 class="mb-2 text-sm font-semibold">Metadata</h2>
+      <pre class="code">{{ meta }}</pre>
+    </div>
+    {% endif %}
   </div>
   <div class="flex flex-col gap-6">
     {% if let Some(result) = result %}

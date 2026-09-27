@@ -31,9 +31,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use serde_json::Value;
-
-use super::{Monitor, Promoted, Store, Watch};
+use super::{Monitor, NewJob, Promoted, Store, Watch};
 use crate::{
     JobId, JobRecord, JobState, Result,
     job::{DEFAULT_QUEUE, from_millis, millis},
@@ -249,22 +247,13 @@ impl FileQueue {
 }
 
 impl Store for FileQueue {
-    fn push(&self, name: &str, queue: &str, args: Vec<Value>) -> Result<JobId> {
-        let job = JobRecord::new(name, queue, args);
-        self.write(JobState::Pending, &job)?;
-        Ok(job.id)
-    }
-
-    fn schedule(
-        &self,
-        name: &str,
-        queue: &str,
-        args: Vec<Value>,
-        run_at: SystemTime,
-    ) -> Result<JobId> {
-        let mut job = JobRecord::new(name, queue, args);
-        job.run_at_ms = Some(millis(run_at));
-        self.write(JobState::Scheduled, &job)?;
+    fn push(&self, job: NewJob) -> Result<JobId> {
+        let job = job.into_record();
+        let state = match job.run_at_ms {
+            Some(_) => JobState::Scheduled,
+            None => JobState::Pending,
+        };
+        self.write(state, &job)?;
         Ok(job.id)
     }
 

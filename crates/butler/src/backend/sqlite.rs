@@ -42,7 +42,6 @@ use std::{
 };
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use serde_json::Value;
 
 use super::{Monitor, NewJob, Promoted, Store, Watch};
 use crate::{
@@ -279,6 +278,14 @@ fn count(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 
+/// Where a new job starts: scheduled if it has a run time.
+fn new_state(job: &JobRecord) -> JobState {
+    match job.run_at_ms {
+        Some(_) => JobState::Scheduled,
+        None => JobState::Pending,
+    }
+}
+
 /// A run time as stored in `run_at`.
 fn run_at_column(job: &JobRecord) -> Option<i64> {
     job.run_at_ms
@@ -294,18 +301,24 @@ fn now_ms() -> i64 {
 }
 
 impl Store for SqliteQueue {
-    fn push(&self, name: &str, queue: &str, args: Vec<Value>) -> Result<JobId> {
-        let job = JobRecord::new(name, queue, args);
+    fn push(&self, job: NewJob) -> Result<JobId> {
+        let job = job.into_record();
         let data = serde_json::to_string(&job)?;
+        let state = new_state(&job);
         self.with_conn(|conn| {
             conn.execute(
-                "INSERT INTO butler_jobs (id, queue, state, seq, data)
-                 VALUES (?1, ?2, 'pending',
-                         (SELECT COALESCE(MAX(seq), 0) + 1 FROM butler_jobs), ?3)",
-                params![job.id, queue, data],
+                &format!(
+                    "INSERT INTO butler_jobs (id, queue, state, seq, data, run_at)
+                     VALUES (?1, ?2, ?3, {NEXT_SEQ}, ?4, ?5)"
+                ),
+                params![job.id, job.queue, state.as_str(), data, run_at_column(&job)],
             )
         })?;
-        self.signals.pushed.notify();
+        // No wake-up for a scheduled job: there is nothing to claim until
+        // it is promoted.
+        if state == JobState::Pending {
+            self.signals.pushed.notify();
+        }
         Ok(job.id)
     }
 
@@ -315,10 +328,9 @@ impl Store for SqliteQueue {
         let records = jobs
             .into_iter()
             .map(|new| {
-                let mut job = JobRecord::new(&new.name, &new.queue, new.args);
-                job.run_at_ms = new.run_at.map(millis);
+                let job = new.into_record();
                 let data = serde_json::to_string(&job)?;
-                Ok((job, new.queue, data))
+                Ok((job, data))
             })
             .collect::<Result<Vec<_>>>()?;
         let ids = self.with_conn(|conn| {
@@ -328,47 +340,21 @@ impl Store for SqliteQueue {
                     "INSERT INTO butler_jobs (id, queue, state, seq, data, run_at)
                      VALUES (?1, ?2, ?3, {NEXT_SEQ}, ?4, ?5)"
                 ))?;
-                for (job, queue, data) in &records {
-                    let state = match job.run_at_ms {
-                        Some(_) => JobState::Scheduled,
-                        None => JobState::Pending,
-                    };
+                for (job, data) in &records {
                     insert.execute(params![
                         job.id,
-                        queue,
-                        state.as_str(),
+                        job.queue,
+                        new_state(job).as_str(),
                         data,
                         run_at_column(job)
                     ])?;
                 }
             }
             tx.commit()?;
-            Ok(records.into_iter().map(|(job, _, _)| job.id).collect())
+            Ok(records.into_iter().map(|(job, _)| job.id).collect())
         })?;
         self.signals.pushed.notify();
         Ok(ids)
-    }
-
-    fn schedule(
-        &self,
-        name: &str,
-        queue: &str,
-        args: Vec<Value>,
-        run_at: SystemTime,
-    ) -> Result<JobId> {
-        let mut job = JobRecord::new(name, queue, args);
-        job.run_at_ms = Some(millis(run_at));
-        let data = serde_json::to_string(&job)?;
-        self.with_conn(|conn| {
-            conn.execute(
-                &format!(
-                    "INSERT INTO butler_jobs (id, queue, state, seq, data, run_at)
-                     VALUES (?1, ?2, 'scheduled', {NEXT_SEQ}, ?3, ?4)"
-                ),
-                params![job.id, queue, data, run_at_column(&job)],
-            )
-        })?;
-        Ok(job.id)
     }
 
     fn promote(&self, now: SystemTime) -> Result<Promoted> {
@@ -878,7 +864,9 @@ mod tests {
         assert_eq!((job.name.as_str(), job.run_at_ms), ("old", None));
 
         let at = SystemTime::now() + Duration::from_secs(60);
-        let id = queue.schedule("new", "default", vec![], at).unwrap();
+        let id = queue
+            .push(NewJob::new("new", "default", vec![]).run_at(at))
+            .unwrap();
         assert_eq!(queue.get(&id).unwrap().unwrap().0, JobState::Scheduled);
         assert_eq!(queue.promote(at).unwrap().moved, 1);
         let _ = std::fs::remove_file(&path);

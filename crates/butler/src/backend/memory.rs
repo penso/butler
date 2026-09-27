@@ -15,8 +15,6 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use serde_json::Value;
-
 use super::{Monitor, NewJob, Promoted, Store, Watch};
 use crate::{
     JobId, JobRecord, JobState, Result, Signal,
@@ -93,6 +91,21 @@ impl State {
         }
     }
 
+    /// Stores a new job: pending on its queue, or scheduled if it has a run
+    /// time.
+    fn insert_new(&mut self, job: JobRecord) -> JobId {
+        if job.run_at_ms.is_some() {
+            return self.insert_scheduled(job);
+        }
+        let id = job.id.clone();
+        self.pending
+            .entry(job.queue.clone())
+            .or_default()
+            .push_back(id.clone());
+        self.jobs.insert(id.clone(), (JobState::Pending, job));
+        id
+    }
+
     fn insert_scheduled(&mut self, job: JobRecord) -> JobId {
         let id = job.id.clone();
         self.scheduled
@@ -116,58 +129,22 @@ impl State {
     }
 }
 
-fn scheduled_record(name: &str, queue: &str, args: Vec<Value>, run_at: SystemTime) -> JobRecord {
-    let mut job = JobRecord::new(name, queue, args);
-    job.run_at_ms = Some(millis(run_at));
-    job
-}
-
 impl Store for MemoryQueue {
-    fn push(&self, name: &str, queue: &str, args: Vec<Value>) -> Result<JobId> {
-        let job = JobRecord::new(name, queue, args);
-        let id = job.id.clone();
-        let mut state = self.lock();
-        state.jobs.insert(id.clone(), (JobState::Pending, job));
-        state
-            .pending
-            .entry(queue.to_owned())
-            .or_default()
-            .push_back(id.clone());
+    fn push(&self, job: NewJob) -> Result<JobId> {
+        let scheduled = job.run_at.is_some();
+        let id = self.lock().insert_new(job.into_record());
         // Every waiting claim rechecks: only some of them serve this queue.
-        self.inner.pushed.notify_all();
+        if !scheduled {
+            self.inner.pushed.notify_all();
+        }
         Ok(id)
-    }
-
-    fn schedule(
-        &self,
-        name: &str,
-        queue: &str,
-        args: Vec<Value>,
-        run_at: SystemTime,
-    ) -> Result<JobId> {
-        let job = scheduled_record(name, queue, args, run_at);
-        Ok(self.lock().insert_scheduled(job))
     }
 
     fn push_many(&self, jobs: Vec<NewJob>) -> Result<Vec<JobId>> {
         let mut state = self.lock();
         let ids = jobs
             .into_iter()
-            .map(|new| {
-                if let Some(run_at) = new.run_at {
-                    let job = scheduled_record(&new.name, &new.queue, new.args, run_at);
-                    return state.insert_scheduled(job);
-                }
-                let job = JobRecord::new(&new.name, &new.queue, new.args);
-                let id = job.id.clone();
-                state.jobs.insert(id.clone(), (JobState::Pending, job));
-                state
-                    .pending
-                    .entry(new.queue)
-                    .or_default()
-                    .push_back(id.clone());
-                id
-            })
+            .map(|new| state.insert_new(new.into_record()))
             .collect();
         self.inner.pushed.notify_all();
         Ok(ids)

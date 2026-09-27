@@ -58,6 +58,15 @@ pub enum Error {
 
     #[error("invalid backoff `{value}`: {reason}")]
     InvalidBackoff { value: String, reason: &'static str },
+
+    /// An [enqueue layer](crate::EnqueueLayer) refused the job; `source` is
+    /// its reason. Nothing was enqueued.
+    #[error("enqueueing `{name}` was vetoed")]
+    Vetoed {
+        name: String,
+        #[source]
+        source: BoxError,
+    },
 }
 
 /// Why one run of a job failed. Its full cause chain is stored as the job's
@@ -148,10 +157,13 @@ impl Failure {
     }
 }
 
-/// An error that asks for nothing special: [`Retry::Default`].
+/// An error whose type isn't [`Retryable`](crate::Retryable) itself: what
+/// the first error of a type registered with [`retryable!`](crate::retryable)
+/// in its source chain asks for, or [`Retry::Default`].
 impl From<BoxError> for Failure {
     fn from(error: BoxError) -> Self {
-        Self::new(error, Retry::Default)
+        let retry = crate::retry::classify_chain(&*error).unwrap_or_default();
+        Self::new(error, retry)
     }
 }
 

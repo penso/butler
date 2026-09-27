@@ -38,10 +38,8 @@ use std::{
     time::Duration,
 };
 
-use serde_json::Value;
-
 use crate::{
-    AnyJob, Failed, Job, JobDef, JobHandle, JobRecord, MemoryQueue, Queue, Result, Store,
+    AnyJob, Failed, Job, JobDef, JobHandle, JobRecord, MemoryQueue, NewJob, Queue, Result, Store,
     error::Chain,
     progress::{Checkpoints, Invocation},
 };
@@ -124,12 +122,14 @@ impl InlineJobs {
     pub(crate) async fn run<T>(
         &self,
         def: &'static JobDef,
-        queue_name: &str,
-        args: Vec<Value>,
+        mut job: NewJob,
     ) -> Result<JobHandle<T>> {
         const INLINE: &str = "inline";
         let queue: Queue = self.store.clone().into();
-        let id = self.store.push(def.name, queue_name, args.clone())?;
+        let args = job.args.clone();
+        // Runs at once, whatever its run time.
+        job.run_at = None;
+        let id = self.store.push(job)?;
         let mut record = self
             .store
             .get(&id)?

@@ -1,6 +1,6 @@
 # butler-web
 
-A web dashboard for [butler](https://crates.io/crates/butler)'s background jobs:
+A web dashboard for [butler](https://crates.io/crates/butler-jobs)'s background jobs:
 live counts over server-sent events, throughput and duration charts, queues,
 workers, and job details. Retry or discard failed jobs, cancel pending work,
 run scheduled jobs now, and inspect arguments, results, errors, and saved

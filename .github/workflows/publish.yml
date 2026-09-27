@@ -1,0 +1,146 @@
+name: Publish
+run-name: Publish @ ${{ inputs.expected_sha }}
+
+# Started by `just release`, from main only. The version is whatever the
+# workspace Cargo.toml says at that commit; the tag is created after the crates
+# are on crates.io, so a tag always means a published release.
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Full commit SHA of main HEAD
+        required: true
+        type: string
+
+permissions: {}
+
+# One release at a time, and never cancel one halfway through publishing.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  audit:
+    name: Workflow Security
+    if: >-
+      github.repository == 'penso/butler' &&
+      github.ref == 'refs/heads/main' &&
+      github.actor == 'penso' && github.triggering_actor == 'penso'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          advanced-security: false
+          online-audits: false
+
+  validate:
+    name: Validate release
+    needs: audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - id: validate
+        name: Check commit, version, tag, and CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          set -euo pipefail
+          # The dispatched ref must still be main's HEAD, so a push racing the
+          # dispatch cannot swap what gets published.
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_SHA" == "$GITHUB_SHA" ]]
+          [[ "$(git rev-parse HEAD)" == "$EXPECTED_SHA" ]]
+          [[ "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" == "$EXPECTED_SHA" ]]
+
+          version=$(cargo metadata --locked --no-deps --format-version 1 |
+            jq -r '[.packages[] | select(.publish == null) | .version] | unique | if length == 1 then .[0] else error("publishable crates disagree on version") end')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$version" >/dev/null 2>&1; then
+            echo "::error::Tag v$version already exists; bump the workspace version first"
+            exit 1
+          fi
+
+          # Publishing is irreversible: require the regular CI to have passed
+          # on exactly this commit rather than re-running a subset of it here.
+          conclusion=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+            --commit "$EXPECTED_SHA" --branch main --event push \
+            --json conclusion --jq 'map(select(.conclusion == "success")) | length')
+          if [[ "$conclusion" == "0" ]]; then
+            echo "::error::CI has not passed on $EXPECTED_SHA"
+            exit 1
+          fi
+
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'Publishing v%s from %s\n' "$version" "$EXPECTED_SHA"
+      - name: Package and verify every crate
+        run: cargo publish --locked --workspace --dry-run
+
+  publish:
+    name: Publish to crates.io
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # The registry token exists only in this environment, restricted to main.
+    environment: crates-io
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      # Publishes butler-macros before butler-jobs, and butler-jobs before
+      # butler-web, waiting for each to be available in the index.
+      # crates.io only offers trusted publishing for crates that already
+      # exist, so the first release needs a token. Once 0.1.0 is out, switch
+      # to rust-lang/crates-io-auth-action and drop this ignore.
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked --workspace # zizmor: ignore[use-trusted-publishing]
+
+  tag:
+    name: Tag and release
+    needs: [validate, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Create the tag and GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "v$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "v$VERSION" \
+            --generate-notes

@@ -61,14 +61,14 @@ jobs:
       - name: Lint every feature combination
         run: |
           cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-          cargo clippy --locked -p butler --all-targets --no-default-features -- -D warnings
-          cargo clippy --locked -p butler --all-targets --no-default-features --features tokio -- -D warnings
-          cargo clippy --locked -p butler --all-targets --no-default-features --features redis -- -D warnings
-          cargo clippy --locked -p butler --all-targets --no-default-features --features sqlite -- -D warnings
+          cargo clippy --locked -p butler-jobs --all-targets --no-default-features -- -D warnings
+          cargo clippy --locked -p butler-jobs --all-targets --no-default-features --features tokio -- -D warnings
+          cargo clippy --locked -p butler-jobs --all-targets --no-default-features --features redis -- -D warnings
+          cargo clippy --locked -p butler-jobs --all-targets --no-default-features --features sqlite -- -D warnings
       - name: Test default features
         run: cargo test --locked --workspace
       - name: Test without optional features
-        run: cargo test --locked -p butler --no-default-features
+        run: cargo test --locked -p butler-jobs --no-default-features
 
   toml:
     name: TOML formatting

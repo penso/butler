@@ -1,10 +1,14 @@
 [package]
+authors.workspace      = true
 categories.workspace   = true
 description            = "Sidekiq-style background jobs: `.await` a #[job] function to enqueue it, and a worker runs it"
 edition.workspace      = true
+homepage.workspace     = true
 keywords               = ["background", "jobs", "queue", "redis", "sidekiq"]
-name                   = "butler"
+license.workspace      = true
+name                   = "butler-jobs"
 readme                 = "../../README.md"
+repository.workspace   = true
 rust-version.workspace = true
 version.workspace      = true
 
@@ -13,6 +17,10 @@ all-features = true
 
 [lints]
 workspace = true
+
+# Published as `butler-jobs`, used as `butler`: `use butler::job`.
+[lib]
+name = "butler"
 
 [features]
 default = ["redis", "sqlite", "tokio"]

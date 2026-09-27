@@ -1,10 +1,14 @@
 [package]
+authors.workspace      = true
 categories.workspace   = true
 description            = "The #[job] attribute macro for the butler background job runner"
 edition.workspace      = true
+homepage.workspace     = true
 keywords               = ["background", "jobs", "macro", "queue"]
+license.workspace      = true
 name                   = "butler-macros"
 readme                 = "README.md"
+repository.workspace   = true
 rust-version.workspace = true
 version.workspace      = true
 

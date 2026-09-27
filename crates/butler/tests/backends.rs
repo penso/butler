@@ -534,10 +534,13 @@ fn a_waiting_claim_wakes_when_a_scheduled_job_comes_due() {
     for (queue, claim) in backends("scheduled-wake") {
         let name = queue.describe();
         let delay = Duration::from_millis(200);
+        // Start the clock before the run time is fixed: `schedule` itself can
+        // take milliseconds (the file backend writes to disk), and that time
+        // counts towards the delay.
+        let started = Instant::now();
         let id = queue
             .schedule("soon", "default", vec![], SystemTime::now() + delay)
             .unwrap();
-        let started = Instant::now();
         match claim {
             // One claim: it wakes at the run time, not at the end of its wait.
             Claim::Blocks => {

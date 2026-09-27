@@ -886,7 +886,8 @@ keep_dead = "30d"            # default "forever"
 ```
 
 Running workers delete older ones, at most 1,000 per call, once a minute, or
-at every keeper tick while a backlog remains. Only finished jobs are ever
+at every keeper tick while the backend says there is more to look at (a full
+batch, or a scan that ran out of budget before reaching the end). Only finished jobs are ever
 deleted: nothing pending, scheduled or running, and nothing a live job
 relies on (unique keys, concurrency and limit slots, recurring ticks, which
 are remembered on their own). Retention is at least a minute, so a
@@ -1455,8 +1456,9 @@ A finished job's file is written when it finishes (touched before the rename,
 for a cancelled one), so cleaning up deletes files in `done/`, `cancelled/`
 and `dead/` whose modification time is older than their retention. Each call
 examines at most 1,000 directory entries and resumes its scan on the next
-call, including when a batch finds no expired jobs. Queue clones share the
-scan cursor; a completed sweep starts over on the next call.
+call, including when a batch finds no expired jobs: until a sweep ends, the
+worker comes back at its next keeper tick rather than a minute later. Queue
+clones share the scan cursor; a completed sweep starts over on the next call.
 
 ### Redis
 

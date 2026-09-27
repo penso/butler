@@ -12,9 +12,9 @@ use std::{
 use tracing::{Instrument, Span, field};
 
 use crate::{
-    Backoff, Config, Cron, DeadJob, Error, Failed, GlobalLimit, Job, JobContext, JobDef, JobError,
-    Layer, NewJob, Next, PreparedJob, Queue, QueuePriority, Recurring, RecurringConfig, Result,
-    RetryPolicy, RunFuture, WorkerConfig, block_on,
+    Backoff, Cleaned, Config, Cron, DeadJob, Error, Failed, GlobalLimit, Job, JobContext, JobDef,
+    JobError, Layer, NewJob, Next, PreparedJob, Queue, QueuePriority, Recurring, RecurringConfig,
+    Result, RetryPolicy, RunFuture, WorkerConfig, block_on,
     error::Chain,
     executor::panic_message,
     job::millis,
@@ -746,7 +746,8 @@ impl Worker {
     }
 
     /// Deletes a batch of finished jobs past the backend's retention, when
-    /// due: every [`CLEAN_INTERVAL`], or at once after a full batch. Only
+    /// due: every [`CLEAN_INTERVAL`], or at the next tick while the backend
+    /// reports more to look at (a full batch, or a scan budget spent). Only
     /// the keeper does it, never a thread about to run a job.
     fn clean_finished(&self) {
         let now = Instant::now();
@@ -764,13 +765,15 @@ impl Worker {
                 return;
             }
         }
-        let deleted = self.queue.clean_finished(SystemTime::now(), CLEAN_BATCH);
+        let cleaned = self.queue.clean_finished(SystemTime::now(), CLEAN_BATCH);
         let mut last = self.upkeep.lock().unwrap_or_else(PoisonError::into_inner);
         last.cleaned = Some(now);
-        last.clean_backlog = matches!(deleted, Ok(CLEAN_BATCH));
-        match deleted {
-            Ok(0) => {}
-            Ok(deleted) => tracing::debug!(deleted, "deleted finished jobs past their retention"),
+        last.clean_backlog = cleaned.as_ref().is_ok_and(|cleaned| cleaned.more);
+        match cleaned {
+            Ok(Cleaned { deleted: 0, .. }) => {}
+            Ok(Cleaned { deleted, .. }) => {
+                tracing::debug!(deleted, "deleted finished jobs past their retention")
+            }
             Err(err) => tracing::warn!(
                 worker = %self.id,
                 error = %Chain(&err),

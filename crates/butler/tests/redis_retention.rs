@@ -9,7 +9,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use butler::{JobState, Keep, Queue, RedisQueue, Retention};
+use butler::{Cleaned, JobState, Keep, Queue, RedisQueue, Retention};
 use serde_json::json;
 
 const HOUR: Duration = Duration::from_secs(3600);
@@ -75,7 +75,7 @@ fn done_and_cancelled_jobs_expire_after_keep_finished() {
     // Dead jobs are kept until cleaned up: forever, here.
     assert_eq!(ttl(&mut conn, &prefix, &dead), -1);
     let far = SystemTime::now() + 1000 * 24 * HOUR;
-    assert_eq!(queue.clean_finished(far, 100).unwrap(), 0);
+    assert_eq!(queue.clean_finished(far, 100).unwrap().deleted, 0);
     assert_eq!(queue.state(&dead), Some(JobState::Dead));
 }
 
@@ -135,7 +135,10 @@ fn dead_jobs_from_before_retention_count_from_the_first_cleanup() {
     queue.fail("w", job, "boom".into(), 0).unwrap();
 
     // All legacy jobs share a grace period, including ones beyond this batch.
-    assert_eq!(queue.clean_finished(SystemTime::now(), 1).unwrap(), 0);
+    assert_eq!(
+        queue.clean_finished(SystemTime::now(), 1).unwrap().deleted,
+        0
+    );
     let later = SystemTime::now() + 2 * HOUR;
     let seen: Option<u64> = redis::cmd("HGET")
         .arg(format!("{prefix}:job:{}", legacy[0]))
@@ -151,15 +154,60 @@ fn dead_jobs_from_before_retention_count_from_the_first_cleanup() {
         .into();
     for id in &legacy {
         assert_eq!(queue.state(id), Some(JobState::Dead));
-        assert_eq!(queue.clean_finished(later, 1).unwrap(), 1);
+        assert_eq!(queue.clean_finished(later, 1).unwrap().deleted, 1);
         assert_eq!(queue.state(id), None);
     }
     assert_eq!(queue.state(&new), Some(JobState::Dead));
-    assert_eq!(queue.clean_finished(later, 1).unwrap(), 1);
+    assert_eq!(queue.clean_finished(later, 1).unwrap().deleted, 1);
     assert_eq!(queue.state(&new), None);
     let dead: i64 = redis::cmd("LLEN")
         .arg(format!("{prefix}:dead"))
         .query(&mut conn)
         .unwrap();
     assert_eq!(dead, 0);
+}
+
+#[test]
+fn stale_dead_ids_spend_the_budget_and_ask_to_be_called_again() {
+    let retention = Retention {
+        finished: Keep::For(HOUR),
+        dead: Keep::For(HOUR),
+    };
+    let Some((queue, prefix, mut conn)) = connect("stale", retention) else {
+        return;
+    };
+    queue.heartbeat("w", HOUR).unwrap();
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        ids.push(queue.push("a", "default", vec![]).unwrap());
+        let job = queue
+            .claim("w", &["default"], Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        queue.fail("w", job, "boom".into(), 0).unwrap();
+    }
+    // The two oldest ids point at jobs that are gone.
+    for id in &ids[..2] {
+        let _: () = redis::cmd("DEL")
+            .arg(format!("{prefix}:job:{id}"))
+            .query(&mut conn)
+            .unwrap();
+    }
+    let later = SystemTime::now() + 2 * HOUR;
+    // Two stale ids fill a budget of two: nothing deleted, but more to see.
+    assert_eq!(
+        queue.clean_finished(later, 2).unwrap(),
+        Cleaned {
+            deleted: 0,
+            more: true
+        }
+    );
+    assert_eq!(
+        queue.clean_finished(later, 2).unwrap(),
+        Cleaned {
+            deleted: 1,
+            more: false
+        }
+    );
+    assert_eq!(queue.state(&ids[2]), None);
 }

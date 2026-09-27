@@ -90,7 +90,7 @@ use std::{
 
 use redis::{Client, Connection, RedisResult};
 
-use super::{GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
+use super::{Cleaned, GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
 use crate::{
     Error, JobId, JobRecord, JobState, RecurringRecord, Result, Retention, Signal,
     job::{from_millis, millis},
@@ -129,13 +129,15 @@ const FIELD_SEP: char = '\u{1f}';
 /// first, from the end of the dead list (KEYS[1]). ARGV[1] is the key prefix,
 /// ARGV[4] the current time (ms): a dead job without `finished_at` (from
 /// before retention) gets the shared migration time. Ids whose job is gone
-/// are dropped. Returns how many jobs it deleted.
+/// are dropped. Looks at ARGV[3] ids at most. Returns how many jobs it
+/// deleted, and 1 if it stopped at that budget rather than at a job too
+/// recent or the end of the list.
 const CLEAN_DEAD: &str = r"
 local p, cutoff, limit = ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3])
-local deleted = 0
+local deleted, more = 0, 1
 for _ = 1, limit do
   local id = redis.call('LINDEX', KEYS[1], -1)
-  if not id then break end
+  if not id then more = 0; break end
   local job = p .. 'job:' .. id
   local f = redis.call('HMGET', job, 'state', 'finished_at')
   if f[1] == 'dead' and not f[2] then
@@ -144,14 +146,15 @@ for _ = 1, limit do
     f[2] = redis.call('GET', migration)
     redis.call('HSET', job, 'finished_at', f[2])
   end
-  if f[1] == 'dead' and tonumber(f[2]) >= cutoff then break end
+  if f[1] == 'dead' and tonumber(f[2]) >= cutoff then more = 0; break end
   redis.call('RPOP', KEYS[1])
   if f[1] == 'dead' then
     redis.call('DEL', job)
     deleted = deleted + 1
   end
 end
-return deleted
+if limit == 0 then more = 0 end
+return {deleted, more}
 ";
 
 /// Stores a job's data (KEYS[2]) only while the job's id is still in the
@@ -1146,11 +1149,11 @@ impl Store for RedisQueue {
     }
 
     /// Done and cancelled jobs expire on their own; this deletes dead ones.
-    fn clean_finished(&self, now: SystemTime, limit: usize) -> Result<usize> {
+    fn clean_finished(&self, now: SystemTime, limit: usize) -> Result<Cleaned> {
         let Some(cutoff) = self.retention.dead.cutoff(now) else {
-            return Ok(0);
+            return Ok(Cleaned::default());
         };
-        self.with_conn(|con| {
+        let (deleted, more): (usize, u8) = self.with_conn(|con| {
             redis::cmd("EVAL")
                 .arg(CLEAN_DEAD)
                 .arg(1)
@@ -1160,6 +1163,10 @@ impl Store for RedisQueue {
                 .arg(limit)
                 .arg(millis(SystemTime::now()))
                 .query(con)
+        })?;
+        Ok(Cleaned {
+            deleted,
+            more: more > 0,
         })
     }
 

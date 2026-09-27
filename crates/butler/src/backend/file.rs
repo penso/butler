@@ -76,7 +76,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use super::{GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
+use super::{Cleaned, GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
 use crate::{
     JobId, JobRecord, JobState, RecurringRecord, Result, Retention,
     job::{DEFAULT_QUEUE, from_millis, millis},
@@ -923,9 +923,12 @@ impl Store for FileQueue {
         Ok(Some(job.id))
     }
 
-    fn clean_finished(&self, now: SystemTime, limit: usize) -> Result<usize> {
+    /// Reads at most [`CLEAN_SCAN_BATCH`] entries per call, resuming where
+    /// the last call stopped: `more` is set until a pass over the three
+    /// directories ends.
+    fn clean_finished(&self, now: SystemTime, limit: usize) -> Result<Cleaned> {
         if limit == 0 {
-            return Ok(0);
+            return Ok(Cleaned::default());
         }
         let mut cursor = self.cleanup.lock().unwrap_or_else(PoisonError::into_inner);
         let mut deleted = 0;
@@ -935,6 +938,7 @@ impl Store for FileQueue {
             (JobState::Dead, self.retention.dead),
         ];
         let mut scanned = 0;
+        let mut more = true;
         while scanned < CLEAN_SCAN_BATCH && deleted < limit {
             let (state, keep) = states[cursor.state];
             let cutoff = keep.cutoff(now);
@@ -950,6 +954,7 @@ impl Store for FileQueue {
                 cursor.entries = None;
                 cursor.state = (cursor.state + 1) % states.len();
                 if cursor.state == 0 {
+                    more = false;
                     break;
                 }
                 continue;
@@ -971,7 +976,7 @@ impl Store for FileQueue {
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok(deleted)
+        Ok(Cleaned { deleted, more })
     }
 
     fn describe(&self) -> String {
@@ -1257,10 +1262,10 @@ mod tests {
         assert!(queue.cancel(&id).unwrap());
 
         let soon = SystemTime::now() + HOUR / 2;
-        assert_eq!(queue.clean_finished(soon, 10).unwrap(), 0);
+        assert_eq!(queue.clean_finished(soon, 10).unwrap().deleted, 0);
         assert_eq!(queue.get(&id).unwrap().unwrap().0, JobState::Cancelled);
         let later = SystemTime::now() + 2 * HOUR;
-        assert_eq!(queue.clean_finished(later, 10).unwrap(), 1);
+        assert_eq!(queue.clean_finished(later, 10).unwrap().deleted, 1);
         assert!(queue.get(&id).unwrap().is_none());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1292,7 +1297,11 @@ mod tests {
             // has read the record or released its unique key.
             assert!(queue.cancel_file(&source, &published).unwrap());
             assert_eq!(
-                queue.clone().clean_finished(SystemTime::now(), 10).unwrap(),
+                queue
+                    .clone()
+                    .clean_finished(SystemTime::now(), 10)
+                    .unwrap()
+                    .deleted,
                 0
             );
             assert_eq!(queue.get(&id).unwrap().unwrap().0, JobState::Cancelled);
@@ -1322,29 +1331,37 @@ mod tests {
             .unwrap()
             .set_modified(SystemTime::now() - 2 * HOUR)
             .unwrap();
+        // Nothing deleted, but the budget ran out: the keeper must come back
+        // at its next tick, not in a minute.
         assert_eq!(
             queue.clean_finished(SystemTime::now(), usize::MAX).unwrap(),
-            0
+            Cleaned {
+                deleted: 0,
+                more: true
+            }
         );
         assert!(dead.exists(), "the first pass must stop at its scan budget");
+        // The next call resumes (not restarts at done/) and ends the pass.
         assert_eq!(
             queue
                 .clone()
                 .clean_finished(SystemTime::now(), usize::MAX)
                 .unwrap(),
-            1
+            Cleaned {
+                deleted: 1,
+                more: false
+            }
         );
-        assert!(
-            !dead.exists(),
-            "the next pass must resume, not restart at done/"
-        );
-        // A completed sweep resets the cursor so formerly fresh files are
+        assert!(!dead.exists());
+        // A completed pass resets the cursor, so formerly fresh files are
         // reconsidered once their retention expires.
+        let later = SystemTime::now() + 2 * HOUR;
+        let first = queue.clean_finished(later, usize::MAX).unwrap();
+        assert_eq!(first.deleted, CLEAN_SCAN_BATCH);
+        assert!(first.more, "stopped at its budget");
         assert_eq!(
-            queue
-                .clean_finished(SystemTime::now() + 2 * HOUR, usize::MAX)
-                .unwrap(),
-            CLEAN_SCAN_BATCH
+            queue.clean_finished(later, usize::MAX).unwrap(),
+            Cleaned::default()
         );
         let _ = fs::remove_dir_all(&dir);
     }

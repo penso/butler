@@ -168,17 +168,18 @@ pub trait Store: Send + Sync + 'static {
     /// Deletes up to `limit` finished jobs old enough at `now` under the
     /// backend's [`Retention`](crate::Retention): done and cancelled jobs
     /// that finished more than `finished` ago, dead ones more than `dead`
-    /// ago. Returns how many it deleted. Jobs in any other state are never
+    /// ago. Returns how many it deleted, and whether it stopped at `limit`
+    /// or at a budget of its own before running out of candidates, so more
+    /// may be old enough already. Jobs in any other state are never
     /// touched, and neither is anything a live job relies on: unique keys,
     /// concurrency and limit slots are held by jobs that haven't finished,
     /// and recurring ticks are kept on their own. Workers call it
-    /// periodically. A call may stop at its scan budget before filling the
-    /// deletion limit; a short batch does not guarantee the backlog is empty.
-    /// A backend may expire finished jobs on its own instead
+    /// periodically, and again at once while [`Cleaned::more`] is set. A
+    /// backend may expire finished jobs on its own instead
     /// (Redis expires done and cancelled jobs), and may keep its most
     /// recently finished job. Default: deletes nothing.
-    fn clean_finished(&self, _now: SystemTime, _limit: usize) -> Result<usize> {
-        Ok(0)
+    fn clean_finished(&self, _now: SystemTime, _limit: usize) -> Result<Cleaned> {
+        Ok(Cleaned::default())
     }
 
     /// Whether calls can block on I/O (network, disk). Async callers send
@@ -367,6 +368,16 @@ pub struct Promoted {
     pub moved: usize,
     /// When the next job still scheduled is due, if any.
     pub next: Option<SystemTime>,
+}
+
+/// What [`Store::clean_finished`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Cleaned {
+    /// Finished jobs deleted.
+    pub deleted: usize,
+    /// It stopped at its limit or its scan budget, not because nothing old
+    /// enough was left: call again soon rather than at the next interval.
+    pub more: bool,
 }
 
 /// How long backends remember that a recurring tick was enqueued. A tick is
@@ -638,7 +649,7 @@ impl Queue {
 
     /// Deletes up to `limit` finished jobs older than the backend's
     /// retention allows; see [`Store::clean_finished`].
-    pub fn clean_finished(&self, now: SystemTime, limit: usize) -> Result<usize> {
+    pub fn clean_finished(&self, now: SystemTime, limit: usize) -> Result<Cleaned> {
         self.0.clean_finished(now, limit)
     }
 

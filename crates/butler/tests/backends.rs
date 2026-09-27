@@ -1678,18 +1678,29 @@ fn a_global_limit_and_concurrency_keys_apply_together() {
     }
 }
 
-/// Cleans up at `now` in batches of `batch`, until a batch comes back short;
-/// returns how many it deleted.
+/// Cleans up at `now` in batches of `batch` while the backend reports more,
+/// as the keeper does; returns how many it deleted. Once it reports no more,
+/// nothing old enough is left.
 fn clean_all(queue: &Queue, now: SystemTime, batch: usize) -> usize {
+    let name = queue.describe();
     let mut deleted = 0;
-    loop {
-        let n = queue.clean_finished(now, batch).unwrap();
-        assert!(n <= batch, "{}: {n} > {batch}", queue.describe());
-        deleted += n;
-        if n < batch {
+    for _ in 0..1_000 {
+        let cleaned = queue.clean_finished(now, batch).unwrap();
+        assert!(cleaned.deleted <= batch, "{name}: {cleaned:?} > {batch}");
+        if cleaned.deleted == batch {
+            assert!(cleaned.more, "{name}: a full batch must report more");
+        }
+        deleted += cleaned.deleted;
+        if !cleaned.more {
+            let again = queue.clean_finished(now, batch).unwrap();
+            assert_eq!(
+                again.deleted, 0,
+                "{name}: {again:?} after reporting no more"
+            );
             return deleted;
         }
     }
+    panic!("{name}: still reporting more after 1,000 calls");
 }
 
 #[test]
@@ -1752,7 +1763,10 @@ fn finished_jobs_past_their_retention_are_deleted_in_batches_and_nothing_else() 
 
         // Nothing is old enough yet.
         assert_eq!(
-            queue.clean_finished(SystemTime::now(), 100).unwrap(),
+            queue
+                .clean_finished(SystemTime::now(), 100)
+                .unwrap()
+                .deleted,
             0,
             "{name}"
         );
@@ -1840,7 +1854,7 @@ fn keeping_forever_deletes_nothing() {
         assert!(queue.cancel(&cancelled).unwrap());
 
         let far = SystemTime::now() + 1000 * 24 * HOUR;
-        assert_eq!(queue.clean_finished(far, 100).unwrap(), 0, "{name}");
+        assert_eq!(queue.clean_finished(far, 100).unwrap().deleted, 0, "{name}");
         assert_eq!(queue.state(&done), Some(JobState::Done), "{name}");
         assert_eq!(queue.state(&dead), Some(JobState::Dead), "{name}");
         assert_eq!(queue.state(&cancelled), Some(JobState::Cancelled), "{name}");

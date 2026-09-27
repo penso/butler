@@ -78,7 +78,7 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use super::{GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
+use super::{Cleaned, GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
 use crate::{
     Error, JobId, JobRecord, JobState, RecurringRecord, Result, Retention, Signal,
     job::{from_millis, millis},
@@ -862,7 +862,7 @@ impl Store for SqliteQueue {
 
     /// One `DELETE` per state, each through the `(state, finished_at)`
     /// index, so a batch costs its own rows rather than the table.
-    fn clean_finished(&self, now: SystemTime, limit: usize) -> Result<usize> {
+    fn clean_finished(&self, now: SystemTime, limit: usize) -> Result<Cleaned> {
         let mut deleted = 0;
         for (state, keep) in [
             (JobState::Done, self.retention.finished),
@@ -887,7 +887,10 @@ impl Store for SqliteQueue {
                 break;
             }
         }
-        Ok(deleted)
+        Ok(Cleaned {
+            deleted,
+            more: deleted == limit,
+        })
     }
 
     fn describe(&self) -> String {
@@ -1527,10 +1530,10 @@ mod tests {
 
         // Not old enough yet: they finished, as far as we know, just now.
         let soon = SystemTime::now() + Duration::from_secs(1800);
-        assert_eq!(queue.clean_finished(soon, 100).unwrap(), 0);
+        assert_eq!(queue.clean_finished(soon, 100).unwrap().deleted, 0);
         // Later, all go but the pending job and the last one to finish.
         let later = SystemTime::now() + Duration::from_secs(7200);
-        assert_eq!(queue.clean_finished(later, 100).unwrap(), 3);
+        assert_eq!(queue.clean_finished(later, 100).unwrap().deleted, 3);
         for id in ["1-1-0", "2-1-0", "3-1-0"] {
             assert!(queue.get(id).unwrap().is_none(), "{id}");
         }
@@ -1555,7 +1558,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(seq("5-1-0"), 5);
-        assert_eq!(queue.clean_finished(later, 100).unwrap(), 1);
+        assert_eq!(queue.clean_finished(later, 100).unwrap().deleted, 1);
         assert!(queue.get("4-1-0").unwrap().is_none());
         let _ = std::fs::remove_file(&path);
     }

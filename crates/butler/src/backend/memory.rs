@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use super::{GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
+use super::{Cleaned, GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
 use crate::{
     JobId, JobRecord, JobState, RecurringRecord, Result, Retention, Signal,
     job::{from_millis, millis},
@@ -574,7 +574,7 @@ impl Store for MemoryQueue {
     }
 
     /// Every call is a few map updates under a lock.
-    fn clean_finished(&self, now: SystemTime, limit: usize) -> Result<usize> {
+    fn clean_finished(&self, now: SystemTime, limit: usize) -> Result<Cleaned> {
         let mut state = self.lock();
         let retention = state.retention;
         let mut deleted = 0;
@@ -583,7 +583,10 @@ impl Store for MemoryQueue {
                 deleted += state.clean(dead, millis(cutoff), limit - deleted);
             }
         }
-        Ok(deleted)
+        Ok(Cleaned {
+            deleted,
+            more: deleted == limit,
+        })
     }
 
     fn blocks(&self) -> bool {

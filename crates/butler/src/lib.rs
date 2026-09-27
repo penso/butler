@@ -55,7 +55,8 @@ pub use arg::JobArg;
 #[cfg(feature = "redis")]
 pub use backend::RedisQueue;
 pub use backend::{
-    Backend, FileQueue, GlobalLimit, MemoryQueue, Monitor, NewJob, Promoted, Queue, Store, Watch,
+    Backend, Cleaned, FileQueue, GlobalLimit, MemoryQueue, Monitor, NewJob, Promoted, Queue, Store,
+    Watch,
 };
 #[cfg(feature = "sqlite")]
 pub use backend::{SQLITE_WATCH_TICK, SqliteQueue};

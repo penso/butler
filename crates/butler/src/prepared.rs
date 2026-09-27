@@ -106,6 +106,17 @@ impl<T> PreparedJob<T> {
         }
     }
 
+    /// Runs the job's body right now, in this process, and returns its
+    /// output, like [`JobCall::now`](crate::JobCall::now): once, with no
+    /// retries, ignoring its queue and any run time.
+    pub async fn now(self) -> Result<T, crate::JobError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let output = crate::call::run_now(self.def, self.args).await?;
+        serde_json::from_value(output).map_err(crate::JobError::Output)
+    }
+
     /// Enqueues this one job, or schedules it if it has a run time.
     pub async fn enqueue(self) -> Result<JobHandle<T>> {
         crate::__private::enqueue_on(self.def, &self.queue, self.args, self.run_at).await

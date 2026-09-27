@@ -38,11 +38,12 @@ after crashes. Reliability and correct job lifecycle semantics come first.
   `butler` pins the macros with `=`. The macro's output may only call
   `butler::__private` items that exist in that exact version.
 - In normal operation, `.await` on a `#[job]` function enqueues rather than
-  running the body (inline testing is the explicit exception). Keep the enqueue
-  return type distinct from the job's own.
+  running the body (inline testing is the explicit exception; `.now()` is the
+  explicit way to run it in place). Keep the enqueue return type distinct from
+  the job's own.
 - Macro-generated calls convert and serialize arguments before constructing the
-  enqueue future. Preserve its `Send + 'static` guarantee and the `JobArg<T>`
-  conversions, including integer-literal inference.
+  `JobCall`. Preserve its `Send + 'static` guarantee (and its futures') and the
+  `JobArg<T>` conversions, including integer-literal inference.
 - Persisted job names, argument shapes, and progress are compatibility contracts.
   Stable `#[job(name = "...")]` names survive Rust function renames. Keep macro
   and runtime queue-name validation aligned. Cross-crate jobs may need explicit

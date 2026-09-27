@@ -9,6 +9,9 @@
 //! let job = send_email("a@b.c", "hi").await?;
 //! job.cancel().await?;   // or job.state(), job.wait(interval), ... (see [`JobHandle`])
 //!
+//! // Or run it right here and get its output, like `perform_now` (see [`JobCall`]).
+//! send_email("a@b.c", "hi").now().await?;
+//!
 //! // Elsewhere (same binary/crate that defines the jobs):
 //! butler::Worker::from_config(&butler::Config::load()?)?.run();
 //! ```
@@ -23,6 +26,7 @@
 
 mod arg;
 mod backend;
+mod call;
 mod config;
 mod error;
 mod executor;
@@ -51,6 +55,7 @@ pub use backend::{
 #[cfg(feature = "sqlite")]
 pub use backend::{SQLITE_WATCH_TICK, SqliteQueue};
 pub use butler_macros::job;
+pub use call::{Enqueueing, JobCall};
 pub use config::{
     BackendKind, Config, FileConfig, QueueConfig, QueueEntry, RedisConfig, SqliteConfig,
     WorkerConfig,
@@ -239,6 +244,15 @@ pub mod __private {
     }
 
     inventory::collect!(crate::JobDef);
+
+    /// What calling a `#[job]` function returns: its arguments, serialized,
+    /// ready to enqueue or to run now.
+    pub fn call<T, const N: usize>(
+        job: &'static crate::JobDef,
+        values: [serde_json::Result<serde_json::Value>; N],
+    ) -> crate::JobCall<T> {
+        crate::JobCall::new(job, values.into_iter().collect())
+    }
 
     /// Collects the serialized arguments of one enqueue call.
     pub fn args<const N: usize>(

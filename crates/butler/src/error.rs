@@ -78,10 +78,21 @@ pub enum JobError {
         source: serde_json::Error,
     },
 
+    /// Running a job with [`JobCall::now`](crate::JobCall::now), its
+    /// arguments could not be serialized.
+    #[error("{job}: arguments could not be serialized")]
+    Arguments {
+        job: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+
     #[error("job panicked: {message}")]
     Panicked { message: String },
 
-    #[error("job output could not be serialized")]
+    /// The job's output could not be serialized, or, with
+    /// [`JobCall::now`](crate::JobCall::now), read back as its type.
+    #[error("job output could not be (de)serialized")]
     Output(#[source] serde_json::Error),
 
     /// The saved progress no longer fits the job's `Progress` type, for

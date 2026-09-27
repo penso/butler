@@ -53,7 +53,8 @@ types, and the `reports` module belong to your application. See
 ## Features
 
 - **Typed calls and results.** Ordinary Rust functions, borrow-friendly
-  arguments, `Send + 'static` enqueue futures, and `JobHandle<T>` results.
+  arguments, `Send + 'static` job calls, and `JobHandle<T>` results. Run a job
+  in place with `.now()` when you need its output right away.
 - **Durable queues.** Redis for workers across servers, SQLite or files for
   local processes, and an in-memory backend for tests and single-process apps.
 - **Recovery and retries.** Worker heartbeats recover abandoned jobs; failed
@@ -89,6 +90,7 @@ crashes; storage durability still depends on the backend's configuration.
 - [Usage](#usage)
   - [Defining jobs](#defining-jobs)
   - [Working with an enqueued job](#working-with-an-enqueued-job)
+  - [Running a job now](#running-a-job-now)
   - [Bulk enqueuing](#bulk-enqueuing)
   - [Scheduling jobs](#scheduling-jobs)
   - [Retries and backoff](#retries-and-backoff)
@@ -166,9 +168,9 @@ still validated at runtime.
 - **Early validation.** An invalid queue name in `#[job(queue = "...")]` or
   a job output that isn't `Serialize` fails at compile time. Duplicate job
   names are rejected when the worker is constructed.
-- **Futures you can move around.** The enqueue future is `Send + 'static`
-  whatever you pass it: arguments are converted and serialized during the call,
-  so it never borrows them. Hand it to `tokio::spawn`, store it, race it.
+- **Calls you can move around.** A job call is `Send + 'static` whatever you
+  pass it: arguments are converted and serialized during the call, so it never
+  borrows them. Store it, race it, or hand `.enqueue()` to `tokio::spawn`.
 - **Errors without anyhow.** The library's errors are `thiserror` enums
   (`butler::Error`, `butler::JobError`) you can match on. Jobs return any error
   that converts into `Box<dyn Error + Send + Sync>`: your own enum, `io::Error`,
@@ -242,7 +244,7 @@ let report: Option<demo::TickReport> = job.result().await?;   // (3) check the r
 1. **Regular async/await.** The future runs right here, in this process, on the
    tokio runtime. The line finishes once the 200ms have passed.
 2. **Enqueuing a butler job.** Calling the function converts and serializes
-   its arguments; awaiting the returned future writes the job to the queue
+   its arguments into a `JobCall`; awaiting it writes the job to the queue
    and returns a typed handle. It doesn't wait for the job body to run. A
    worker picks up the job, possibly on another machine and possibly later.
 3. **Reading the result.** `job.result().await?` asks the backend for the
@@ -251,9 +253,12 @@ let report: Option<demo::TickReport> = job.result().await?;   // (3) check the r
    `job.wait_result(interval).await?` to wait and distinguish success from
    failure or cancellation.
 
-These are ordinary Rust futures: enqueue calls can also be used with
-`tokio::join!` or `tokio::spawn`. That composes the enqueue operations in the
-caller; the job bodies still execute independently in workers.
+A `JobCall` turns into an ordinary Rust future when awaited (it implements
+`IntoFuture`), so enqueue calls also work with `tokio::join!`; for
+`tokio::spawn`, which takes a `Future`, pass `send_email(..).enqueue()`. That
+composes the enqueue operations in the caller; the job bodies still execute
+independently in workers. To run a body here instead, and get its output, use
+[`.now()`](#running-a-job-now).
 
 ### How Rust tells them apart
 
@@ -274,17 +279,15 @@ async fn send_email(to: String, retries: u32) -> Result<MessageId, MailError> {
 the compiler sees roughly:
 
 ```rust
-// 1. What callers get: a function whose only job is to enqueue. Each argument
-//    is converted (`&str` -> `String`) and serialized right away, and the
-//    future writes the job to the queue. Its output type is computed from the
-//    job's return type: `Result<MessageId, _>` gives a `JobHandle<MessageId>`.
-pub fn send_email(to: impl JobArg<String>, retries: impl JobArg<u32>)
-    -> impl Future<Output = Result<JobHandle<MessageId>, butler::Error>> + Send + 'static
-{
+// 1. What callers get: a function that only builds the call. Each argument is
+//    converted (`&str` -> `String`) and serialized right away. Awaiting the
+//    `JobCall` writes the job to the queue; `.now()` runs (3) in place. Its
+//    output type is computed from the job's return type: `Result<MessageId, _>`
+//    gives a `JobHandle<MessageId>` when awaited, a `MessageId` from `.now()`.
+pub fn send_email(to: impl JobArg<String>, retries: impl JobArg<u32>) -> JobCall<MessageId> {
     let to: String = to.into_arg();
     let retries: u32 = retries.into_arg();
-    let args = butler::__private::args([to_value(&to), to_value(&retries)]);
-    async move { butler::__private::enqueue(&send_email::JOB, args?).await }
+    butler::__private::call(&send_email::JOB, [to_value(&to), to_value(&retries)])
 }
 
 // 2. Your original body, under a hidden name. Only the worker calls it.
@@ -316,7 +319,7 @@ inventory::submit! { send_email::JOB }
 
 So `send_email(...).await` in your app resolves to (1). The worker never calls
 `send_email`: it runs (3), which decodes the arguments and runs your original
-body (2). A function and a module can share the name `send_email` because Rust
+body (2). `send_email(...).now()` runs (3) too, in your process. A function and a module can share the name `send_email` because Rust
 keeps values and types in separate namespaces.
 
 The return type also shows the difference. The enqueue returns
@@ -567,8 +570,8 @@ pub fn thumbnail(path: PathBuf) -> Result<Vec<u8>, ImageError> { ... }
   `Into<T>` on purpose: with `impl Into<u32>`, a bare `3` doesn't compile. It
   also means `"text".into()` at a call site is now ambiguous; drop the `.into()`.
 - The arguments are converted and serialized when you call the function, so the
-  returned future is `Send + 'static` and never borrows them. You can pass it
-  to `tokio::spawn`.
+  returned `JobCall` is `Send + 'static` and never borrows them, and so are the
+  futures it becomes. `tokio::spawn(send_email(..).enqueue())` works.
 - The function may return `()`, or `Result<T, E>` where `T` can be serialized
   and `E` is any error: your own `thiserror` enum, `std::io::Error`, a `String`
   message, or anything else that converts into `butler::BoxError`
@@ -599,6 +602,34 @@ job.wait(Duration::from_millis(100)).await?; // poll until Done, Dead or Cancell
 job.result().await?;                        // Some(T) once done, None before
 job.wait_result(Duration::from_millis(100)).await?; // T, or the failure
 ```
+
+### Running a job now
+
+Sometimes the caller needs the job's work done before it continues: a
+command-line tool, a request that can't return without it, a job that runs
+another as one of its steps. `.now()` runs the body right here, like
+ActiveJob's `perform_now`, and returns its real output:
+
+```rust
+let id: MessageId = send_email("ada@example.com", "Welcome").now().await?;
+
+// Prepared jobs too; their queue and run time are ignored.
+let id = send_email::prepare("ada@example.com", "Welcome")?.now().await?;
+```
+
+- Nothing is enqueued and no worker is involved. The arguments still go
+  through JSON and the job's generated code, exactly as on a worker.
+- It runs once. There are no retries, no backoff and no scheduling: the
+  result is `Result<T, butler::JobError>`, and a failure is
+  `JobError::Failed` holding the job's own error
+  (`failure.into_inner().downcast::<MailError>()`).
+- A plain `fn` job runs on tokio's blocking pool inside a runtime, as on a
+  worker, and in place without one: `butler::block_on(job(..).now())` works in
+  a program with no runtime. A panic in it comes back as `JobError::Panicked`.
+  An `async fn` job runs in your task, so a panic in it propagates, like any
+  function call.
+- A `Progress` starts from its default; checkpoints are neither saved nor
+  interrupted.
 
 ### Bulk enqueuing
 

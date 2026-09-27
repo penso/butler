@@ -9,10 +9,11 @@
 //!
 //! into:
 //! - `fn send_email(to: impl JobArg<String>, subject: impl JobArg<String>)`,
-//!   returning a `Send + 'static` future of `Result<JobHandle, butler::Error>`.
-//!   Awaiting it pushes a job onto the queue (like `perform_async`). The
-//!   arguments are converted and serialized during the call, so the future
-//!   never borrows them.
+//!   returning a `Send + 'static` `butler::JobCall`. Awaiting it pushes a job
+//!   onto the queue (like `perform_async`) and returns a `JobHandle`;
+//!   `.now().await` runs the body here instead and returns its output (like
+//!   `perform_now`). The arguments are converted and serialized during the
+//!   call, so the `JobCall` never borrows them.
 //! - a hidden `__butler_perform_send_email` holding the original body.
 //! - a registration entry so any `Worker` in the same binary can dispatch it by name.
 //!
@@ -244,18 +245,12 @@ fn expand(func: ItemFn, attrs: Attrs) -> syn::Result<proc_macro2::TokenStream> {
     Ok(quote! {
         #(#attrs)*
         #vis fn #name(#(#idents: impl ::butler::JobArg<#types>),*)
-            -> impl ::core::future::Future<
-                Output = ::core::result::Result<
-                    ::butler::JobHandle<<#returns as ::butler::IntoJobResult>::Output>,
-                    ::butler::Error,
-                >,
-            > + ::core::marker::Send + 'static
+            -> ::butler::JobCall<<#returns as ::butler::IntoJobResult>::Output>
         {
             #(let #idents: #types = ::butler::JobArg::into_arg(#idents);)*
-            let args = ::butler::__private::args([
+            ::butler::__private::call(&#name::JOB, [
                 #(::butler::__private::serde_json::to_value(&#idents)),*
-            ]);
-            async move { ::butler::__private::enqueue(&#name::JOB, args?).await }
+            ])
         }
 
         #[doc(hidden)]

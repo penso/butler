@@ -15,9 +15,10 @@ impl Wake for ThreadWaker {
 }
 
 /// Runs a future to completion on the current thread, with no runtime needed.
-/// The thread parks until the future's waker fires.
-pub fn block_on<F: Future>(fut: F) -> F::Output {
-    let mut fut = pin!(fut);
+/// The thread parks until the future's waker fires. It takes anything that
+/// `.await` takes, so `block_on(send_email(..))` enqueues a job.
+pub fn block_on<F: IntoFuture>(fut: F) -> F::Output {
+    let mut fut = pin!(fut.into_future());
     let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
     let mut cx = Context::from_waker(&waker);
     loop {

@@ -242,7 +242,122 @@ async fn a_base_path_prefixes_every_link() {
         "",
     )
     .await;
-    assert_eq!(location.as_deref(), Some("/admin/jobs/"));
+    assert_eq!(location.as_deref(), Some("/admin/jobs"));
+}
+
+#[tokio::test]
+async fn error_pages_keep_the_base_path() {
+    let f = fixture("/admin/jobs");
+    let app = Router::new().nest("/admin/jobs", f.app.clone());
+    let pages = [
+        (
+            "/admin/jobs/jobs/nope",
+            StatusCode::NOT_FOUND,
+            "job nope not found",
+        ),
+        (
+            "/admin/jobs/no-such-page",
+            StatusCode::NOT_FOUND,
+            "page not found",
+        ),
+    ];
+    for (uri, expected, message) in pages {
+        let (status, html) = get(&app, uri).await;
+        assert_eq!(status, expected, "{uri}");
+        assert!(html.contains(message), "{uri}");
+        assert!(
+            html.contains(r#"href="/admin/jobs/assets/app.css""#),
+            "{uri}"
+        );
+        assert!(html.contains(r#"data-base="/admin/jobs""#), "{uri}");
+        assert!(
+            html.contains(r#"href="/admin/jobs/jobs?state=dead""#),
+            "{uri}"
+        );
+        assert!(!html.contains(r#"href="/""#), "{uri}: a link to the root");
+    }
+
+    // Errors from actions, too.
+    let (status, html) = post_page(&app, "/admin/jobs/queues/bad%20queue/pause").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        html.contains(r#"href="/admin/jobs""#),
+        "back to the dashboard"
+    );
+    assert!(!html.contains(r#"href="/""#));
+}
+
+/// Every `href="…"` in `html`.
+fn links(html: &str) -> Vec<String> {
+    html.split(r#"href=""#)
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+async fn links_home_resolve_under_a_nested_base_path() {
+    let f = fixture("/admin/jobs");
+    let app = Router::new().nest("/admin/jobs", f.app.clone());
+    // axum serves a nested router's root at the bare prefix only:
+    // "/admin/jobs/" is not found.
+    let (status, _) = get(&app, "/admin/jobs/").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    for page in ["/admin/jobs/workers", "/admin/jobs/jobs/nope"] {
+        let (_, html) = get(&app, page).await;
+        let links = links(&html);
+        assert!(
+            links.iter().any(|link| link == "/admin/jobs"),
+            "{page}: {links:?}"
+        );
+        for link in links.iter().filter(|link| !link.contains("/assets/")) {
+            let (status, _) = get(&app, link).await;
+            assert_eq!(status, StatusCode::OK, "{page} links to {link}");
+        }
+    }
+
+    // After an action with no page to return to, back to the dashboard.
+    let (_, location) = post(
+        &app,
+        &format!("/admin/jobs/jobs/{}/retry", f.dead),
+        "same-origin",
+        "",
+    )
+    .await;
+    assert_eq!(location.as_deref(), Some("/admin/jobs"));
+    let (status, _) = get(&app, location.as_deref().unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn error_pages_at_the_root_link_to_the_root() {
+    let f = fixture("");
+    for uri in ["/jobs/nope", "/no-such-page"] {
+        let (status, html) = get(&f.app, uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert!(html.contains(r#"href="/assets/app.css""#), "{uri}");
+        assert!(html.contains(r#"href="/""#), "{uri}");
+    }
+}
+
+/// A same-origin POST, returning the page it answers with.
+async fn post_page(app: &Router, uri: &str) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(uri)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
 }
 
 #[tokio::test]

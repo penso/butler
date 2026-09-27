@@ -21,14 +21,14 @@
 <body class="min-h-screen" data-base="{{ base }}">
   <header class="sticky top-0 z-10 border-b border-[var(--border)] bg-[var(--bg)]/85 backdrop-blur">
     <div class="mx-auto flex max-w-7xl items-center gap-4 px-6 py-3">
-      <a href="{{ base }}/" class="flex items-center gap-2 font-semibold tracking-tight">
+      <a href="{{ base }}{% if base.is_empty() %}/{% endif %}" class="flex items-center gap-2 font-semibold tracking-tight">
         <span class="grid h-7 w-7 place-items-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent)]">
           <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h10M4 17h6"/><circle cx="18" cy="16" r="3"/></svg>
         </span>
         butler
       </a>
       <nav class="flex items-center gap-1">
-        <a href="{{ base }}/" class="nav-link {% if nav == "dashboard" %}active{% endif %}">Dashboard</a>
+        <a href="{{ base }}{% if base.is_empty() %}/{% endif %}" class="nav-link {% if nav == "dashboard" %}active{% endif %}">Dashboard</a>
         <a href="{{ base }}/jobs?state=dead" class="nav-link {% if nav == "jobs" %}active{% endif %}">Jobs</a>
         <a href="{{ base }}/recurring" class="nav-link {% if nav == "recurring" %}active{% endif %}">Recurring</a>
         <a href="{{ base }}/workers" class="nav-link {% if nav == "workers" %}active{% endif %}">Workers</a>

@@ -99,11 +99,7 @@ pub(crate) async fn dashboard(
         jobs: views::summarize(&buckets).into_iter().take(12).collect(),
         snapshot_json: script_json(&snapshot),
         // The dashboard itself: a nested router serves it at the bare base.
-        return_to: if state.base.is_empty() {
-            "/".to_owned()
-        } else {
-            state.base.clone()
-        },
+        return_to: crate::home(&state.base),
     };
     Ok(Html(page.render()?))
 }

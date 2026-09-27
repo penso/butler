@@ -64,14 +64,17 @@ types, and the `reports` module belong to your application. See
   metadata, vetoes, a tracing span per run, and an `on_dead` hook for alerts.
 - **Scheduled jobs.** Run a job in five minutes or at 03:00 with
   `prepare(..)?.run_in(..)` or `.run_at(..)`, and cancel it while it waits.
+- **Recurring jobs.** Cron schedules in `butler.toml` or code, in UTC or a
+  named time zone, enqueued exactly once per tick however many workers run.
 - **Resumable work.** Typed checkpoints let long jobs continue after a deploy,
   crash, or failed attempt.
 - **Controlled concurrency.** Named queues, strict or weighted priority,
-  per-queue limits, per-key limits across workers ("one sync per account"),
-  unique jobs, and bulk enqueueing. Async jobs run as Tokio tasks;
+  per-queue limits per worker or across all workers, per-key limits across
+  workers ("one sync per account"), unique jobs, and bulk enqueueing. Async jobs run as Tokio tasks;
   synchronous jobs use its blocking pool. A thread worker also runs without Tokio.
 - **Built-in visibility.** A live web dashboard for throughput, workers,
-  queues, job details, scheduled jobs, and retry/cancel/discard/run-now actions.
+  queues, job details, scheduled and recurring jobs, retry/cancel/discard/run-now
+  actions, and pausing or resuming a queue.
 
 Delivery is **at least once**: jobs must be safe to repeat, including work done
 since the last saved checkpoint. Durable backends recover work after worker
@@ -96,6 +99,7 @@ crashes; storage durability still depends on the backend's configuration.
   - [Running a job now](#running-a-job-now)
   - [Bulk enqueuing](#bulk-enqueuing)
   - [Scheduling jobs](#scheduling-jobs)
+  - [Recurring jobs](#recurring-jobs)
   - [Retries and backoff](#retries-and-backoff)
   - [Results](#results)
   - [Running a worker](#running-a-worker)
@@ -215,7 +219,8 @@ each. See [Concurrency and cores](#concurrency-and-cores) for tuning.
 
 `butler-web` shows live counts streamed over server-sent events, throughput and
 duration charts, queues, workers, and job details. Retry or discard failed
-jobs, cancel pending work, run scheduled jobs now, and inspect arguments,
+jobs, cancel pending work, run scheduled jobs now, pause and resume queues,
+see each recurring schedule's next and last run, and inspect arguments,
 results, errors, and saved progress from one place.
 
 ![butler-web dashboard, dark theme](https://raw.githubusercontent.com/penso/butler/main/docs/images/dashboard-dark.png)
@@ -709,6 +714,64 @@ promotes them every 250 ms, so they move even while every worker is busy. How
 each backend stores them is under [Backends](#backends). The dashboard lists
 them in a Scheduled tab, with "Run now" and "Cancel".
 
+### Recurring jobs
+
+Jobs enqueued on a cron schedule, like Solid Queue's `recurring.yml`: a
+nightly report, an hourly cleanup. Declare them in `butler.toml`:
+
+```toml
+[[recurring]]
+job = "nightly_report"        # the job's name: its function, or #[job(name = "...")]
+cron = "0 3 * * *"            # minute hour day-of-month month day-of-week
+args = ["summary"]            # optional: its arguments, in order
+queue = "reports"             # optional: default, the job's own queue
+timezone = "Europe/Paris"     # optional: default, UTC
+key = "nightly"               # optional: see below
+```
+
+or in code, from a prepared job:
+
+```rust
+let worker = butler::Worker::from_config(&config)?
+    .recurring(nightly_report::prepare("summary")?, "0 3 * * *")?;
+
+// With a time zone or a key of its own:
+let schedule = butler::Recurring::new(cleanup::prepare()?, "*/15 * * * *")?
+    .in_time_zone("America/New_York")?
+    .with_key("cleanup")?;
+let worker = worker.add_recurring(schedule)?;
+```
+
+- **Cron.** Five fields, as in crontab, with lists, ranges, steps and names
+  (`"*/15 9-17 * * mon-fri"`). In the day of week, `0` and `7` are Sunday and
+  `1` is Monday; when both day fields are restricted, either one matching is
+  enough: `"0 0 1 * 1"` runs on the first of each month and every Monday.
+  If either day field starts with `*` (including `*/2`), both fields must
+  match. Expressions are checked when `butler.toml` loads.
+- **Time zones.** UTC unless `timezone` names an IANA zone. In a zone with
+  daylight saving time, a local time skipped in spring doesn't run that day,
+  and one repeated in autumn runs at both instants.
+- **Exactly once per tick.** Every worker with the schedule evaluates it, and
+  the backend enqueues each tick once between them: the push is idempotent on
+  `(schedule, tick time)`. The job then runs like any other, with its queue,
+  retries and at-least-once delivery.
+- **Missed ticks.** A tick that passed while no worker was running is
+  enqueued once, late, when a worker starts: only the latest one, never a
+  backlog. A schedule doesn't run for ticks from before it first existed.
+- **Keys.** A schedule is identified by its key, derived by default from the
+  job, queue, arguments, cron and time zone, so changing any of them makes a
+  new schedule. Give it a `key` to keep its history across such changes, and
+  so that old and new workers can't both run one tick during a rolling
+  deploy.
+- **The job must be known** to the worker when the schedule is read. Jobs from
+  another crate need registering first:
+  `Worker::new(config.connect()?).register(lib::job::JOB).with_config(&config.worker).with_recurring_config(&config.recurring)?`.
+
+Workers register their schedules with the backend every minute. The
+dashboard's Recurring page lists them with their next and last run, and marks
+the ones no running worker has registered for three minutes; those can be
+removed.
+
 ### Retries and backoff
 
 A failed job is retried up to `max_retries` times, waiting longer before each
@@ -1077,6 +1140,14 @@ To override a job's queue for one call, prepare it and pick the queue:
   worker prints the queues it serves at startup. Dedicated workers are a
   common pattern: one worker for `["critical"]` only, another for the rest.
 - Retries and crash recovery put a job back on its own queue.
+- **Pausing a queue** stops every worker from claiming its jobs without
+  stopping the workers: `queue.pause_queue("mailers")?`, or Pause on the
+  dashboard's Queues table, then `resume_queue`. The paused set lives in the
+  backend, and each worker reads it every second, so a pause takes effect
+  within about a second; jobs already running finish. A paused queue still
+  accepts jobs, and scheduled jobs and retries are still promoted onto it;
+  they wait there until it is resumed. A worker serving only paused queues
+  sits idle.
 - Queue names are 1 to 64 of `A-Z a-z 0-9 _ - .` and don't start with a dot. The
   macro checks this at compile time, and the config when it loads.
 
@@ -1097,10 +1168,21 @@ of CPUs), each on the multi-threaded tokio runtime:
 concurrency = 100_000     # jobs running at once, across all queues
 claimers = 16             # claim loops side by side (default: CPU count)
 
-[worker.queue_limits]     # optional: at most this many at once, per queue
-mailers = 20              # e.g. an SMTP provider allowing 20 connections
-reports = 2               # heavy jobs that shouldn't pile up
+[worker.queue_limits]     # optional: at most this many at once, per queue, IN EACH WORKER
+mailers = 20              # e.g. 20 SMTP connections per process
+reports = 2               # heavy jobs that shouldn't pile up on one machine
+
+[worker.global_queue_limits]  # optional: at most this many at once, per queue, ACROSS ALL WORKERS
+exports = 5               # e.g. an API allowing 5 concurrent requests in total
 ```
+
+> **Per-process or global?** `[worker.queue_limits]` counts inside each
+> worker process, so the limits add up: three workers with `mailers = 20` can
+> run **60** mailer jobs at once. `[worker.global_queue_limits]` is counted by
+> the backend, so three workers with `exports = 5` run **5** export jobs at
+> once between them. Use the per-process limit to protect one machine (memory,
+> CPU, connections from one host), and the global one to protect a shared
+> resource (a rate-limited API, a database).
 
 - **`concurrency`** caps every queue together. It is a tokio `Semaphore`: each
   running job holds a permit until it finishes.
@@ -1113,6 +1195,20 @@ reports = 2               # heavy jobs that shouldn't pile up
   ran all 40 of its jobs at once. A job kept waiting only by its queue's limit
   starts within about 10 ms of a slot freeing up. Code:
   `worker.queue_limit("mailers", 20)`.
+- **`[worker.global_queue_limits]`** caps a queue across every worker. The
+  backend keeps the count of that queue's running jobs and checks it in the
+  same atomic step as the claim (a Lua script in Redis, one `UPDATE` in
+  SQLite, exclusive slot files for the file backend, the lock for memory), so
+  the limit holds however many workers race. A job holds its slot until it
+  completes, fails (retry, backoff, dead), or is interrupted at a checkpoint,
+  and a crashed worker's slots come back when recovery requeues its jobs
+  (after `heartbeat_ttl_secs`, at the next `recover_interval_secs`). A full
+  queue is skipped like a locally full one, and a freed slot is used within
+  about 100 ms. It costs a little more per claim than the per-process limit,
+  which stays the cheap default. Set the same global limit on every worker
+  serving the queue: a worker without it neither takes a slot nor respects
+  the limit. Both kinds can apply to one queue. Code:
+  `worker.global_queue_limit("exports", 5)`.
 - **`claimers`** is how many claim loops run side by side. Each takes one job
   at a time from the backend, so more of them start jobs faster; this is what
   lets a very high `concurrency` actually fill up. Raise it for Redis, where
@@ -1211,8 +1307,19 @@ checkpoint_interval_ms = 1000  # jobs with a Progress: how often it is saved
 queues = ["default"]         # or ["critical", "default"], or [["critical", 6], ["default", 1]]
 claimers = 16                # claim loops side by side (default: the number of CPUs)
 
-[worker.queue_limits]        # optional: jobs running at once, per queue
+[worker.queue_limits]        # optional: jobs running at once, per queue, in each worker process
 mailers = 20
+
+[worker.global_queue_limits] # optional: jobs running at once, per queue, across all workers
+exports = 5
+
+[[recurring]]                # optional, any number: see "Recurring jobs"
+job = "nightly_report"
+cron = "0 3 * * *"
+args = ["summary"]           # optional
+queue = "reports"            # optional: default, the job's own queue
+timezone = "Europe/Paris"    # optional: default, UTC
+key = "nightly"              # optional: default, derived from the fields above
 ```
 
 Environment variables override any key, with `__` between levels:
@@ -1278,6 +1385,9 @@ without crashing can also see its job run a second time elsewhere.
 
 ```text
 pending/<queue>/  scheduled/  processing/<worker>/  workers/<worker>  done/  dead/  cancelled/
+paused/<queue>
+slots/<queue>/<n>
+recurring/schedules/<key>.json  recurring/ticks/<key>/<tick time>
 ```
 
 Each write goes to `tmp/` first and is then renamed into place, so nothing ever
@@ -1294,6 +1404,19 @@ so claims skip jobs whose key is full without reading them; running keyed
 jobs hold a slot file in `ckeys/<key hash>/`, taken by an exclusive hard link.
 A unique job's push hard-links a lock to `unique/<key hash>`; replacing a lock
 left behind by a crashed process is best effort.
+
+A claim under a global queue limit of `max` first takes one of the slot names
+`0` to `max - 1` in `slots/<queue>/` by hard-linking a file naming the worker
+(a link fails if the name exists, so each slot has one holder), then claims a
+job and records its id in the slot, or gives the slot back if there was none.
+The holding worker frees it when the job finishes; recovery frees every slot
+of a stopped worker.
+
+A recurring tick is claimed by hard-linking a marker file, already holding the
+job id, to `recurring/ticks/<key>/<tick time>`: a link fails if the name
+exists, so exactly one worker creates it and enqueues the job. The job file is
+written under `tmp/` first and renamed into its queue after the link; a crash
+between the two loses that one tick.
 
 ### Redis
 
@@ -1315,6 +1438,11 @@ left behind by a crashed process is best effort.
 | `butler:blocked` | HASH | per queue, how many of its ids wait in blocked lists |
 | `butler:blocked_keys` | SET | concurrency keys that ever had skipped jobs |
 | `butler:unique:<key>` | STRING | the id of the job holding a unique key (by the key's hash) |
+| `butler:paused` | SET | paused queues, which workers leave out of their claims |
+| `butler:slots:<queue>` | SET | ids running in one of the queue's global-limit slots |
+| `butler:recurring` | SET | keys of the recurring schedules workers registered |
+| `butler:recurring:<key>` | HASH | `data` (schedule JSON), `created_at`, `seen_at`, `last_tick`, `last_job` |
+| `butler:recurring:tick:<key>:<ms>` | STRING | the job enqueued for that tick; expires after 24h |
 
 A claim is one Lua script per queue the worker serves, in its priority
 order: it moves the job's id from `queue:<queue>` to `processing:<worker>`
@@ -1341,8 +1469,12 @@ recovering at once can't requeue a job twice. Promotion is a Lua script too:
 it takes the due ids from `butler:scheduled` (`ZRANGEBYSCORE`) and `LPUSH`es
 each onto its own queue, atomically, so a job moves exactly once. Cancelling a
 scheduled job is a `ZREM`, tried before the queue list: ids only move from the
-set to a queue, so a job can't slip past both checks. Calls use a small connection
-pool, so concurrent claims don't wait on each other.
+set to a queue, so a job can't slip past both checks. A recurring tick is a
+script too: `SET recurring:tick:<key>:<ms> NX`, and the job's push only if
+that succeeded. Under a global queue limit, the claim script first checks
+`SCARD slots:<queue>`, claims nothing at the limit, and adds the claimed id
+to the set; completing, failing and recovering a job `SREM` it. Calls use a
+small connection pool, so concurrent claims don't wait on each other.
 
 The job's return value goes into the job hash's `data`, next to its arguments.
 
@@ -1359,8 +1491,11 @@ processes on the same machine:
 
 | Table | Columns | Purpose |
 |---|---|---|
-| `butler_jobs` | `id, queue, state, worker, seq, data, run_at, ckey, climit, ukey, umode` | every job; `data` is the job JSON, `seq` the order in its queue, `run_at` a scheduled job's time in ms, then its concurrency and unique keys |
+| `butler_jobs` | `id, queue, state, worker, seq, data, run_at, slot, ckey, climit, ukey, umode` | every job; `data` is the job JSON, `seq` the order in its queue, `run_at` a scheduled job's time in ms, `slot` set while it holds a global-limit slot, then its concurrency and unique keys |
 | `butler_workers` | `worker, expires_at_ms` | heartbeats, for crash recovery |
+| `butler_paused` | `queue, paused_at_ms` | paused queues; created when an older database is opened |
+| `butler_recurring` | `key, data, created_at_ms, seen_at_ms, last_tick_ms, last_job_id` | recurring schedules and their last run |
+| `butler_recurring_ticks` | `key, tick_ms, job_id` | ticks enqueued; the primary key `(key, tick_ms)` makes each one run once |
 
 A claim is one `UPDATE ... RETURNING` that moves the oldest pending row of a
 queue to `processing` under the claiming worker. SQLite runs it under its write
@@ -1379,6 +1514,16 @@ than `climit` processing rows, so it skips jobs whose key is full; nothing
 needs releasing, since only processing rows count. A unique job's push looks
 for a job holding its key and inserts in the same immediate transaction.
 Databases from before these columns get them when opened.
+
+A claim under a global queue limit is the same single `UPDATE`, with one more
+condition: fewer than the limit of the queue's `processing` rows have `slot`
+set. Any move out of `processing` frees the slot, since only processing rows
+count. Databases from before global limits get the `slot` column when opened.
+
+A recurring tick is an `INSERT OR IGNORE` into `butler_recurring_ticks` and
+the job's insert, in one transaction: only the worker whose tick row went in
+enqueues the job. Databases from before recurring jobs get both tables when
+opened.
 
 **Waking waiters without a server.** SQLite has no pub/sub between processes:
 its hooks only see changes made through the same connection. butler combines
@@ -1412,10 +1557,12 @@ memory until the process exits.
 `crates/butler/tests/backends.rs` runs the same contract checks (FIFO claims,
 waking on push, cancel against claim, results, retries, recovery, scheduled
 jobs: not claimable early, claimable once due, promoted to their own queue,
-cancel against promotion; concurrency keys: skipped when full, never
-exceeded by concurrent claims, freed by every way out of processing and by
-recovery; unique jobs: stored once under concurrent pushes, freed at the
-right point) against all four backends.
+cancel against promotion; recurring ticks enqueued once however many workers
+push them; global queue limits: never exceeded by concurrent claims, freed by
+every way out of processing and by crash recovery; concurrency keys: skipped
+when full, never exceeded by concurrent claims, freed by every way out of
+processing and by recovery; unique jobs: stored once under concurrent pushes,
+freed at the right point) against all four backends.
 
 **Upgrading.** Scheduled jobs add a `scheduled` state, which retries waiting
 out their backoff use too. Deploy this version to every worker and dashboard
@@ -1436,6 +1583,28 @@ the claim is now a script (one round trip instead of two); in SQLite four
 the file backend `ckeys/` and `unique/` directories and keyed pending file
 names. Jobs without keys are stored and claimed as before.
 
+**Upgrading to paused queues.** Pausing adds storage only: a
+`<prefix>:paused` set in Redis, a `butler_paused` table in SQLite (created
+when a database is opened), and a `paused/` directory for the file backend.
+Workers of an older version don't read it and keep claiming from a paused
+queue, so upgrade every worker before relying on a pause.
+
+**Upgrading to global queue limits.** They add storage only: `slots:<queue>`
+sets in Redis, a `slot` column in SQLite's `butler_jobs` (added when a
+database is opened), and a `slots/` directory for the file backend. Nothing
+changes for queues without a global limit. Workers of an older version, or
+without the limit configured, don't take slots and aren't bounded by the
+limit, so deploy the new version with the limit to every worker serving the
+queue before relying on it.
+
+**Upgrading to recurring jobs.** They add storage and nothing else changes:
+new Redis keys under `<prefix>:recurring`, two new SQLite tables (created
+when a database is opened), and a `recurring/` directory for the file
+backend. Workers without `[[recurring]]` entries never touch them. Only
+workers running this version enqueue recurring jobs; while older workers run
+next to them, they simply don't take part. A dashboard of an older version
+lacks the Recurring page but works otherwise.
+
 ## Limitations
 
 - **At-least-once delivery.** A job interrupted by a crash runs again (see
@@ -1443,8 +1612,10 @@ names. Jobs without keys are stored and claimed as before.
 - **Polling on the file backend.** Idle file-backed workers check every
   `poll_interval_ms`, and `wait_result` every interval it is given. Redis,
   SQLite, and memory support wake-ups, with polling as a fallback.
-- **Worker-local limits.** Concurrency and per-queue limits apply to each
-  worker, not across a fleet. They are not global rate limits.
+- **Mostly worker-local limits.** `concurrency` and `[worker.queue_limits]`
+  apply to each worker, not across a fleet; `[worker.global_queue_limits]`
+  caps concurrent jobs of a queue across all workers. None of them is a rate
+  limit (jobs per second).
 - **Job names are the contract.** Renaming a function strands jobs already
   queued under the old name. Use `#[job(name = "...")]` for names that need to
   stay stable.
@@ -1460,6 +1631,7 @@ crates/butler/                   the library (published as `butler`)
   src/prepared.rs                PreparedJob, enqueue_all (bulk enqueuing)
   src/progress.rs                Progress, Interrupted (job continuations)
   src/retry.rs                   Backoff, Retry, Retryable, RetryPolicy
+  src/recurring.rs               Cron, Recurring, RecurringRecord (recurring jobs)
   src/testing.rs                 perform_enqueued_jobs, InlineJobs
   src/backend/mod.rs             Backend traits (Store, Monitor, Watch), Queue handle
   src/backend/file.rs            file backend

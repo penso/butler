@@ -13,8 +13,8 @@ use std::{
 };
 
 use butler::{
-    AnyJob, Backoff, ConcurrencyKey, Failed, FileQueue, JITTER, JobState, MemoryQueue, NewJob,
-    Queue, Retry, RetryPolicy, Unique, UniqueKey,
+    AnyJob, Backoff, ConcurrencyKey, Cron, Failed, FileQueue, GlobalLimit, JITTER, JobState,
+    MemoryQueue, NewJob, Queue, Recurring, RecurringRecord, Retry, RetryPolicy, Unique, UniqueKey,
     monitor::{JobMetric, ListFilter},
 };
 use serde_json::json;
@@ -1234,5 +1234,433 @@ fn concurrent_pushes_of_a_unique_job_store_it_once() {
         assert_eq!(ids[1], ids[2], "{name}");
         assert_ne!(ids[1], a, "{name}");
         assert_eq!(queue.stats().unwrap().pending(), 2, "{name}");
+    }
+}
+
+#[test]
+fn paused_queues_are_listed_until_resumed() {
+    for (queue, _) in backends("pause") {
+        let name = queue.describe();
+        assert!(queue.paused_queues().unwrap().is_empty(), "{name}");
+        assert!(queue.pause_queue("mailers").unwrap(), "{name}");
+        assert!(
+            !queue.pause_queue("mailers").unwrap(),
+            "{name}: already paused"
+        );
+        assert!(queue.pause_queue("low").unwrap(), "{name}");
+        assert_eq!(queue.paused_queues().unwrap(), ["low", "mailers"], "{name}");
+
+        assert!(queue.resume_queue("mailers").unwrap(), "{name}");
+        assert!(
+            !queue.resume_queue("mailers").unwrap(),
+            "{name}: not paused"
+        );
+        assert_eq!(queue.paused_queues().unwrap(), ["low"], "{name}");
+
+        let bad = queue.pause_queue("../etc").unwrap_err();
+        assert!(matches!(bad, butler::Error::InvalidQueue { .. }), "{name}");
+    }
+}
+
+#[test]
+fn a_paused_queue_still_accepts_jobs_and_promotions() {
+    for (queue, _) in backends("pause-accepts") {
+        let name = queue.describe();
+        queue.pause_queue("default").unwrap();
+        let first = queue.push("a", "default", vec![]).unwrap();
+        let at = SystemTime::now() + HOUR;
+        let scheduled = queue.schedule("b", "default", vec![], at).unwrap();
+        assert_eq!(queue.promote(at).unwrap().moved, 1, "{name}");
+        assert_eq!(queue.state(&first), Some(JobState::Pending), "{name}");
+        assert_eq!(queue.state(&scheduled), Some(JobState::Pending), "{name}");
+        assert_eq!(queue.stats().unwrap().pending(), 2, "{name}");
+
+        // Resumed, its jobs are claimed in their order.
+        queue.resume_queue("default").unwrap();
+        assert_eq!(queue.claim("w", DEFAULT, NOW).unwrap().unwrap().id(), first);
+        assert_eq!(
+            queue.claim("w", DEFAULT, NOW).unwrap().unwrap().id(),
+            scheduled
+        );
+    }
+}
+
+const MAILERS: &[&str] = &["mailers"];
+
+fn at_most(max: usize) -> [GlobalLimit<'static>; 1] {
+    [GlobalLimit {
+        queue: "mailers",
+        max,
+    }]
+}
+
+#[test]
+fn a_global_limit_caps_running_jobs_across_workers() {
+    for (queue, _) in backends("global-limit") {
+        let name = queue.describe();
+        for n in 0..5 {
+            queue.push("send", "mailers", vec![json!(n)]).unwrap();
+        }
+        let other = queue.push("other", "default", vec![]).unwrap();
+        let limits = at_most(2);
+        let claim = |worker: &str, queues: &[&str]| {
+            queue
+                .claim_within_limits(worker, queues, &limits, NOW)
+                .unwrap()
+        };
+
+        let first = claim("w1", MAILERS).unwrap();
+        claim("w2", MAILERS).unwrap();
+        assert!(claim("w3", MAILERS).is_none(), "{name}: two are running");
+        // A full queue doesn't hold back the others.
+        let next = claim("w3", &["mailers", "default"]).unwrap();
+        assert_eq!(next.id(), other, "{name}");
+
+        // Finishing one frees its slot for any worker.
+        queue.complete("w1", first, json!(null)).unwrap();
+        claim("w3", MAILERS).unwrap();
+        assert!(claim("w4", MAILERS).is_none(), "{name}");
+
+        // Claims without the limit take no slot and aren't bounded by it.
+        assert!(queue.claim("w5", MAILERS, NOW).unwrap().is_some(), "{name}");
+        assert!(claim("w4", MAILERS).is_none(), "{name}");
+    }
+}
+
+#[test]
+fn every_way_out_of_processing_frees_a_global_slot() {
+    for (queue, _) in backends("global-release") {
+        let name = queue.describe();
+        for n in 0..6 {
+            queue.push("send", "mailers", vec![json!(n)]).unwrap();
+        }
+        let limits = at_most(1);
+        let claim = || {
+            queue
+                .claim_within_limits("w", MAILERS, &limits, NOW)
+                .unwrap()
+        };
+        let full = |step: &str| {
+            assert!(claim().is_none(), "{name}: the slot is held before {step}");
+        };
+
+        let job = claim().unwrap();
+        full("a retry");
+        queue.fail("w", job, "again".into(), 3).unwrap();
+
+        let job = claim().unwrap();
+        full("a delayed retry");
+        let policy = RetryPolicy::new(3, Backoff::Fixed(HOUR));
+        queue.fail("w", job, "later".into(), policy).unwrap();
+
+        let job = claim().unwrap();
+        full("dying");
+        queue.fail("w", job, "dead".into(), 0).unwrap();
+
+        let job = claim().unwrap();
+        full("an interruption");
+        queue.interrupt("w", job).unwrap();
+
+        let job = claim().unwrap();
+        full("completing");
+        queue.complete("w", job, json!(null)).unwrap();
+        assert!(claim().is_some(), "{name}: free again");
+    }
+}
+
+#[test]
+fn recovering_a_crashed_worker_frees_its_global_slots() {
+    for (queue, _) in backends("global-recover") {
+        let name = queue.describe();
+        for n in 0..3 {
+            queue.push("send", "mailers", vec![json!(n)]).unwrap();
+        }
+        let limits = at_most(2);
+        queue.heartbeat("crashed", Duration::from_secs(60)).unwrap();
+        queue.heartbeat("alive", Duration::from_secs(60)).unwrap();
+        queue
+            .claim_within_limits("crashed", MAILERS, &limits, NOW)
+            .unwrap()
+            .unwrap();
+        queue
+            .claim_within_limits("crashed", MAILERS, &limits, NOW)
+            .unwrap()
+            .unwrap();
+        assert!(
+            queue
+                .claim_within_limits("alive", MAILERS, &limits, NOW)
+                .unwrap()
+                .is_none(),
+            "{name}"
+        );
+
+        queue
+            .heartbeat("crashed", Duration::from_millis(1))
+            .unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(queue.recover().unwrap(), 2, "{name}");
+        // Both slots came back.
+        assert!(
+            queue
+                .claim_within_limits("alive", MAILERS, &limits, NOW)
+                .unwrap()
+                .is_some(),
+            "{name}"
+        );
+        assert!(
+            queue
+                .claim_within_limits("alive", MAILERS, &limits, NOW)
+                .unwrap()
+                .is_some(),
+            "{name}"
+        );
+        assert!(
+            queue
+                .claim_within_limits("alive", MAILERS, &limits, NOW)
+                .unwrap()
+                .is_none(),
+            "{name}: still two at most"
+        );
+    }
+}
+
+#[test]
+fn concurrent_claims_never_exceed_a_global_limit() {
+    for (queue, _) in backends("global-race") {
+        let name = queue.describe();
+        for n in 0..12 {
+            queue.push("send", "mailers", vec![json!(n)]).unwrap();
+        }
+        let claimers: Vec<_> = (0..8)
+            .map(|n| {
+                let queue = queue.clone();
+                thread::spawn(move || {
+                    queue
+                        .claim_within_limits(&format!("w{n}"), MAILERS, &at_most(3), NOW)
+                        .unwrap()
+                        .is_some()
+                })
+            })
+            .collect();
+        let claimed = claimers
+            .into_iter()
+            .filter_map(|claimer| claimer.join().unwrap().then_some(()))
+            .count();
+        assert_eq!(claimed, 3, "{name}");
+    }
+}
+
+/// A recurring schedule for job `name` every hour, as a worker registers it
+/// at `now`.
+fn hourly(name: &str, key: &str, now: SystemTime) -> RecurringRecord {
+    Recurring::from_parts(
+        name.into(),
+        "reports".into(),
+        vec![json!("summary")],
+        Cron::parse("0 * * * *").unwrap(),
+    )
+    .unwrap()
+    .with_key(key)
+    .unwrap()
+    .record(now)
+}
+
+#[test]
+fn a_recurring_tick_is_enqueued_once_however_many_workers_push_it() {
+    for (queue, _) in backends("recurring-once") {
+        let name = queue.describe();
+        let now = SystemTime::now();
+        queue
+            .register_recurring(&[hourly("report", "hourly", now)])
+            .unwrap();
+        let tick = UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+
+        // Eight workers reach the same tick at once: one of them enqueues it.
+        let pushers: Vec<_> = (0..8)
+            .map(|_| {
+                let queue = queue.clone();
+                thread::spawn(move || {
+                    let job = NewJob::new("report", "reports", vec![json!("summary")]);
+                    queue.push_recurring("hourly", tick, job).unwrap()
+                })
+            })
+            .collect();
+        let ids: Vec<_> = pushers
+            .into_iter()
+            .filter_map(|pusher| pusher.join().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 1, "{name}: one job per tick");
+
+        // Pending on its own queue, with its arguments, claimable once.
+        assert_eq!(queue.state(&ids[0]), Some(JobState::Pending), "{name}");
+        let job = queue.claim("w", &["reports"], NOW).unwrap().unwrap();
+        assert_eq!(job.id(), ids[0], "{name}");
+        assert_eq!(job.args(), [json!("summary")], "{name}");
+        assert!(
+            queue.claim("w", &["reports"], NOW).unwrap().is_none(),
+            "{name}"
+        );
+
+        // Later tries of the same tick still find it taken; the next tick runs.
+        let again = NewJob::new("report", "reports", vec![]);
+        assert_eq!(
+            queue.push_recurring("hourly", tick, again).unwrap(),
+            None,
+            "{name}"
+        );
+        let next = tick + HOUR;
+        let next_id = queue
+            .push_recurring("hourly", next, NewJob::new("report", "reports", vec![]))
+            .unwrap();
+        assert!(next_id.is_some(), "{name}");
+
+        // The same tick of another schedule is its own.
+        let other = queue
+            .push_recurring("other", tick, NewJob::new("report", "reports", vec![]))
+            .unwrap();
+        assert!(other.is_some(), "{name}");
+
+        let listed = queue.recurring().unwrap();
+        assert_eq!(
+            listed.len(),
+            1,
+            "{name}: only registered schedules are listed"
+        );
+        assert_eq!(listed[0].last_tick_ms, Some(millis(next) as u64), "{name}");
+        assert_eq!(listed[0].last_job_id, next_id, "{name}");
+    }
+}
+
+#[test]
+fn registering_a_schedule_keeps_its_creation_time_and_last_run() {
+    for (queue, _) in backends("recurring-register") {
+        let name = queue.describe();
+        let first = UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let stored = queue
+            .register_recurring(&[hourly("report", "hourly", first)])
+            .unwrap();
+        assert_eq!(stored[0].created_at_ms, millis(first) as u64, "{name}");
+        assert_eq!(stored[0].last_tick_ms, None, "{name}");
+        let id = queue
+            .push_recurring("hourly", first, NewJob::new("report", "reports", vec![]))
+            .unwrap()
+            .unwrap();
+
+        // A later registration, with new arguments: the definition and
+        // `seen_at_ms` change, the creation time and last run stay.
+        let later = first + HOUR;
+        let mut changed = hourly("report", "hourly", later);
+        changed.args = vec![json!("detailed")];
+        let stored = queue
+            .register_recurring(&[changed, hourly("cleanup", "cleanup", later)])
+            .unwrap();
+        assert_eq!(stored.len(), 2, "{name}");
+        assert_eq!(stored[0].key, "hourly", "{name}: in the order given");
+        assert_eq!(stored[0].created_at_ms, millis(first) as u64, "{name}");
+        assert_eq!(stored[0].seen_at_ms, millis(later) as u64, "{name}");
+        assert_eq!(stored[0].last_tick_ms, Some(millis(first) as u64), "{name}");
+        assert_eq!(
+            stored[0].last_job_id.as_deref(),
+            Some(id.as_str()),
+            "{name}"
+        );
+        assert_eq!(stored[0].args, vec![json!("detailed")], "{name}");
+        assert_eq!(stored[1].created_at_ms, millis(later) as u64, "{name}");
+
+        let listed = queue.recurring().unwrap();
+        let keys: Vec<_> = listed.iter().map(|s| s.key.as_str()).collect();
+        assert_eq!(keys, ["cleanup", "hourly"], "{name}: sorted by key");
+        assert_eq!(listed[1], stored[0], "{name}");
+    }
+}
+
+#[test]
+fn removing_a_schedule_forgets_it_and_its_last_run() {
+    for (queue, _) in backends("recurring-remove") {
+        let name = queue.describe();
+        let now = SystemTime::now();
+        queue
+            .register_recurring(&[hourly("report", "hourly", now)])
+            .unwrap();
+        let tick = UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        queue
+            .push_recurring("hourly", tick, NewJob::new("report", "reports", vec![]))
+            .unwrap()
+            .unwrap();
+        assert!(queue.remove_recurring("hourly").unwrap(), "{name}");
+        assert!(!queue.remove_recurring("hourly").unwrap(), "{name}");
+        assert!(queue.recurring().unwrap().is_empty(), "{name}");
+
+        // Registered again, it is new: no last run.
+        let stored = queue
+            .register_recurring(&[hourly("report", "hourly", now)])
+            .unwrap();
+        assert_eq!(stored[0].last_tick_ms, None, "{name}");
+    }
+}
+
+#[test]
+fn removing_a_schedule_rejects_invalid_keys_without_changing_jobs() {
+    for (queue, _) in backends("recurring-remove-invalid") {
+        let id = queue.push("report", "default", vec![]).unwrap();
+        queue
+            .register_recurring(&[hourly("report", "hourly", SystemTime::now())])
+            .unwrap();
+        for key in [
+            "",
+            ".",
+            "..",
+            "../../pending",
+            "/pending",
+            "a/b",
+            "a\\b",
+            &"a".repeat(129),
+        ] {
+            assert!(
+                matches!(
+                    queue.remove_recurring(key),
+                    Err(butler::Error::InvalidRecurringKey { .. })
+                ),
+                "{}: {key:?}",
+                queue.describe()
+            );
+            assert_eq!(queue.state(&id), Some(JobState::Pending));
+            assert_eq!(queue.recurring().unwrap().len(), 1);
+        }
+        assert_eq!(queue.claim("w", DEFAULT, NOW).unwrap().unwrap().id(), id);
+    }
+}
+
+#[test]
+fn a_global_limit_and_concurrency_keys_apply_together() {
+    for (queue, _) in backends("global-and-keys") {
+        let name = queue.describe();
+        let on_mailers = |job: NewJob| NewJob {
+            queue: "mailers".into(),
+            ..job
+        };
+        let a1 = queue.push_job(on_mailers(keyed("a1", "a", 1))).unwrap();
+        let a2 = queue.push_job(on_mailers(keyed("a2", "a", 1))).unwrap();
+        let b1 = queue.push_job(on_mailers(keyed("b1", "b", 1))).unwrap();
+        let c1 = queue.push_job(on_mailers(keyed("c1", "c", 1))).unwrap();
+        let limits = at_most(2);
+        let claim = |worker: &str| {
+            queue
+                .claim_within_limits(worker, MAILERS, &limits, NOW)
+                .unwrap()
+        };
+
+        let first = claim("w1").unwrap();
+        assert_eq!(first.id(), a1, "{name}");
+        // a2 is skipped for its key, without taking a slot: b1 gets the second.
+        assert_eq!(claim("w2").unwrap().id(), b1, "{name}");
+        // Both slots are in use: c1 waits, though its key is free.
+        assert!(claim("w3").is_none(), "{name}");
+
+        // a1 finishes: its slot and its key are free, so a2 is next in line.
+        queue.complete("w1", first, json!(null)).unwrap();
+        assert_eq!(claim("w3").unwrap().id(), a2, "{name}");
+        assert!(claim("w4").is_none(), "{name}");
+        assert_eq!(queue.state(&c1), Some(JobState::Pending), "{name}");
     }
 }

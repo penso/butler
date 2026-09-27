@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
 
 use askama::Template;
 use axum::{
@@ -35,6 +35,8 @@ async fn blocking<T: Send + 'static>(
 pub(crate) struct QueueRow {
     pub name: String,
     pub pending: String,
+    /// Workers don't claim its jobs until it is resumed.
+    pub paused: bool,
 }
 
 #[derive(Template)]
@@ -53,6 +55,7 @@ struct DashboardPage {
     queues: Vec<QueueRow>,
     jobs: Vec<JobSummary>,
     snapshot_json: String,
+    return_to: String,
 }
 
 pub(crate) async fn dashboard(
@@ -61,7 +64,17 @@ pub(crate) async fn dashboard(
     let stats = read_stats(&state.queue).await?;
     let since = current_minute().saturating_sub(DAY_MINUTES);
     let buckets = blocking(&state.queue, move |queue| queue.metrics(since)).await?;
+    let paused = blocking(&state.queue, Queue::paused_queues).await?;
     let snapshot = Snapshot::from_stats(&stats);
+    // Every queue with jobs, and the paused ones even without.
+    let mut queues: BTreeMap<&str, u64> = stats
+        .queues
+        .iter()
+        .map(|queue| (queue.name.as_str(), queue.pending))
+        .collect();
+    for queue in &paused {
+        queues.entry(queue).or_default();
+    }
     let page = DashboardPage {
         base: state.base.clone(),
         nav: "dashboard",
@@ -73,16 +86,22 @@ pub(crate) async fn dashboard(
         scheduled: thousands(stats.scheduled),
         dead: thousands(stats.dead),
         workers: thousands(snapshot.workers_alive as u64),
-        queues: stats
-            .queues
-            .iter()
-            .map(|queue| QueueRow {
-                name: queue.name.clone(),
-                pending: thousands(queue.pending),
+        queues: queues
+            .into_iter()
+            .map(|(name, pending)| QueueRow {
+                name: name.to_owned(),
+                pending: thousands(pending),
+                paused: paused.iter().any(|queue| queue == name),
             })
             .collect(),
         jobs: views::summarize(&buckets).into_iter().take(12).collect(),
         snapshot_json: script_json(&snapshot),
+        // The dashboard itself: a nested router serves it at the bare base.
+        return_to: if state.base.is_empty() {
+            "/".to_owned()
+        } else {
+            state.base.clone()
+        },
     };
     Ok(Html(page.render()?))
 }
@@ -340,6 +359,74 @@ pub(crate) async fn job(
         can_discard: job_state.is_finished(),
         can_cancel: matches!(job_state, JobState::Pending | JobState::Scheduled),
         can_run_now: job_state == JobState::Scheduled,
+    };
+    Ok(Html(page.render()?))
+}
+
+/// One recurring schedule in the table.
+pub(crate) struct RecurringRow {
+    pub key: String,
+    pub name: String,
+    pub queue: String,
+    pub cron: String,
+    pub time_zone: String,
+    /// Its arguments as compact JSON.
+    pub args: String,
+    /// Its next tick, in ms and as "in 5m"; `None` if it never runs again.
+    pub next: Option<(u64, String)>,
+    /// Its last run: the tick in ms, "3m ago", and the job it enqueued.
+    pub last: Option<(u64, String, String)>,
+    /// Whether a running worker registered it recently.
+    pub active: bool,
+}
+
+#[derive(Template)]
+#[template(path = "recurring.html")]
+struct RecurringPage {
+    base: String,
+    nav: &'static str,
+    rows: Vec<RecurringRow>,
+    return_to: String,
+    /// How long a schedule may go unregistered before it shows as inactive.
+    window: String,
+}
+
+pub(crate) async fn recurring(
+    State(state): State<Arc<AppState>>,
+) -> Result<Html<String>, WebError> {
+    let schedules = blocking(&state.queue, Queue::recurring).await?;
+    let now = SystemTime::now();
+    let rows = schedules
+        .iter()
+        .map(|schedule| {
+            let next = schedule.next_run(now).map(|at| {
+                let ms = views::epoch_ms(at);
+                (ms, until(ms))
+            });
+            RecurringRow {
+                key: schedule.key.clone(),
+                name: schedule.name.clone(),
+                queue: schedule.queue.clone(),
+                cron: schedule.cron.clone(),
+                time_zone: schedule.time_zone.clone(),
+                args: serde_json::to_string(&schedule.args).unwrap_or_default(),
+                next,
+                last: schedule
+                    .last_tick_ms
+                    .zip(schedule.last_job_id.clone())
+                    .map(|(ms, job)| (ms, ago(ms), job)),
+                active: schedule.is_active(now),
+            }
+        })
+        .collect();
+    let page = RecurringPage {
+        base: state.base.clone(),
+        nav: "recurring",
+        rows,
+        return_to: format!("{}/recurring", state.base),
+        window: duration(
+            u64::try_from(butler::recurring::ACTIVE_WINDOW.as_millis()).unwrap_or(u64::MAX),
+        ),
     };
     Ok(Html(page.render()?))
 }

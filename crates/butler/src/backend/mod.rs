@@ -29,6 +29,7 @@ use crate::{
     RetryPolicy, Signal, UniqueKey,
     job::{after, millis},
     monitor::{JobMetric, ListFilter, MetricBucket, Stats},
+    recurring::RecurringRecord,
     state::{Done, Pending, Processing},
 };
 
@@ -77,6 +78,29 @@ pub trait Store: Send + Sync + 'static {
     /// `None` right away, and the worker polls them instead.
     fn claim(&self, worker: &str, queues: &[&str], wait: Duration) -> Result<Option<JobRecord>>;
 
+    /// Like [`claim`](Store::claim), with global limits: a queue in `limits`
+    /// is skipped while `max` of its jobs claimed this way are running,
+    /// across every worker. Checking the count and claiming are one atomic
+    /// step. The job holds its slot until it is completed, failed (retried,
+    /// scheduled, dead or interrupted), or recovered after its worker
+    /// stopped, so a crashed worker's slots come back through
+    /// [`recover`](Store::recover). Queues not in `limits` are claimed as
+    /// `claim` does, without a slot.
+    ///
+    /// The default only handles an empty `limits`, by calling `claim`.
+    fn claim_within_limits(
+        &self,
+        worker: &str,
+        queues: &[&str],
+        limits: &[GlobalLimit<'_>],
+        wait: Duration,
+    ) -> Result<Option<JobRecord>> {
+        if limits.is_empty() {
+            return self.claim(worker, queues, wait);
+        }
+        Err(Error::Unsupported("global queue limits"))
+    }
+
     /// Marks a job `worker` claimed as done.
     fn complete(&self, worker: &str, job: &JobRecord) -> Result<()>;
 
@@ -113,6 +137,33 @@ pub trait Store: Send + Sync + 'static {
     /// each job moves exactly once.
     /// Interrupted retry transitions preserve their recorded schedule.
     fn recover(&self) -> Result<usize>;
+
+    /// The queues an operator paused with [`Monitor::pause_queue`], sorted.
+    /// Workers leave them out of their claim order; they still accept new
+    /// jobs, and scheduled jobs are still promoted onto them. Default: none.
+    fn paused_queues(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Stores the recurring schedules a worker runs, or refreshes them if
+    /// the backend has them already: their definition and `seen_at_ms` come
+    /// from `schedules`, while a stored schedule keeps its `created_at_ms`
+    /// and last run. Returns the stored schedules, in the same order.
+    /// Default: not supported.
+    fn register_recurring(&self, _schedules: &[RecurringRecord]) -> Result<Vec<RecurringRecord>> {
+        Err(Error::Unsupported("recurring jobs"))
+    }
+
+    /// Enqueues `job` (pending, on its queue) as the run of recurring
+    /// schedule `key` for its tick at `tick`, unless that tick was already
+    /// enqueued: however many workers call it, one job per `(key, tick)`.
+    /// Checking and enqueueing are one atomic step. Records the job as the
+    /// schedule's last run, unless a later tick already ran. Returns the new
+    /// job's id, or `None` if the tick was taken. A tick is remembered for at
+    /// least a day. Default: not supported.
+    fn push_recurring(&self, _key: &str, _tick: SystemTime, _job: NewJob) -> Result<Option<JobId>> {
+        Err(Error::Unsupported("recurring jobs"))
+    }
 
     /// Whether calls can block on I/O (network, disk). Async callers send
     /// blocking backends' calls to tokio's blocking pool; calls to backends
@@ -160,6 +211,32 @@ pub trait Monitor: Send + Sync + 'static {
         Err(Error::Unsupported("discarding jobs"))
     }
 
+    /// Pauses `queue`: workers stop claiming its jobs (the running ones
+    /// finish), while it keeps accepting jobs. Returns `false` if it was
+    /// already paused.
+    fn pause_queue(&self, _queue: &str) -> Result<bool> {
+        Err(Error::Unsupported("pausing queues"))
+    }
+
+    /// Resumes a paused `queue`. Returns `false` if it wasn't paused.
+    fn resume_queue(&self, _queue: &str) -> Result<bool> {
+        Err(Error::Unsupported("pausing queues"))
+    }
+
+    /// Every recurring schedule a worker registered, sorted by key.
+    fn recurring(&self) -> Result<Vec<RecurringRecord>> {
+        Err(Error::Unsupported("listing recurring jobs"))
+    }
+
+    /// Forgets a recurring schedule and its last run. A worker that still
+    /// runs it registers it again, as new. Returns `false` if `key` is
+    /// unknown. Implementations must reject invalid keys with
+    /// [`Error::InvalidRecurringKey`] before touching storage (see
+    /// [`recurring::is_valid_key`](crate::recurring::is_valid_key)).
+    fn remove_recurring(&self, _key: &str) -> Result<bool> {
+        Err(Error::Unsupported("removing recurring jobs"))
+    }
+
     /// Records one finished attempt, for history. Default: ignored.
     fn record_metric(&self, _metric: &JobMetric) -> Result<()> {
         Ok(())
@@ -180,6 +257,24 @@ pub trait Watch: Send + Sync + 'static {
     /// default, makes waiters poll at the interval they were given.
     fn watch_finished(&self, _id: &str) -> Option<Arc<Signal>> {
         None
+    }
+}
+
+/// At most `max` jobs of `queue` running at once across every worker, for
+/// [`Store::claim_within_limits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalLimit<'a> {
+    pub queue: &'a str,
+    pub max: usize,
+}
+
+impl<'a> GlobalLimit<'a> {
+    /// The limit for `queue` in `limits`, if it has one.
+    pub fn of(limits: &[GlobalLimit<'a>], queue: &str) -> Option<usize> {
+        limits
+            .iter()
+            .find(|limit| limit.queue == queue)
+            .map(|limit| limit.max)
     }
 }
 
@@ -258,6 +353,11 @@ pub struct Promoted {
     pub next: Option<SystemTime>,
 }
 
+/// How long backends remember that a recurring tick was enqueued. A tick is
+/// only ever tried around its own time, or once by a worker starting later,
+/// which first checks the schedule's last run; a day covers both.
+pub(crate) const TICK_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// The shortest a claim waits for a scheduled job to come due, so a run time
 /// that slips into the past between two calls can't make it spin.
 const MIN_SCHEDULE_WAIT: Duration = Duration::from_millis(1);
@@ -265,6 +365,17 @@ const MIN_SCHEDULE_WAIT: Duration = Duration::from_millis(1);
 // Schedules can change from another process while a backend waits for pending
 // work. Periodically return to promotion even when no due time was known.
 const MAX_SCHEDULE_WAIT: Duration = Duration::from_millis(100);
+
+/// Queue names become file names and Redis keys.
+fn check_queue_name(queue: &str) -> Result<()> {
+    if crate::is_valid_queue_name(queue) {
+        return Ok(());
+    }
+    Err(Error::InvalidQueue {
+        name: queue.to_owned(),
+        reason: "use 1 to 64 of A-Z a-z 0-9 _ - . (not starting with a dot)",
+    })
+}
 
 /// Whether `at` has passed, to the millisecond backends store.
 fn is_due(at: SystemTime) -> bool {
@@ -357,10 +468,27 @@ impl Queue {
         queues: &[&str],
         wait: Duration,
     ) -> Result<Option<Job<Processing>>> {
+        self.claim_within_limits(worker, queues, &[], wait)
+    }
+
+    /// Like [`claim`](Queue::claim), skipping each queue in `limits` while
+    /// `max` of its jobs claimed this way run across every worker; see
+    /// [`Store::claim_within_limits`]. A slot freed elsewhere is noticed at
+    /// the next check, within about 100 ms while waiting.
+    pub fn claim_within_limits(
+        &self,
+        worker: &str,
+        queues: &[&str],
+        limits: &[GlobalLimit<'_>],
+        wait: Duration,
+    ) -> Result<Option<Job<Processing>>> {
         let deadline = Instant::now() + wait;
         // Checked first: promoting costs a backend call, and a busy queue
         // rarely needs it.
-        if let Some(record) = self.0.claim(worker, queues, Duration::ZERO)? {
+        if let Some(record) = self
+            .0
+            .claim_within_limits(worker, queues, limits, Duration::ZERO)?
+        {
             return Ok(Some(Job::from_record(record)));
         }
         loop {
@@ -378,7 +506,7 @@ impl Queue {
                 None => left,
             };
             let started = Instant::now();
-            if let Some(record) = self.0.claim(worker, queues, until)? {
+            if let Some(record) = self.0.claim_within_limits(worker, queues, limits, until)? {
                 return Ok(Some(Job::from_record(record)));
             }
             // After the last wait, make one final promotion/nonblocking claim:
@@ -448,6 +576,57 @@ impl Queue {
             JobState::Scheduled => Failed::Scheduled(Job::from_record(record)),
             _ => Failed::Retry(Job::from_record(record)),
         })
+    }
+
+    /// The paused queues, sorted; see [`Store::paused_queues`].
+    pub fn paused_queues(&self) -> Result<Vec<String>> {
+        self.0.paused_queues()
+    }
+
+    /// Pauses `queue`: workers stop claiming from it within about a second,
+    /// and the jobs already running finish. It still accepts jobs, and
+    /// scheduled jobs are still promoted onto it. Returns `false` if it was
+    /// already paused.
+    pub fn pause_queue(&self, queue: &str) -> Result<bool> {
+        check_queue_name(queue)?;
+        self.0.pause_queue(queue)
+    }
+
+    /// Resumes a paused `queue`. Returns `false` if it wasn't paused.
+    pub fn resume_queue(&self, queue: &str) -> Result<bool> {
+        check_queue_name(queue)?;
+        self.0.resume_queue(queue)
+    }
+
+    /// Stores or refreshes recurring schedules; see
+    /// [`Store::register_recurring`].
+    pub fn register_recurring(
+        &self,
+        schedules: &[RecurringRecord],
+    ) -> Result<Vec<RecurringRecord>> {
+        self.0.register_recurring(schedules)
+    }
+
+    /// Enqueues `job` as tick `tick` of recurring schedule `key`, unless some
+    /// worker already did. Returns its id, or `None` if the tick was taken.
+    /// A run time on `job` is ignored: it is pending at once.
+    pub fn push_recurring(
+        &self,
+        key: &str,
+        tick: SystemTime,
+        mut job: NewJob,
+    ) -> Result<Option<JobId>> {
+        job.run_at = None;
+        self.0.push_recurring(key, tick, job)
+    }
+
+    /// Every registered recurring schedule, sorted by key.
+    pub fn recurring(&self) -> Result<Vec<RecurringRecord>> {
+        self.0.recurring()
+    }
+
+    pub fn remove_recurring(&self, key: &str) -> Result<bool> {
+        self.0.remove_recurring(key)
     }
 
     pub fn heartbeat(&self, worker: &str, ttl: Duration) -> Result<()> {

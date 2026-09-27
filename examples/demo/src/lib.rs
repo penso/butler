@@ -69,3 +69,10 @@ pub async fn alert(tick: u64) {
         std::process::id()
     );
 }
+
+/// Enqueued by the workers themselves, once a minute between them: the
+/// `[[recurring]]` entry in `butler.toml`.
+#[butler::job(name = "demo.summary")]
+pub async fn summary(label: String) {
+    println!("[worker {}] recurring summary: {label}", std::process::id());
+}

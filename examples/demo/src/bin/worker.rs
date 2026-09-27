@@ -9,15 +9,25 @@
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
     let config = butler::Config::load()?;
-    let worker = butler::Worker::from_config(&config)?
+    // The jobs live in another crate, so they are registered before the
+    // `[[recurring]]` entries that name them are read.
+    let worker = butler::Worker::new(config.connect()?)
         .register(demo::process_tick::JOB)
-        .register(demo::alert::JOB);
+        .register(demo::alert::JOB)
+        .register(demo::summary::JOB)
+        .with_config(&config.worker)
+        .with_recurring_config(&config.recurring)?;
     println!(
-        "[worker {}] started on {}, jobs: {:?}, queues: {:?}",
+        "[worker {}] started on {}, jobs: {:?}, queues: {:?}, recurring: {:?}",
         std::process::id(),
         worker.queue().describe(),
         worker.job_names(),
-        worker.served_queues()
+        worker.served_queues(),
+        worker
+            .recurring_schedules()
+            .iter()
+            .map(|schedule| format!("{} ({})", schedule.name(), schedule.cron().expression()))
+            .collect::<Vec<_>>()
     );
 
     worker

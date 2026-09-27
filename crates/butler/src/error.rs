@@ -59,6 +59,10 @@ pub enum Error {
     #[error("invalid backoff `{value}`: {reason}")]
     InvalidBackoff { value: String, reason: &'static str },
 
+    /// A job's concurrency limit is 0, which would keep it waiting forever.
+    #[error("concurrency limit of `{key}` must be at least 1")]
+    InvalidConcurrencyLimit { key: String },
+
     #[error("invalid cron expression `{expression}`")]
     InvalidCron {
         expression: String,

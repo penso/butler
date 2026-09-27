@@ -295,6 +295,10 @@ struct JobPage {
     args: String,
     /// What enqueue layers stored with the job, if anything.
     meta: Option<String>,
+    /// Its concurrency key and limit.
+    concurrency: Option<(String, u32)>,
+    /// Its unique key, and until when ("until started").
+    unique: Option<(String, &'static str)>,
     last_error: Option<String>,
     result: Option<String>,
     progress: Option<String>,
@@ -336,6 +340,17 @@ pub(crate) async fn job(
             .map(|ms| (ms, until(ms))),
         args: pretty(&record.args),
         meta: (!record.meta.is_empty()).then(|| pretty(&record.meta)),
+        concurrency: record
+            .concurrency
+            .as_ref()
+            .map(|key| (key.key.clone(), key.limit)),
+        unique: record.unique.as_ref().map(|key| {
+            let until = match key.until {
+                butler::Unique::UntilStarted => "until started",
+                butler::Unique::UntilFinished => "until finished",
+            };
+            (key.key.clone(), until)
+        }),
         last_error: record.last_error.clone(),
         result: record.result.as_ref().map(pretty),
         progress: record.progress.as_ref().map(pretty),

@@ -41,6 +41,12 @@ pub struct JobRecord {
     /// [`JobContext`](crate::JobContext).
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub meta: serde_json::Map<String, Value>,
+    /// Its per-key concurrency limit, from `#[job(concurrency_key = ...)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<crate::ConcurrencyKey>,
+    /// Its uniqueness, from `#[job(unique = ...)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unique: Option<crate::UniqueKey>,
 }
 
 impl JobRecord {
@@ -65,6 +71,8 @@ impl JobRecord {
             progress: None,
             run_at_ms: None,
             meta: serde_json::Map::new(),
+            concurrency: None,
+            unique: None,
         }
     }
 

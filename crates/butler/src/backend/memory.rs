@@ -52,6 +52,11 @@ struct State {
     /// Per worker. A set: a worker can hold a great many jobs at once, and
     /// finishing one must not scan the others.
     processing: HashMap<String, HashSet<JobId>>,
+    /// Per concurrency key, the jobs running with it.
+    running_keys: HashMap<String, HashSet<JobId>>,
+    /// Per unique key, the job holding it. Checked against that job's state,
+    /// so a lock left by a job that moved on is free.
+    unique: HashMap<String, JobId>,
     /// Queues an operator paused.
     paused: BTreeSet<String>,
     /// Per queue with a global limit, the jobs running in one of its slots.
@@ -95,16 +100,19 @@ impl MemoryQueue {
 }
 
 impl State {
-    /// Takes job `id` out of `worker`'s processing area, and frees its
-    /// global-limit slot if it held one. Returns whether a slot was freed.
-    /// A worker that no longer holds the job (it was recovered and claimed
-    /// again) frees nothing: the slot is the new claim's.
-    fn release(&mut self, worker: &str, id: &str, queue: &str) -> bool {
+    /// Takes `job` out of `worker`'s processing area, and frees its
+    /// global-limit slot and its concurrency key. Returns whether anything
+    /// was freed, which lets a waiting claim take a job. A worker that no
+    /// longer holds the job (it was recovered and claimed again) frees no
+    /// slot: the slot is the new claim's.
+    fn release(&mut self, worker: &str, job: &JobRecord) -> bool {
         let held = self
             .processing
             .get_mut(worker)
-            .is_some_and(|held| held.remove(id));
-        held && self.free_slot(queue, id)
+            .is_some_and(|held| held.remove(&job.id));
+        let slot = held && self.free_slot(&job.queue, &job.id);
+        let key = self.free_key(job);
+        slot || key
     }
 
     fn free_slot(&mut self, queue: &str, id: &str) -> bool {
@@ -113,9 +121,79 @@ impl State {
             .is_some_and(|slots| slots.remove(id))
     }
 
+    fn free_key(&mut self, job: &JobRecord) -> bool {
+        job.concurrency.as_ref().is_some_and(|concurrency| {
+            self.running_keys
+                .get_mut(&concurrency.key)
+                .is_some_and(|running| running.remove(&job.id))
+        })
+    }
+
+    /// Frees `job`'s unique key, if it still holds it.
+    fn unlock(&mut self, job: &JobRecord) {
+        if let Some(unique) = &job.unique
+            && self.unique.get(&unique.key) == Some(&job.id)
+        {
+            self.unique.remove(&unique.key);
+        }
+    }
+
+    /// The job holding `job`'s unique key, if one does.
+    fn unique_holder(&self, job: &JobRecord) -> Option<JobId> {
+        let unique = job.unique.as_ref()?;
+        let holder = self.unique.get(&unique.key)?;
+        let (state, _) = self.jobs.get(holder)?;
+        unique.until.holds_in(*state).then(|| holder.clone())
+    }
+
+    /// Whether `id` may start: its concurrency key, if any, has room.
+    fn has_room(&self, id: &str) -> bool {
+        let Some((_, job)) = self.jobs.get(id) else {
+            return true;
+        };
+        job.concurrency.as_ref().is_none_or(|concurrency| {
+            self.running_keys
+                .get(&concurrency.key)
+                .map_or(0, HashSet::len)
+                < concurrency.limit as usize
+        })
+    }
+
+    /// Takes the first job of `queue` that may start, skipping those whose
+    /// concurrency key is full, and takes its key.
+    fn take_next(&mut self, queue: &str) -> Option<JobId> {
+        let pending = self.pending.get(queue)?;
+        let position = pending.iter().position(|id| self.has_room(id))?;
+        let id = self.pending.get_mut(queue)?.remove(position)?;
+        if let Some((_, job)) = self.jobs.get(&id) {
+            let job = job.clone();
+            if let Some(concurrency) = &job.concurrency {
+                self.running_keys
+                    .entry(concurrency.key.clone())
+                    .or_default()
+                    .insert(id.clone());
+            }
+            if job
+                .unique
+                .as_ref()
+                .is_some_and(|unique| unique.until == crate::Unique::UntilStarted)
+            {
+                self.unlock(&job);
+            }
+        }
+        Some(id)
+    }
+
     /// Stores a new job: pending on its queue, or scheduled if it has a run
-    /// time.
+    /// time. A unique job whose key is held stores nothing, and gets the
+    /// holder's id.
     fn insert_new(&mut self, job: JobRecord) -> JobId {
+        if let Some(holder) = self.unique_holder(&job) {
+            return holder;
+        }
+        if let Some(unique) = &job.unique {
+            self.unique.insert(unique.key.clone(), job.id.clone());
+        }
         if job.run_at_ms.is_some() {
             return self.insert_scheduled(job);
         }
@@ -214,7 +292,7 @@ impl Store for MemoryQueue {
                 if limit.is_some_and(|max| used >= max) {
                     return None;
                 }
-                let id = locked.pending.get_mut(*queue)?.pop_front()?;
+                let id = locked.take_next(queue)?;
                 if limit.is_some() {
                     locked
                         .slots
@@ -251,9 +329,10 @@ impl Store for MemoryQueue {
 
     fn complete(&self, worker: &str, job: &JobRecord) -> Result<()> {
         let mut state = self.lock();
-        if state.release(worker, &job.id, &job.queue) {
+        if state.release(worker, job) {
             self.inner.pushed.notify_all();
         }
+        state.unlock(job);
         state
             .jobs
             .insert(job.id.clone(), (JobState::Done, job.clone()));
@@ -263,8 +342,11 @@ impl Store for MemoryQueue {
 
     fn fail(&self, worker: &str, job: &JobRecord, next: JobState) -> Result<()> {
         let mut state = self.lock();
-        if state.release(worker, &job.id, &job.queue) {
+        if state.release(worker, job) {
             self.inner.pushed.notify_all();
+        }
+        if next == JobState::Dead {
+            state.unlock(job);
         }
         if next == JobState::Scheduled {
             state.insert_scheduled(job.clone());
@@ -327,8 +409,10 @@ impl Store for MemoryQueue {
             }
             _ => return Ok(false),
         }
-        if let Some((job_state, _)) = state.jobs.get_mut(id) {
+        if let Some((job_state, job)) = state.jobs.get_mut(id) {
             *job_state = JobState::Cancelled;
+            let job = job.clone();
+            state.unlock(&job);
         }
         self.inner.finished.notify(id);
         Ok(true)
@@ -375,8 +459,10 @@ impl Store for MemoryQueue {
                     continue;
                 };
                 *job_state = JobState::Pending;
-                let queue = job.queue.clone();
-                state.free_slot(&queue, &id);
+                let job = job.clone();
+                state.free_key(&job);
+                state.free_slot(&job.queue, &id);
+                let queue = job.queue;
                 // Claimed before anything still pending, so it goes first.
                 state.pending.entry(queue).or_default().push_front(id);
                 recovered += 1;

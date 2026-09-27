@@ -26,6 +26,13 @@
 //! `butler::Retryable`, each error decides whether and when to retry; for
 //! errors wrapped in a `BoxError` or `anyhow::Error`, register the inner type
 //! with `butler::retryable!`.
+//!
+//! `#[job(concurrency_key = "account_id", limit = 2)]` runs at most two jobs
+//! with the same `account_id` at once, across every worker (`limit` defaults
+//! to 1; the key may name several arguments, separated by commas), and
+//! `#[job(unique = "until_started")]` (or `"until_finished"`) makes
+//! enqueueing an identical job, same arguments, return the one already
+//! waiting. Argument names are checked here, at compile time.
 //! - `send_email::prepare(...)`, which builds the job without enqueueing it,
 //!   for `butler::enqueue_all`, `.on_queue(..)`, or `.run_in(..)` to schedule it.
 //! - `send_email::JOB`, a handle for `Worker::register`. Jobs defined in another
@@ -53,6 +60,10 @@ struct Attrs {
     queue: Option<LitStr>,
     retries: Option<LitInt>,
     backoff: Option<proc_macro2::TokenStream>,
+    /// The argument names the concurrency key is made of.
+    concurrency_key: Option<LitStr>,
+    limit: Option<LitInt>,
+    unique: Option<proc_macro2::TokenStream>,
 }
 
 #[proc_macro_attribute]
@@ -79,6 +90,28 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
                 )
             })?);
             Ok(())
+        } else if meta.path.is_ident("concurrency_key") {
+            attrs.concurrency_key = Some(meta.value()?.parse()?);
+            Ok(())
+        } else if meta.path.is_ident("limit") {
+            let value: LitInt = meta.value()?.parse()?;
+            if value.base10_parse::<u32>()? == 0 {
+                return Err(syn::Error::new(
+                    value.span(),
+                    "a concurrency limit starts at 1",
+                ));
+            }
+            attrs.limit = Some(value);
+            Ok(())
+        } else if meta.path.is_ident("unique") {
+            let value: LitStr = meta.value()?.parse()?;
+            attrs.unique = Some(unique(&value.value()).ok_or_else(|| {
+                syn::Error::new(
+                    value.span(),
+                    "unique is \"until_started\" or \"until_finished\"",
+                )
+            })?);
+            Ok(())
         } else if meta.path.is_ident("queue") {
             let value: LitStr = meta.value()?.parse()?;
             if !is_valid_queue_name(&value.value()) {
@@ -91,7 +124,8 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
             Ok(())
         } else {
             Err(meta.error(
-                "unsupported job attribute, expected `name`, `queue`, `retries` or `backoff`",
+                "unsupported job attribute, expected `name`, `queue`, `retries`, `backoff`, \
+                 `concurrency_key`, `limit` or `unique`",
             ))
         }
     });
@@ -117,6 +151,61 @@ fn is_valid_queue_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+/// Same names as `butler::Unique::parse`, checked at compile time, as the
+/// `butler::Unique` to put in the job's `JobDef`.
+fn unique(value: &str) -> Option<proc_macro2::TokenStream> {
+    match value {
+        "until_started" => Some(quote!(::butler::Unique::UntilStarted)),
+        "until_finished" => Some(quote!(::butler::Unique::UntilFinished)),
+        _ => None,
+    }
+}
+
+/// The positions, among the arguments callers pass, of the names in `key`.
+fn key_positions(
+    key: &LitStr,
+    args: &[syn::Ident],
+    progress: Option<&syn::Ident>,
+) -> syn::Result<Vec<usize>> {
+    let mut positions = Vec::new();
+    for name in key.value().split(',').map(str::trim) {
+        if name.is_empty() {
+            return Err(syn::Error::new(
+                key.span(),
+                "concurrency_key names the job's arguments, separated by commas",
+            ));
+        }
+        if progress.is_some_and(|progress| progress == name) {
+            return Err(syn::Error::new(
+                key.span(),
+                format!("`{name}` is the job's Progress, not an argument callers pass"),
+            ));
+        }
+        let Some(position) = args.iter().position(|arg| arg == name) else {
+            let names: Vec<String> = args.iter().map(ToString::to_string).collect();
+            return Err(syn::Error::new(
+                key.span(),
+                format!(
+                    "`{name}` is not an argument of this job; its arguments are: {}",
+                    if names.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        names.join(", ")
+                    }
+                ),
+            ));
+        };
+        if positions.contains(&position) {
+            return Err(syn::Error::new(
+                key.span(),
+                format!("`{name}` is named twice in concurrency_key"),
+            ));
+        }
+        positions.push(position);
+    }
+    Ok(positions)
 }
 
 /// Same forms as `butler::Backoff`'s `FromStr`, checked at compile time, as
@@ -148,7 +237,16 @@ fn expand(func: ItemFn, attrs: Attrs) -> syn::Result<proc_macro2::TokenStream> {
         queue,
         retries,
         backoff,
+        concurrency_key,
+        limit,
+        unique,
     } = attrs;
+    if let (None, Some(limit)) = (&concurrency_key, &limit) {
+        return Err(syn::Error::new(
+            limit.span(),
+            "limit caps jobs per concurrency_key: add concurrency_key = \"<argument>\"",
+        ));
+    }
     let sig = &func.sig;
     let is_async = sig.asyncness.is_some();
     if !sig.generics.params.is_empty() {
@@ -217,6 +315,24 @@ fn expand(func: ItemFn, attrs: Attrs) -> syn::Result<proc_macro2::TokenStream> {
     };
     let backoff = match backoff {
         Some(backoff) => quote!(::core::option::Option::Some(#backoff)),
+        None => quote!(::core::option::Option::None),
+    };
+    let concurrency = match &concurrency_key {
+        Some(key) => {
+            let positions = key_positions(key, &idents, progress.as_ref().map(|(ident, _)| ident))?;
+            let limit = match &limit {
+                Some(limit) => quote!(#limit),
+                None => quote!(1),
+            };
+            quote!(::core::option::Option::Some(::butler::ConcurrencyLimit {
+                args: &[#(#positions),*],
+                limit: #limit,
+            }))
+        }
+        None => quote!(::core::option::Option::None),
+    };
+    let unique = match unique {
+        Some(unique) => quote!(::core::option::Option::Some(#unique)),
         None => quote!(::core::option::Option::None),
     };
     let perform = format_ident!("__butler_perform_{}", name);
@@ -293,6 +409,8 @@ fn expand(func: ItemFn, attrs: Attrs) -> syn::Result<proc_macro2::TokenStream> {
                     queue: #queue,
                     retries: #retries,
                     backoff: #backoff,
+                    concurrency: #concurrency,
+                    unique: #unique,
                     perform: super::#dispatch,
                 };
 

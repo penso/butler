@@ -25,7 +25,8 @@ pub use self::redis::RedisQueue;
 pub use self::sqlite::{SqliteQueue, WATCH_TICK as SQLITE_WATCH_TICK};
 pub use self::{file::FileQueue, memory::MemoryQueue};
 use crate::{
-    AnyJob, Error, Failed, Job, JobId, JobRecord, JobState, Result, Retry, RetryPolicy, Signal,
+    AnyJob, ConcurrencyKey, Error, Failed, Job, JobDef, JobId, JobRecord, JobState, Result, Retry,
+    RetryPolicy, Signal, UniqueKey,
     job::{after, millis},
     monitor::{JobMetric, ListFilter, MetricBucket, Stats},
     recurring::RecurringRecord,
@@ -289,6 +290,13 @@ pub struct NewJob {
     /// Stored with the job as its [`JobRecord::meta`]: what enqueue layers
     /// add, such as a tenant or a trace id, for worker layers to read.
     pub meta: Map<String, Value>,
+    /// At most `limit` jobs with its key run at once, across every worker:
+    /// claims skip it while its key is full. Set from
+    /// `#[job(concurrency_key = ..., limit = ...)]`.
+    pub concurrency: Option<ConcurrencyKey>,
+    /// While a job with the same key holds it, pushing this one stores
+    /// nothing and returns that job's id. Set from `#[job(unique = ...)]`.
+    pub unique: Option<UniqueKey>,
 }
 
 impl NewJob {
@@ -300,7 +308,22 @@ impl NewJob {
             args,
             run_at: None,
             meta: Map::new(),
+            concurrency: None,
+            unique: None,
         }
+    }
+
+    /// A job for `def`, with the concurrency and unique keys its
+    /// `#[job(...)]` attributes ask for.
+    pub fn for_job(def: &JobDef, queue: impl Into<String>, args: Vec<Value>) -> Self {
+        let mut job = Self::new(def.name, queue, args);
+        job.concurrency = def
+            .concurrency
+            .map(|limit| ConcurrencyKey::new(def.name, &job.args, &limit));
+        job.unique = def
+            .unique
+            .map(|until| UniqueKey::new(def.name, &job.args, until));
+        job
     }
 
     /// The same job, scheduled for `at`.
@@ -315,6 +338,8 @@ impl NewJob {
         let mut job = JobRecord::owned(self.name, self.queue, self.args);
         job.run_at_ms = self.run_at.map(millis);
         job.meta = self.meta;
+        job.concurrency = self.concurrency;
+        job.unique = self.unique;
         job
     }
 }

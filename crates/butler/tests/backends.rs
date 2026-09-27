@@ -13,8 +13,8 @@ use std::{
 };
 
 use butler::{
-    AnyJob, Backoff, Cron, Failed, FileQueue, GlobalLimit, JITTER, JobState, MemoryQueue, NewJob,
-    Queue, Recurring, RecurringRecord, Retry, RetryPolicy,
+    AnyJob, Backoff, ConcurrencyKey, Cron, Failed, FileQueue, GlobalLimit, JITTER, JobState,
+    MemoryQueue, NewJob, Queue, Recurring, RecurringRecord, Retry, RetryPolicy, Unique, UniqueKey,
     monitor::{JobMetric, ListFilter},
 };
 use serde_json::json;
@@ -969,6 +969,274 @@ fn metadata_is_kept_through_scheduling_claims_retries_and_recovery() {
     }
 }
 
+/// A job whose concurrency key is `key`, with `limit`.
+fn keyed(name: &str, key: &str, limit: u32) -> NewJob {
+    let mut job = NewJob::new(name, "default", vec![json!(key)]);
+    job.concurrency = Some(ConcurrencyKey {
+        key: format!("sync:[{key:?}]"),
+        limit,
+    });
+    job
+}
+
+#[test]
+fn claims_skip_jobs_whose_concurrency_key_is_full() {
+    for (queue, _) in backends("ckey-skip") {
+        let name = queue.describe();
+        let a1 = queue.push_job(keyed("a1", "a", 1)).unwrap();
+        let a2 = queue.push_job(keyed("a2", "a", 1)).unwrap();
+        let b1 = queue.push_job(keyed("b1", "b", 1)).unwrap();
+        let plain = queue.push("plain", "default", vec![]).unwrap();
+        let a3 = queue.push_job(keyed("a3", "a", 1)).unwrap();
+        let claim = |worker: &str| queue.claim(worker, DEFAULT, NOW).unwrap();
+
+        let first = claim("w1").unwrap();
+        assert_eq!(first.id(), a1, "{name}");
+        // "a" is running: a2 is skipped, and the jobs behind it are not held back.
+        assert_eq!(claim("w2").unwrap().id(), b1, "{name}");
+        assert_eq!(claim("w3").unwrap().id(), plain, "{name}");
+        assert!(claim("w4").is_none(), "{name}: only a's jobs are left");
+        assert_eq!(queue.state(&a2), Some(JobState::Pending), "{name}");
+
+        // a1 finishes: a2, then a3, in their order.
+        queue.complete("w1", first, json!(null)).unwrap();
+        let second = claim("w4").unwrap();
+        assert_eq!(second.id(), a2, "{name}");
+        assert!(claim("w5").is_none(), "{name}");
+        queue.complete("w4", second, json!(null)).unwrap();
+        assert_eq!(claim("w5").unwrap().id(), a3, "{name}");
+    }
+}
+
+#[test]
+fn a_concurrency_limit_above_one_runs_that_many_per_key() {
+    for (queue, _) in backends("ckey-limit") {
+        let name = queue.describe();
+        for n in 0..4 {
+            queue.push_job(keyed(&format!("j{n}"), "a", 2)).unwrap();
+        }
+        let claim = |worker: &str| queue.claim(worker, DEFAULT, NOW).unwrap();
+        assert!(claim("w1").is_some(), "{name}");
+        assert!(claim("w2").is_some(), "{name}");
+        assert!(claim("w3").is_none(), "{name}: two at most");
+    }
+}
+
+#[test]
+fn every_way_out_of_processing_frees_a_concurrency_key() {
+    for (queue, _) in backends("ckey-release") {
+        let name = queue.describe();
+        for n in 0..6 {
+            queue.push_job(keyed(&format!("j{n}"), "a", 1)).unwrap();
+        }
+        let claim = || queue.claim("w", DEFAULT, NOW).unwrap();
+        let full = |step: &str| {
+            assert!(claim().is_none(), "{name}: the key is held before {step}");
+        };
+
+        let job = claim().unwrap();
+        full("a retry");
+        queue.fail("w", job, "again".into(), 3).unwrap();
+
+        let job = claim().unwrap();
+        full("a delayed retry");
+        let policy = RetryPolicy::new(3, Backoff::Fixed(HOUR));
+        queue.fail("w", job, "later".into(), policy).unwrap();
+
+        let job = claim().unwrap();
+        full("dying");
+        queue.fail("w", job, "dead".into(), 0).unwrap();
+
+        let job = claim().unwrap();
+        full("an interruption");
+        queue.interrupt("w", job).unwrap();
+
+        let job = claim().unwrap();
+        full("completing");
+        queue.complete("w", job, json!(null)).unwrap();
+        assert!(claim().is_some(), "{name}: free again");
+    }
+}
+
+#[test]
+fn recovering_a_crashed_worker_frees_its_concurrency_keys() {
+    for (queue, _) in backends("ckey-recover") {
+        let name = queue.describe();
+        let held = queue.push_job(keyed("held", "a", 1)).unwrap();
+        let waiting = queue.push_job(keyed("waiting", "a", 1)).unwrap();
+        queue.heartbeat("crashed", Duration::from_secs(60)).unwrap();
+        queue.claim("crashed", DEFAULT, NOW).unwrap().unwrap();
+        assert!(
+            queue.claim("alive", DEFAULT, NOW).unwrap().is_none(),
+            "{name}"
+        );
+
+        queue
+            .heartbeat("crashed", Duration::from_millis(1))
+            .unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(queue.recover().unwrap(), 1, "{name}");
+        // The key is free again: one of the two runs, and only one.
+        let next = queue.claim("alive", DEFAULT, NOW).unwrap().unwrap();
+        assert!([&held, &waiting].contains(&&next.id().to_owned()), "{name}");
+        assert!(
+            queue.claim("alive", DEFAULT, NOW).unwrap().is_none(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_job_skipped_for_its_key_stays_pending_counted_listed_and_cancellable() {
+    for (queue, _) in backends("ckey-parked") {
+        let name = queue.describe();
+        queue.push_job(keyed("running", "a", 1)).unwrap();
+        let skipped = queue.push_job(keyed("skipped", "a", 1)).unwrap();
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        assert!(queue.claim("w", DEFAULT, NOW).unwrap().is_none(), "{name}");
+
+        assert_eq!(queue.state(&skipped), Some(JobState::Pending), "{name}");
+        assert_eq!(queue.stats().unwrap().pending(), 1, "{name}");
+        let listed = queue.list(&ListFilter::new(JobState::Pending)).unwrap();
+        let ids: Vec<_> = listed.iter().map(|job| job.record().id.clone()).collect();
+        assert_eq!(ids, std::slice::from_ref(&skipped), "{name}");
+
+        assert!(queue.cancel(&skipped).unwrap(), "{name}");
+        assert_eq!(queue.state(&skipped), Some(JobState::Cancelled), "{name}");
+        queue.complete("w", job, json!(null)).unwrap();
+        assert!(queue.claim("w", DEFAULT, NOW).unwrap().is_none(), "{name}");
+        assert_eq!(queue.stats().unwrap().pending(), 0, "{name}");
+    }
+}
+
+#[test]
+fn concurrent_claims_never_exceed_a_concurrency_key_limit() {
+    for (queue, _) in backends("ckey-race") {
+        let name = queue.describe();
+        for n in 0..12 {
+            queue.push_job(keyed(&format!("j{n}"), "a", 3)).unwrap();
+        }
+        let claimers: Vec<_> = (0..8)
+            .map(|n| {
+                let queue = queue.clone();
+                thread::spawn(move || {
+                    queue
+                        .claim(&format!("w{n}"), DEFAULT, NOW)
+                        .unwrap()
+                        .is_some()
+                })
+            })
+            .collect();
+        let claimed = claimers
+            .into_iter()
+            .filter_map(|claimer| claimer.join().unwrap().then_some(()))
+            .count();
+        assert_eq!(claimed, 3, "{name}");
+    }
+}
+
+/// A job that is unique on `key` until `until`.
+fn unique(key: &str, until: Unique) -> NewJob {
+    let mut job = NewJob::new("refresh", "default", vec![json!(key)]);
+    job.unique = Some(UniqueKey {
+        key: format!("refresh:[{key:?}]"),
+        until,
+    });
+    job
+}
+
+#[test]
+fn a_unique_job_until_started_is_stored_once_while_it_waits() {
+    for (queue, _) in backends("unique-started") {
+        let name = queue.describe();
+        let first = queue.push_job(unique("a", Unique::UntilStarted)).unwrap();
+        let again = queue.push_job(unique("a", Unique::UntilStarted)).unwrap();
+        assert_eq!(again, first, "{name}: the waiting one");
+        let other = queue.push_job(unique("b", Unique::UntilStarted)).unwrap();
+        assert_ne!(other, first, "{name}: other arguments are another job");
+        assert_eq!(queue.stats().unwrap().pending(), 2, "{name}");
+
+        // Scheduled counts as waiting.
+        let later = unique("c", Unique::UntilStarted).run_at(SystemTime::now() + HOUR);
+        let scheduled = queue.push_job(later.clone()).unwrap();
+        assert_eq!(queue.push_job(later).unwrap(), scheduled, "{name}");
+
+        // Once a worker starts it, an identical job can wait again.
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        assert_eq!(job.id(), first, "{name}");
+        let next = queue.push_job(unique("a", Unique::UntilStarted)).unwrap();
+        assert_ne!(next, first, "{name}");
+
+        // Cancelling frees it too.
+        assert!(queue.cancel(&next).unwrap(), "{name}");
+        let after_cancel = queue.push_job(unique("a", Unique::UntilStarted)).unwrap();
+        assert_ne!(after_cancel, next, "{name}");
+    }
+}
+
+#[test]
+fn a_unique_job_until_finished_keeps_its_key_through_retries() {
+    for (queue, _) in backends("unique-finished") {
+        let name = queue.describe();
+        let job_of = |key| unique(key, Unique::UntilFinished);
+        let first = queue.push_job(job_of("a")).unwrap();
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        assert_eq!(
+            queue.push_job(job_of("a")).unwrap(),
+            first,
+            "{name}: running"
+        );
+        queue.fail("w", job, "again".into(), 3).unwrap();
+        assert_eq!(
+            queue.push_job(job_of("a")).unwrap(),
+            first,
+            "{name}: retrying"
+        );
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        queue.complete("w", job, json!(null)).unwrap();
+        let second = queue.push_job(job_of("a")).unwrap();
+        assert_ne!(second, first, "{name}: done frees it");
+
+        // Dying frees it as well.
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        queue.fail("w", job, "dead".into(), 0).unwrap();
+        assert_ne!(queue.push_job(job_of("a")).unwrap(), second, "{name}");
+    }
+}
+
+#[test]
+fn concurrent_pushes_of_a_unique_job_store_it_once() {
+    for (queue, _) in backends("unique-race") {
+        let name = queue.describe();
+        let pushers: Vec<_> = (0..8)
+            .map(|_| {
+                let queue = queue.clone();
+                thread::spawn(move || queue.push_job(unique("a", Unique::UntilFinished)).unwrap())
+            })
+            .collect();
+        let ids: HashSet<_> = pushers
+            .into_iter()
+            .map(|pusher| pusher.join().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 1, "{name}: every push got the same job");
+        let a = ids.into_iter().next().unwrap();
+        assert_eq!(queue.stats().unwrap().pending(), 1, "{name}");
+
+        // In one batch too, duplicates of the batch included.
+        let ids = queue
+            .push_many(vec![
+                unique("a", Unique::UntilFinished),
+                unique("b", Unique::UntilFinished),
+                unique("b", Unique::UntilFinished),
+            ])
+            .unwrap();
+        assert_eq!(ids[0], a, "{name}");
+        assert_eq!(ids[1], ids[2], "{name}");
+        assert_ne!(ids[1], a, "{name}");
+        assert_eq!(queue.stats().unwrap().pending(), 2, "{name}");
+    }
+}
+
 #[test]
 fn paused_queues_are_listed_until_resumed() {
     for (queue, _) in backends("pause") {
@@ -1360,5 +1628,39 @@ fn removing_a_schedule_rejects_invalid_keys_without_changing_jobs() {
             assert_eq!(queue.recurring().unwrap().len(), 1);
         }
         assert_eq!(queue.claim("w", DEFAULT, NOW).unwrap().unwrap().id(), id);
+    }
+}
+
+#[test]
+fn a_global_limit_and_concurrency_keys_apply_together() {
+    for (queue, _) in backends("global-and-keys") {
+        let name = queue.describe();
+        let on_mailers = |job: NewJob| NewJob {
+            queue: "mailers".into(),
+            ..job
+        };
+        let a1 = queue.push_job(on_mailers(keyed("a1", "a", 1))).unwrap();
+        let a2 = queue.push_job(on_mailers(keyed("a2", "a", 1))).unwrap();
+        let b1 = queue.push_job(on_mailers(keyed("b1", "b", 1))).unwrap();
+        let c1 = queue.push_job(on_mailers(keyed("c1", "c", 1))).unwrap();
+        let limits = at_most(2);
+        let claim = |worker: &str| {
+            queue
+                .claim_within_limits(worker, MAILERS, &limits, NOW)
+                .unwrap()
+        };
+
+        let first = claim("w1").unwrap();
+        assert_eq!(first.id(), a1, "{name}");
+        // a2 is skipped for its key, without taking a slot: b1 gets the second.
+        assert_eq!(claim("w2").unwrap().id(), b1, "{name}");
+        // Both slots are in use: c1 waits, though its key is free.
+        assert!(claim("w3").is_none(), "{name}");
+
+        // a1 finishes: its slot and its key are free, so a2 is next in line.
+        queue.complete("w1", first, json!(null)).unwrap();
+        assert_eq!(claim("w3").unwrap().id(), a2, "{name}");
+        assert!(claim("w4").is_none(), "{name}");
+        assert_eq!(queue.state(&c1), Some(JobState::Pending), "{name}");
     }
 }

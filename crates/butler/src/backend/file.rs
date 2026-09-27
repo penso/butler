@@ -13,11 +13,28 @@
 //! <dir>/done/                  succeeded
 //! <dir>/dead/                  failed after exhausting retries
 //! <dir>/cancelled/             removed from pending/ before a worker claimed it
+//! <dir>/ckeys/<key>/<n>         a running job's concurrency slot: "<worker>\n<job id>"
+//! <dir>/unique/<key>            the id of the job holding that unique key
 //! <dir>/paused/<queue>          a queue workers don't claim from
 //! <dir>/slots/<queue>/<n>       a global-limit slot in use: "<worker>\n<job id>"
 //! <dir>/recurring/schedules/<key>.json   a recurring schedule workers registered
 //! <dir>/recurring/ticks/<key>/<tick ms>  one per tick enqueued, holding its job id
 //! ```
+//!
+//! A pending job with a concurrency key is named `<id>~<key>~<limit>.json`
+//! (`<key>` being the key's hash), so a claim can skip jobs whose key is
+//! full without reading them. Claiming one first takes one of the slot
+//! names `0` to `limit - 1` in `ckeys/<key>/` by hard-linking a file naming
+//! the worker (a link fails if the name exists, so each slot has one
+//! holder), then renames the job, and gives the slot back if the rename
+//! lost. Processing files are always `<id>.json`. The holding worker frees
+//! the slot when the job finishes; `recover` frees a stopped worker's.
+//!
+//! A unique job's push hard-links a file holding its id to `unique/<key>`.
+//! If that name exists and the job it names still holds the key, the push
+//! stores nothing and returns that id; a lock whose job moved on is removed
+//! and the link tried again. That replacement is best effort: two pushes
+//! replacing the same stale lock at once could both store their job.
 //!
 //! Cancelling is a rename from `pending/<queue>/` or `scheduled/` to
 //! `cancelled/`, promoting a due job is a rename from `scheduled/` to
@@ -43,7 +60,7 @@
 //! between the two steps loses that one tick: the marker says it ran.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
@@ -70,6 +87,12 @@ const LOOKUP_ORDER: [JobState; 6] = [
 ];
 
 const WORKERS: &str = "workers";
+const CKEYS: &str = "ckeys";
+const UNIQUE: &str = "unique";
+
+/// How long a unique lock whose job isn't written yet counts as held: its
+/// push writes the job right after taking the lock, unless it crashed.
+const UNWRITTEN_LOCK_GRACE: Duration = Duration::from_secs(10);
 const PAUSED: &str = "paused";
 const SLOTS: &str = "slots";
 const SCHEDULES: &str = "recurring/schedules";
@@ -183,7 +206,7 @@ impl FileQueue {
         };
         let dir = self.pending(&job.queue);
         fs::create_dir_all(&dir)?;
-        match fs::rename(path, dir.join(format!("{}.json", job.id))) {
+        match fs::rename(path, dir.join(pending_name(&job))) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.into()),
@@ -199,8 +222,16 @@ impl FileQueue {
                 }
                 continue;
             }
-            // One level of subdirectories: per worker, or per queue.
-            if matches!(state, JobState::Processing | JobState::Pending) {
+            if state == JobState::Pending {
+                for queue in fs::read_dir(self.dir(state))? {
+                    if let Some(path) = self.pending_file(&queue?.path(), id)? {
+                        return Ok(Some((state, path)));
+                    }
+                }
+                continue;
+            }
+            // One level of subdirectories: per worker.
+            if state == JobState::Processing {
                 for sub in fs::read_dir(self.dir(state))? {
                     let path = sub?.path().join(&file);
                     if path.exists() {
@@ -246,17 +277,41 @@ impl FileQueue {
         Ok(self.root.join("tmp").join(unique))
     }
 
-    fn slots(&self, queue: &str) -> PathBuf {
-        self.root.join(SLOTS).join(queue)
+    /// Job `id`'s file in the pending directory `dir`, keyed name or not.
+    fn pending_file(&self, dir: &Path, id: &str) -> Result<Option<PathBuf>> {
+        let plain = dir.join(format!("{id}.json"));
+        if plain.exists() {
+            return Ok(Some(plain));
+        }
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let prefix = format!("{id}~");
+        for entry in entries {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+            {
+                return Ok(Some(entry.path()));
+            }
+        }
+        Ok(None)
     }
 
-    /// Takes a free slot of `queue`'s `max` for `worker`, or `None` if all
-    /// are in use. The slot file names the worker until
+    fn ckey_slots(&self, hash: &str) -> PathBuf {
+        self.root.join(CKEYS).join(hash)
+    }
+
+    /// Takes a free slot among `0..max` in `dir` for `worker`, or `None` if
+    /// every one is in use. The slot names the worker until
     /// [`hold_slot`](Self::hold_slot) adds the job.
-    fn take_slot(&self, queue: &str, max: usize, worker: &str) -> Result<Option<PathBuf>> {
-        let dir = self.slots(queue);
-        fs::create_dir_all(&dir)?;
-        let staged = self.staged(format!("slot-{queue}").as_ref())?;
+    fn take_slot(&self, dir: &Path, max: usize, worker: &str) -> Result<Option<PathBuf>> {
+        fs::create_dir_all(dir)?;
+        let staged = self.staged("slot".as_ref())?;
         fs::write(&staged, format!("{worker}\n"))?;
         let mut taken = None;
         for n in 0..max {
@@ -277,17 +332,16 @@ impl FileQueue {
         Ok(taken)
     }
 
-    /// Records that the job in `slot` is `id`, so completing it frees it.
+    /// Records that the job in `slot` is `id`, so finishing it frees it.
     fn hold_slot(&self, slot: &Path, worker: &str, id: &str) -> Result<()> {
         self.write_atomic(slot, format!("{worker}\n{id}").as_bytes())
     }
 
-    /// Frees the slots of `queue` that `holds` accepts, given each one's
+    /// Frees the slots in `dir` that `holds` accepts, given each one's
     /// worker and job id.
-    fn free_slots(&self, queue: &str, holds: impl Fn(&str, &str) -> bool) -> Result<()> {
-        let entries = match fs::read_dir(self.slots(queue)) {
+    fn free_slots(&self, dir: &Path, holds: impl Fn(&str, &str) -> bool) -> Result<()> {
+        let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
-            // No global limit on this queue.
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
         };
@@ -304,6 +358,84 @@ impl FileQueue {
             }
         }
         Ok(())
+    }
+
+    /// Frees the concurrency slot `worker` holds for `job`, if any.
+    fn release_key(&self, worker: &str, job: &JobRecord) -> Result<()> {
+        match &job.concurrency {
+            Some(concurrency) => self.free_slots(&self.ckey_slots(&concurrency.hash()), |w, id| {
+                w == worker && id == job.id
+            }),
+            None => Ok(()),
+        }
+    }
+
+    fn unique_lock(&self, unique: &crate::UniqueKey) -> PathBuf {
+        self.root.join(UNIQUE).join(unique.hash())
+    }
+
+    /// Frees `job`'s unique key, if it still holds it.
+    fn unlock(&self, job: &JobRecord) -> Result<()> {
+        let Some(unique) = &job.unique else {
+            return Ok(());
+        };
+        let lock = self.unique_lock(unique);
+        match fs::read_to_string(&lock) {
+            Ok(holder) if holder == job.id => ignore_missing(fs::remove_file(lock)),
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Takes `job`'s unique key, or returns the id of the job holding it.
+    fn lock_unique(&self, job: &JobRecord, unique: &crate::UniqueKey) -> Result<Option<JobId>> {
+        let lock = self.unique_lock(unique);
+        fs::create_dir_all(self.root.join(UNIQUE))?;
+        let staged = self.staged("unique".as_ref())?;
+        fs::write(&staged, &job.id)?;
+        let result = (|| {
+            for _ in 0..16 {
+                match fs::hard_link(&staged, &lock) {
+                    Ok(()) => return Ok(None),
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e.into()),
+                }
+                let holder = match fs::read_to_string(&lock) {
+                    Ok(holder) => holder,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                let holds = match self.get(&holder)? {
+                    Some((state, record)) => record
+                        .unique
+                        .map_or(unique.until, |key| key.until)
+                        .holds_in(state),
+                    // Its push took the lock and is still writing the job,
+                    // unless it crashed in between long ago.
+                    None => fs::metadata(&lock)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|at| at.elapsed().ok())
+                        .is_none_or(|age| age < UNWRITTEN_LOCK_GRACE),
+                };
+                if holds {
+                    return Ok(Some(holder));
+                }
+                // Left by a job that moved on: replace it.
+                ignore_missing(fs::remove_file(&lock))?;
+            }
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "unique lock kept changing while enqueueing",
+            )
+            .into())
+        })();
+        ignore_missing(fs::remove_file(&staged))?;
+        result
+    }
+
+    fn slots(&self, queue: &str) -> PathBuf {
+        self.root.join(SLOTS).join(queue)
     }
 
     fn schedule_path(&self, key: &str) -> PathBuf {
@@ -366,7 +498,7 @@ impl FileQueue {
             JobState::Pending => {
                 let dir = self.pending(&job.queue);
                 fs::create_dir_all(&dir)?;
-                dir.join(format!("{}.json", job.id))
+                dir.join(pending_name(job))
             }
             JobState::Scheduled => self.scheduled_path(job),
             _ => self.dir(state).join(format!("{}.json", job.id)),
@@ -393,6 +525,11 @@ impl FileQueue {
 impl Store for FileQueue {
     fn push(&self, job: NewJob) -> Result<JobId> {
         let job = job.into_record();
+        if let Some(unique) = &job.unique
+            && let Some(holder) = self.lock_unique(&job, unique)?
+        {
+            return Ok(holder);
+        }
         let state = match job.run_at_ms {
             Some(_) => JobState::Scheduled,
             None => JobState::Pending,
@@ -450,29 +587,62 @@ impl Store for FileQueue {
             // its processing directory.
             let processing = self.processing(worker);
             fs::create_dir_all(&processing)?;
-            let slot = match GlobalLimit::of(limits, queue) {
+            let queue_slot = match GlobalLimit::of(limits, queue) {
                 None => None,
-                Some(max) => match self.take_slot(queue, max, worker)? {
+                Some(max) => match self.take_slot(&self.slots(queue), max, worker)? {
                     Some(slot) => Some(slot),
                     None => continue,
                 },
             };
+            // Keys found full during this claim: their jobs are skipped.
+            let mut full: HashSet<String> = HashSet::new();
             for name in names {
-                let to = processing.join(&name);
-                match fs::rename(dir.join(&name), &to) {
+                let Some(name) = name.to_str() else { continue };
+                let Some((id, key)) = parse_pending_name(name) else {
+                    continue;
+                };
+                let key_slot = match key {
+                    None => None,
+                    Some((hash, limit)) => {
+                        if full.contains(hash) {
+                            continue;
+                        }
+                        match self.take_slot(&self.ckey_slots(hash), limit, worker)? {
+                            Some(slot) => Some(slot),
+                            None => {
+                                full.insert(hash.to_owned());
+                                continue;
+                            }
+                        }
+                    }
+                };
+                let to = processing.join(format!("{id}.json"));
+                match fs::rename(dir.join(name), &to) {
                     Ok(()) => {
                         let job: JobRecord = serde_json::from_slice(&fs::read(&to)?)?;
-                        if let Some(slot) = &slot {
+                        for slot in queue_slot.iter().chain(&key_slot) {
                             self.hold_slot(slot, worker, &job.id)?;
+                        }
+                        if job
+                            .unique
+                            .as_ref()
+                            .is_some_and(|unique| unique.until == crate::Unique::UntilStarted)
+                        {
+                            self.unlock(&job)?;
                         }
                         return Ok(Some(job));
                     }
                     // Another worker claimed it first, or it was cancelled.
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        if let Some(slot) = key_slot {
+                            ignore_missing(fs::remove_file(slot))?;
+                        }
+                    }
                     Err(e) => return Err(e.into()),
                 }
             }
-            if let Some(slot) = slot {
+            // No job taken from this queue: give its slot back.
+            if let Some(slot) = queue_slot {
                 ignore_missing(fs::remove_file(slot))?;
             }
         }
@@ -482,7 +652,11 @@ impl Store for FileQueue {
     fn complete(&self, worker: &str, job: &JobRecord) -> Result<()> {
         self.write(JobState::Done, job)?;
         self.remove_processing(worker, job)?;
-        self.free_slots(&job.queue, |holder, id| holder == worker && id == job.id)
+        self.free_slots(&self.slots(&job.queue), |holder, id| {
+            holder == worker && id == job.id
+        })?;
+        self.release_key(worker, job)?;
+        self.unlock(job)
     }
 
     fn fail(&self, worker: &str, job: &JobRecord, next: JobState) -> Result<()> {
@@ -498,7 +672,14 @@ impl Store for FileQueue {
             self.write(next, job)?;
             self.remove_processing(worker, job)?;
         }
-        self.free_slots(&job.queue, |holder, id| holder == worker && id == job.id)
+        self.free_slots(&self.slots(&job.queue), |holder, id| {
+            holder == worker && id == job.id
+        })?;
+        self.release_key(worker, job)?;
+        if next == JobState::Dead {
+            self.unlock(job)?;
+        }
+        Ok(())
     }
 
     fn get(&self, id: &str) -> Result<Option<(JobState, JobRecord)>> {
@@ -517,28 +698,38 @@ impl Store for FileQueue {
     }
 
     fn cancel(&self, id: &str) -> Result<bool> {
-        let file = format!("{id}.json");
+        let cancelled = self.dir(JobState::Cancelled).join(format!("{id}.json"));
         // Scheduled first: promotion only moves jobs from there to pending/,
         // so checking in that order can't miss a job moving in between.
+        let mut taken = false;
         if let Some(path) = self.find_scheduled(id)? {
-            match fs::rename(path, self.dir(JobState::Cancelled).join(&file)) {
-                Ok(()) => return Ok(true),
+            match fs::rename(path, &cancelled) {
+                Ok(()) => taken = true,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
         }
-        for queue in fs::read_dir(self.dir(JobState::Pending))? {
-            match fs::rename(
-                queue?.path().join(&file),
-                self.dir(JobState::Cancelled).join(&file),
-            ) {
-                Ok(()) => return Ok(true),
-                // Not in this queue, or claimed or cancelled first.
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
+        if !taken {
+            for queue in fs::read_dir(self.dir(JobState::Pending))? {
+                let Some(path) = self.pending_file(&queue?.path(), id)? else {
+                    continue;
+                };
+                match fs::rename(path, &cancelled) {
+                    Ok(()) => {
+                        taken = true;
+                        break;
+                    }
+                    // Claimed or cancelled first.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
-        Ok(false)
+        if taken {
+            let job: JobRecord = serde_json::from_slice(&fs::read(&cancelled)?)?;
+            self.unlock(&job)?;
+        }
+        Ok(taken)
     }
 
     fn heartbeat(&self, worker: &str, ttl: Duration) -> Result<()> {
@@ -586,7 +777,7 @@ impl Store for FileQueue {
                 } else {
                     let dir = self.pending(&job.queue);
                     fs::create_dir_all(&dir)?;
-                    dir.join(format!("{}.json", job.id))
+                    dir.join(pending_name(&job))
                 };
                 match fs::rename(held.path(), to) {
                     Ok(()) => recovered += 1,
@@ -594,13 +785,23 @@ impl Store for FileQueue {
                     Err(e) => return Err(e.into()),
                 }
             }
+            // Its jobs are back in line: give their concurrency slots back.
+            match fs::read_dir(self.root.join(CKEYS)) {
+                Ok(keys) => {
+                    for key in keys {
+                        self.free_slots(&key?.path(), |holder, _| holder == worker)?;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
             // Its jobs are back in line: give their slots back too, and any
             // it took without getting a job.
             match fs::read_dir(self.root.join(SLOTS)) {
                 Ok(queues) => {
                     for queue in queues {
                         if let Some(queue) = queue?.file_name().to_str() {
-                            self.free_slots(queue, |holder, _| holder == worker)?;
+                            self.free_slots(&self.slots(queue), |holder, _| holder == worker)?;
                         }
                     }
                 }
@@ -891,6 +1092,32 @@ impl Monitor for FileQueue {
 }
 
 impl Watch for FileQueue {}
+
+/// A pending job's file name: `<id>.json`, or `<id>~<key hash>~<limit>.json`
+/// for a job with a concurrency key.
+fn pending_name(job: &JobRecord) -> String {
+    match &job.concurrency {
+        Some(concurrency) => format!(
+            "{}~{}~{}.json",
+            job.id,
+            concurrency.hash(),
+            concurrency.limit
+        ),
+        None => format!("{}.json", job.id),
+    }
+}
+
+/// A pending file name's job id, and its concurrency key hash and limit if
+/// it has them.
+fn parse_pending_name(name: &str) -> Option<(&str, Option<(&str, usize)>)> {
+    let stem = name.strip_suffix(".json")?;
+    let mut parts = stem.split('~');
+    let id = parts.next()?;
+    match (parts.next(), parts.next()) {
+        (Some(hash), Some(limit)) => Some((id, Some((hash, limit.parse().ok()?)))),
+        _ => Some((id, None)),
+    }
+}
 
 /// The run time in a scheduled file's name, `<run time in ms>_<id>.json`.
 fn scheduled_run_at(name: &str) -> Option<u64> {

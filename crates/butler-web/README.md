@@ -47,11 +47,38 @@ however many are.
 
 ## Security
 
-The dashboard has no login of its own: bind it to localhost (the default) or
-mount it behind your authentication. Actions are POSTs, and cross-site POSTs
-are refused (`Sec-Fetch-Site`, or `Origin`), so another site can't trigger
-them through a logged-in browser. Redirects after an action never leave the
-dashboard. Everything from jobs (names, arguments, errors) is HTML-escaped.
+By default the dashboard has no login of its own: bind it to localhost (the
+default) or mount it behind your authentication.
+
+### Optional basic auth
+
+For running the dashboard on its own without a proxy, it can ask for one
+username and password (HTTP basic auth) on every page, asset, action and the
+live stream:
+
+```rust
+butler_web::Dashboard::new(queue).basic_auth("admin", &password).router()
+```
+
+The `butler-web` binary turns it on when `BUTLER_WEB_USERNAME` and
+`BUTLER_WEB_PASSWORD` are both set:
+
+```sh
+BUTLER_WEB_USERNAME=admin BUTLER_WEB_PASSWORD='…' butler-web
+```
+
+This is a convenience, not a replacement for your application's
+authentication or an authenticating proxy: there is one shared account, no
+logout, and no rate limiting of wrong guesses, and browsers send the
+credentials with every request, so serve it over HTTPS or keep it on
+localhost. The credentials are compared in constant time. It still works under
+`base_path`, and the cross-site check below still applies.
+
+### Actions
+
+Actions are POSTs, and cross-site POSTs are refused (`Sec-Fetch-Site`, or
+`Origin`), so another site can't trigger them through a logged-in browser.
+Redirects after an action never leave the dashboard. Everything from jobs (names, arguments, errors) is HTML-escaped.
 
 ## How it's built
 

@@ -25,6 +25,10 @@ unwrap_used = "deny"
 anyhow = "1.0.104"
 askama = "0.16"
 axum   = "0.8.9"
+# The dashboard's optional HTTP basic auth: the expected header, and comparing
+# it in constant time.
+base64 = { default-features = false, features = ["alloc"], version = "0.23.1" }
+subtle = { default-features = false, version = "2.6.1" }
 # `butler` is taken on crates.io, so the package is `butler-jobs`; its library
 # is still named `butler`, which is the path the macro expands to.
 butler = { package = "butler-jobs", path = "crates/butler", version = "0.1.0" }

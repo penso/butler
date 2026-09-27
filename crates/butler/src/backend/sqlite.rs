@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! butler_jobs     id, queue, state, worker, seq, data (job JSON), finished_seq, run_at,
-//!                 slot, ckey, climit, ukey, umode
+//!                 slot, ckey, climit, ukey, umode, finished_at
 //! butler_workers  worker, expires_at_ms (the heartbeat)
 //! butler_paused   queue, paused_at_ms: queues workers don't claim from
 //! butler_recurring        key, data (schedule JSON), created_at_ms, seen_at_ms, last_tick_ms, last_job_id
@@ -43,6 +43,15 @@
 //! returns it instead of inserting. Databases from before these columns get
 //! them when opened.
 //!
+//! A finished job's `finished_at` is when it finished (ms since the epoch).
+//! Cleaning up deletes finished rows older than the queue's
+//! [`Retention`](crate::Retention), a bounded batch at a time through a
+//! partial index on `(state, finished_at)`, but never the row with the
+//! highest `finished_seq`: new finishes number from it, and a watcher in
+//! another process must never see a number it already passed. Databases from
+//! before retention get the column when opened, with the time they were
+//! opened as the finish time of the jobs already finished.
+//!
 //! Waking waiters, without a server to publish through:
 //!
 //! - **Same process: instant.** Every write through a `SqliteQueue` notifies
@@ -69,9 +78,9 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use super::{GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
+use super::{Cleaned, GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
 use crate::{
-    Error, JobId, JobRecord, JobState, RecurringRecord, Result, Signal,
+    Error, JobId, JobRecord, JobState, RecurringRecord, Result, Retention, Signal,
     job::{from_millis, millis},
     monitor::{
         JobMetric, ListFilter, METRICS_RETENTION_MINUTES, MetricBucket, QueueStats, Stats,
@@ -106,7 +115,9 @@ CREATE TABLE IF NOT EXISTS butler_jobs (
     ckey   TEXT,
     climit INTEGER,
     ukey   TEXT,
-    umode  TEXT
+    umode  TEXT,
+    -- When a job finished (done, dead or cancelled), in ms since the epoch.
+    finished_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS butler_jobs_claim ON butler_jobs (state, queue, seq);
 CREATE INDEX IF NOT EXISTS butler_jobs_finished ON butler_jobs (finished_seq);
@@ -154,10 +165,11 @@ CREATE TABLE IF NOT EXISTS butler_recurring_ticks (
 );
 ";
 
-/// Needs the `run_at` column, which older databases only have once
-/// [`migrate`] added it.
+/// Needs columns that older databases only have once [`migrate`] added them.
 const SCHEDULED_INDEX: &str = "
 CREATE INDEX IF NOT EXISTS butler_jobs_scheduled ON butler_jobs (state, run_at);
+CREATE INDEX IF NOT EXISTS butler_jobs_finished_at ON butler_jobs (state, finished_at)
+    WHERE finished_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS butler_jobs_ckey ON butler_jobs (ckey, state) WHERE ckey IS NOT NULL;
 CREATE INDEX IF NOT EXISTS butler_jobs_ukey ON butler_jobs (ukey) WHERE ukey IS NOT NULL;";
 
@@ -189,6 +201,7 @@ pub struct SqliteQueue {
     watcher: OnceLock<()>,
     /// The minute history was last pruned, so it's pruned once a minute.
     pruned_at_minute: AtomicU64,
+    retention: Retention,
 }
 
 /// A job was pushed (idle claims re-check their queues), or a job finished
@@ -213,7 +226,14 @@ impl SqliteQueue {
             signals: Arc::default(),
             watcher: OnceLock::new(),
             pruned_at_minute: AtomicU64::new(0),
+            retention: Retention::default(),
         })
+    }
+
+    /// Keeps finished jobs for `retention`.
+    pub fn retention(mut self, retention: Retention) -> Self {
+        self.retention = retention;
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -319,6 +339,18 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
                 "ALTER TABLE butler_jobs ADD COLUMN {column} {kind}"
             ))?;
         }
+    }
+    let has_finished_at = tx
+        .prepare("SELECT 1 FROM pragma_table_info('butler_jobs') WHERE name = 'finished_at'")?
+        .exists([])?;
+    if !has_finished_at {
+        // When jobs finished wasn't recorded: count their retention from now.
+        tx.execute_batch("ALTER TABLE butler_jobs ADD COLUMN finished_at INTEGER")?;
+        tx.execute(
+            "UPDATE butler_jobs SET finished_at = ?1
+             WHERE state IN ('done', 'dead', 'cancelled')",
+            params![now_ms()],
+        )?;
     }
     tx.execute_batch(SCHEDULED_INDEX)?;
     tx.commit()
@@ -606,10 +638,10 @@ impl Store for SqliteQueue {
         self.with_conn(|conn| {
             conn.execute(
                 "UPDATE butler_jobs
-                 SET state = 'done', worker = NULL, data = ?2,
+                 SET state = 'done', worker = NULL, data = ?2, finished_at = ?3,
                      finished_seq = (SELECT COALESCE(MAX(finished_seq), 0) + 1 FROM butler_jobs)
                  WHERE id = ?1",
-                params![job.id, data],
+                params![job.id, data, now_ms()],
             )
         })?;
         self.signals.finished.notify(&job.id);
@@ -634,10 +666,10 @@ impl Store for SqliteQueue {
             ),
             _ => conn.execute(
                 "UPDATE butler_jobs
-                 SET state = ?3, worker = NULL, data = ?2,
+                 SET state = ?3, worker = NULL, data = ?2, finished_at = ?4,
                      finished_seq = (SELECT COALESCE(MAX(finished_seq), 0) + 1 FROM butler_jobs)
                  WHERE id = ?1",
-                params![job.id, data, next.as_str()],
+                params![job.id, data, next.as_str(), now_ms()],
             ),
         })?;
         match next {
@@ -683,10 +715,10 @@ impl Store for SqliteQueue {
         let changed = self.with_conn(|conn| {
             conn.execute(
                 "UPDATE butler_jobs
-                 SET state = 'cancelled',
+                 SET state = 'cancelled', finished_at = ?2,
                      finished_seq = (SELECT COALESCE(MAX(finished_seq), 0) + 1 FROM butler_jobs)
                  WHERE id = ?1 AND state IN ('pending', 'scheduled')",
-                params![id],
+                params![id, now_ms()],
             )
         })?;
         if changed == 0 {
@@ -830,6 +862,39 @@ impl Store for SqliteQueue {
         Ok(Some(job.id))
     }
 
+    /// One `DELETE` per state, each through the `(state, finished_at)`
+    /// index, so a batch costs its own rows rather than the table.
+    fn clean_finished(&self, now: SystemTime, limit: usize) -> Result<Cleaned> {
+        let mut deleted = 0;
+        for (state, keep) in [
+            (JobState::Done, self.retention.finished),
+            (JobState::Cancelled, self.retention.finished),
+            (JobState::Dead, self.retention.dead),
+        ] {
+            let Some(cutoff) = keep.cutoff(now) else {
+                continue;
+            };
+            let batch = i64::try_from(limit - deleted).unwrap_or(i64::MAX);
+            deleted += self.with_conn(|conn| {
+                conn.execute(
+                    "DELETE FROM butler_jobs WHERE id IN (
+                         SELECT id FROM butler_jobs
+                         WHERE state = ?1 AND finished_at < ?2
+                           AND finished_seq < (SELECT MAX(finished_seq) FROM butler_jobs)
+                         LIMIT ?3)",
+                    params![state.as_str(), int(millis(cutoff)), batch],
+                )
+            })?;
+            if deleted == limit {
+                break;
+            }
+        }
+        Ok(Cleaned {
+            deleted,
+            more: deleted == limit,
+        })
+    }
+
     fn describe(&self) -> String {
         format!("sqlite:{}", self.path.display())
     }
@@ -965,7 +1030,8 @@ impl Monitor for SqliteQueue {
         let changed = self.with_conn(|conn| {
             conn.execute(
                 "UPDATE butler_jobs
-                 SET state = 'pending', worker = NULL, finished_seq = NULL, data = ?2,
+                 SET state = 'pending', worker = NULL, finished_seq = NULL, finished_at = NULL,
+                     data = ?2,
                      seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM butler_jobs)
                  WHERE id = ?1 AND state = 'dead'",
                 params![id, data],
@@ -1396,6 +1462,138 @@ mod tests {
             .unwrap();
         assert_eq!(queue.get(&id).unwrap().unwrap().0, JobState::Scheduled);
         assert_eq!(queue.promote(at).unwrap().moved, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `butler_jobs` as the version before retention created it.
+    const JOBS_TABLE_BEFORE_RETENTION: &str = "
+    CREATE TABLE butler_jobs (
+        id TEXT PRIMARY KEY, queue TEXT NOT NULL, state TEXT NOT NULL, worker TEXT,
+        seq INTEGER NOT NULL, data TEXT NOT NULL, finished_seq INTEGER, run_at INTEGER,
+        slot INTEGER, ckey TEXT, climit INTEGER, ukey TEXT, umode TEXT
+    );
+    CREATE INDEX butler_jobs_claim ON butler_jobs (state, queue, seq);
+    CREATE INDEX butler_jobs_finished ON butler_jobs (finished_seq);
+    CREATE INDEX butler_jobs_seq ON butler_jobs (seq);";
+
+    #[test]
+    fn a_database_from_before_retention_counts_its_finished_jobs_from_the_upgrade() {
+        let path = std::env::temp_dir().join(format!(
+            "butler-sqlite-migrate-retention-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(JOBS_TABLE_BEFORE_RETENTION).unwrap();
+            for (id, state, seq, finished_seq) in [
+                ("1-1-0", "done", 1, Some(1)),
+                ("2-1-0", "dead", 2, Some(2)),
+                ("3-1-0", "cancelled", 3, Some(3)),
+                ("4-1-0", "done", 4, Some(4)),
+                ("5-1-0", "pending", 5, None),
+            ] {
+                let data = format!(
+                    r#"{{"id":"{id}","name":"old","queue":"default","args":[],
+                    "attempts":0,"enqueued_at_ms":1,"last_error":null}}"#
+                );
+                conn.execute(
+                    "INSERT INTO butler_jobs (id, queue, state, seq, data, finished_seq)
+                     VALUES (?1, 'default', ?2, ?3, ?4, ?5)",
+                    params![id, state, seq, data, finished_seq],
+                )
+                .unwrap();
+            }
+        }
+        let before = now_ms();
+        let queue = SqliteQueue::open(&path).unwrap().retention(Retention {
+            finished: crate::Keep::For(Duration::from_secs(3600)),
+            dead: crate::Keep::For(Duration::from_secs(3600)),
+        });
+        // Opening it again finds the column there and changes nothing.
+        drop(SqliteQueue::open(&path).unwrap());
+
+        let finished_at = |id: &str| -> Option<i64> {
+            queue
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT finished_at FROM butler_jobs WHERE id = ?1",
+                        params![id],
+                        |row| row.get(0),
+                    )
+                })
+                .unwrap()
+        };
+        for id in ["1-1-0", "2-1-0", "3-1-0", "4-1-0"] {
+            let at = finished_at(id).unwrap();
+            assert!(at >= before && at <= now_ms(), "{id}: {at}");
+        }
+        assert_eq!(finished_at("5-1-0"), None);
+
+        // Not old enough yet: they finished, as far as we know, just now.
+        let soon = SystemTime::now() + Duration::from_secs(1800);
+        assert_eq!(queue.clean_finished(soon, 100).unwrap().deleted, 0);
+        // Later, all go but the pending job and the last one to finish.
+        let later = SystemTime::now() + Duration::from_secs(7200);
+        assert_eq!(queue.clean_finished(later, 100).unwrap().deleted, 3);
+        for id in ["1-1-0", "2-1-0", "3-1-0"] {
+            assert!(queue.get(id).unwrap().is_none(), "{id}");
+        }
+        assert_eq!(queue.get("4-1-0").unwrap().unwrap().0, JobState::Done);
+        assert_eq!(queue.get("5-1-0").unwrap().unwrap().0, JobState::Pending);
+
+        // New finishes number after it, and it goes once it isn't the last.
+        let job = queue
+            .claim("w", &["default"], Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        queue.complete("w", &job).unwrap();
+        let seq = |id: &str| -> i64 {
+            queue
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT finished_seq FROM butler_jobs WHERE id = ?1",
+                        params![id],
+                        |row| row.get(0),
+                    )
+                })
+                .unwrap()
+        };
+        assert_eq!(seq("5-1-0"), 5);
+        assert_eq!(queue.clean_finished(later, 100).unwrap().deleted, 1);
+        assert!(queue.get("4-1-0").unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cleaning_up_reads_the_finished_at_index_not_the_table() {
+        let path = std::env::temp_dir().join(format!(
+            "butler-sqlite-clean-plan-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let queue = SqliteQueue::open(&path).unwrap();
+        let plan: Vec<String> = queue
+            .with_conn(|conn| {
+                conn.prepare(
+                    "EXPLAIN QUERY PLAN SELECT id FROM butler_jobs
+                     WHERE state = 'done' AND finished_at < 1
+                       AND finished_seq < (SELECT MAX(finished_seq) FROM butler_jobs)
+                     LIMIT 10",
+                )?
+                .query_map([], |row| row.get::<_, String>(3))?
+                .collect()
+            })
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("butler_jobs_finished_at")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.starts_with("SCAN")),
+            "{plan:?}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -53,6 +53,11 @@
 //! After lowering a limit, slots numbered above the new one stay held until
 //! their jobs finish.
 //!
+//! A finished job's file is written (done, dead) or touched (cancelled) when
+//! it finishes, so its modification time is when it finished: cleaning up
+//! deletes the files of `done/`, `cancelled/` and `dead/` older than the
+//! queue's [`Retention`](crate::Retention).
+//!
 //! A recurring tick is claimed by hard-linking a marker file, already
 //! holding the job id, to `recurring/ticks/<key>/<tick>`: a link fails if the
 //! name exists, so exactly one worker creates it, and only that worker then
@@ -64,13 +69,16 @@ use std::{
     ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use super::{GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
+use super::{Cleaned, GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
 use crate::{
-    JobId, JobRecord, JobState, RecurringRecord, Result,
+    JobId, JobRecord, JobState, RecurringRecord, Result, Retention,
     job::{DEFAULT_QUEUE, from_millis, millis},
     monitor::{ListFilter, QueueStats, Stats, WorkerStats},
 };
@@ -98,9 +106,20 @@ const SLOTS: &str = "slots";
 const SCHEDULES: &str = "recurring/schedules";
 const TICKS: &str = "recurring/ticks";
 
+/// Bound metadata reads as well as deletions, even when no files have expired.
+const CLEAN_SCAN_BATCH: usize = 1_000;
+
+#[derive(Debug, Default)]
+struct CleanupCursor {
+    state: usize,
+    entries: Option<fs::ReadDir>,
+}
+
 #[derive(Debug, Clone)]
 pub struct FileQueue {
     root: PathBuf,
+    retention: Retention,
+    cleanup: Arc<Mutex<CleanupCursor>>,
 }
 
 impl FileQueue {
@@ -113,7 +132,17 @@ impl FileQueue {
             fs::create_dir_all(root.join(state.as_str()))?;
         }
         fs::create_dir_all(root.join(JobState::Pending.as_str()).join(DEFAULT_QUEUE))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            retention: Retention::default(),
+            cleanup: Arc::default(),
+        })
+    }
+
+    /// Keeps finished jobs for `retention`.
+    pub fn retention(mut self, retention: Retention) -> Self {
+        self.retention = retention;
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -520,6 +549,21 @@ impl FileQueue {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Refresh the inode before publishing it in cancelled/. If a claim or
+    /// promotion wins the rename, touching its source does not change ownership.
+    fn cancel_file(&self, from: &Path, to: &Path) -> Result<bool> {
+        let moved = (|| -> io::Result<()> {
+            let file = fs::File::options().write(true).open(from)?;
+            file.set_modified(SystemTime::now())?;
+            fs::rename(from, to)
+        })();
+        match moved {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 impl Store for FileQueue {
@@ -703,25 +747,16 @@ impl Store for FileQueue {
         // so checking in that order can't miss a job moving in between.
         let mut taken = false;
         if let Some(path) = self.find_scheduled(id)? {
-            match fs::rename(path, &cancelled) {
-                Ok(()) => taken = true,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
+            taken = self.cancel_file(&path, &cancelled)?;
         }
         if !taken {
             for queue in fs::read_dir(self.dir(JobState::Pending))? {
                 let Some(path) = self.pending_file(&queue?.path(), id)? else {
                     continue;
                 };
-                match fs::rename(path, &cancelled) {
-                    Ok(()) => {
-                        taken = true;
-                        break;
-                    }
-                    // Claimed or cancelled first.
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(e.into()),
+                if self.cancel_file(&path, &cancelled)? {
+                    taken = true;
+                    break;
                 }
             }
         }
@@ -888,6 +923,62 @@ impl Store for FileQueue {
             ignore_missing(fs::remove_file(dir.join(name)))?;
         }
         Ok(Some(job.id))
+    }
+
+    /// Reads at most [`CLEAN_SCAN_BATCH`] entries per call, resuming where
+    /// the last call stopped: `more` is set until a pass over the three
+    /// directories ends.
+    fn clean_finished(&self, now: SystemTime, limit: usize) -> Result<Cleaned> {
+        if limit == 0 {
+            return Ok(Cleaned::default());
+        }
+        let mut cursor = self.cleanup.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut deleted = 0;
+        let states = [
+            (JobState::Done, self.retention.finished),
+            (JobState::Cancelled, self.retention.finished),
+            (JobState::Dead, self.retention.dead),
+        ];
+        let mut scanned = 0;
+        let mut more = true;
+        while scanned < CLEAN_SCAN_BATCH && deleted < limit {
+            let (state, keep) = states[cursor.state];
+            let cutoff = keep.cutoff(now);
+            if cutoff.is_some() && cursor.entries.is_none() {
+                cursor.entries = Some(fs::read_dir(self.dir(state))?);
+            }
+            let entry = if cutoff.is_some() {
+                cursor.entries.as_mut().and_then(Iterator::next)
+            } else {
+                None
+            };
+            let (Some(entry), Some(cutoff)) = (entry, cutoff) else {
+                cursor.entries = None;
+                cursor.state = (cursor.state + 1) % states.len();
+                if cursor.state == 0 {
+                    more = false;
+                    break;
+                }
+                continue;
+            };
+            scanned += 1;
+            let entry = entry?;
+            let finished_at = match entry.metadata() {
+                Ok(meta) if meta.is_file() => meta.modified()?,
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if finished_at >= cutoff {
+                continue;
+            }
+            match fs::remove_file(entry.path()) {
+                Ok(()) => deleted += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(Cleaned { deleted, more })
     }
 
     fn describe(&self) -> String {
@@ -1139,4 +1230,141 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use crate::{Keep, Retention};
+
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn a_cancelled_job_is_kept_from_when_it_was_cancelled_not_pushed() {
+        let dir = std::env::temp_dir().join(format!(
+            "butler-file-cancel-retention-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let queue = FileQueue::new(&dir).unwrap().retention(Retention {
+            finished: Keep::For(HOUR),
+            dead: Keep::Forever,
+        });
+        let id = queue.push(NewJob::new("a", "default", vec![])).unwrap();
+        // Pushed two hours ago.
+        let file = queue.pending(DEFAULT_QUEUE).join(format!("{id}.json"));
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(SystemTime::now() - 2 * HOUR)
+            .unwrap();
+        assert!(queue.cancel(&id).unwrap());
+
+        let soon = SystemTime::now() + HOUR / 2;
+        assert_eq!(queue.clean_finished(soon, 10).unwrap().deleted, 0);
+        assert_eq!(queue.get(&id).unwrap().unwrap().0, JobState::Cancelled);
+        let later = SystemTime::now() + 2 * HOUR;
+        assert_eq!(queue.clean_finished(later, 10).unwrap().deleted, 1);
+        assert!(queue.get(&id).unwrap().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancellation_is_safe_to_clean_as_soon_as_the_rename_publishes_it() {
+        let dir =
+            std::env::temp_dir().join(format!("butler-file-cancel-publish-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let queue = FileQueue::new(&dir).unwrap().retention(Retention {
+            finished: Keep::For(HOUR),
+            dead: Keep::Forever,
+        });
+        for scheduled in [false, true] {
+            let mut new = NewJob::new("a", "default", vec![]);
+            if scheduled {
+                new = new.run_at(SystemTime::now() + HOUR);
+            }
+            let id = queue.push(new).unwrap();
+            let (_, source) = queue.find(&id).unwrap().unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&source)
+                .unwrap()
+                .set_modified(SystemTime::now() - 2 * HOUR)
+                .unwrap();
+            let published = queue.dir(JobState::Cancelled).join(format!("{id}.json"));
+            // Interleave cleanup at the publication boundary, before cancel
+            // has read the record or released its unique key.
+            assert!(queue.cancel_file(&source, &published).unwrap());
+            assert_eq!(
+                queue
+                    .clone()
+                    .clean_finished(SystemTime::now(), 10)
+                    .unwrap()
+                    .deleted,
+                0
+            );
+            assert_eq!(queue.get(&id).unwrap().unwrap().0, JobState::Cancelled);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_bounds_scans_and_resumes_past_unexpired_files() {
+        let dir =
+            std::env::temp_dir().join(format!("butler-file-clean-scan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let queue = FileQueue::new(&dir).unwrap().retention(Retention {
+            finished: Keep::For(HOUR),
+            dead: Keep::For(HOUR),
+        });
+        // A full scan budget of fresh done jobs, with an expired job in a
+        // later directory. Filesystem entry order cannot affect this test.
+        for n in 0..CLEAN_SCAN_BATCH {
+            fs::write(queue.dir(JobState::Done).join(format!("{n}.json")), b"{}").unwrap();
+        }
+        let dead = queue.dir(JobState::Dead).join("old.json");
+        fs::write(&dead, b"{}").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&dead)
+            .unwrap()
+            .set_modified(SystemTime::now() - 2 * HOUR)
+            .unwrap();
+        // Nothing deleted, but the budget ran out: the keeper must come back
+        // at its next tick, not in a minute.
+        assert_eq!(
+            queue.clean_finished(SystemTime::now(), usize::MAX).unwrap(),
+            Cleaned {
+                deleted: 0,
+                more: true
+            }
+        );
+        assert!(dead.exists(), "the first pass must stop at its scan budget");
+        // The next call resumes (not restarts at done/) and ends the pass.
+        assert_eq!(
+            queue
+                .clone()
+                .clean_finished(SystemTime::now(), usize::MAX)
+                .unwrap(),
+            Cleaned {
+                deleted: 1,
+                more: false
+            }
+        );
+        assert!(!dead.exists());
+        // A completed pass resets the cursor, so formerly fresh files are
+        // reconsidered once their retention expires.
+        let later = SystemTime::now() + 2 * HOUR;
+        let first = queue.clean_finished(later, usize::MAX).unwrap();
+        assert_eq!(first.deleted, CLEAN_SCAN_BATCH);
+        assert!(first.more, "stopped at its budget");
+        assert_eq!(
+            queue.clean_finished(later, usize::MAX).unwrap(),
+            Cleaned::default()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

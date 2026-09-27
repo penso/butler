@@ -7,8 +7,9 @@
 //! <prefix>:processing:<worker>   LIST  ids that worker claimed
 //! <prefix>:worker:<worker>       STRING  heartbeat; expires unless the worker refreshes it
 //! <prefix>:workers               SET   worker ids that may hold jobs
-//! <prefix>:dead                  LIST  ids that exhausted their retries
-//! <prefix>:job:<id>              HASH  { state, queue, data (job JSON), ckey, climit, ukey, umode }
+//! <prefix>:dead                  LIST  ids that exhausted their retries, newest first
+//! <prefix>:job:<id>              HASH  { state, queue, data (job JSON), ckey, climit, ukey, umode,
+//!                                       finished_at (ms, once dead) }
 //! <prefix>:running:<key>         SET   ids running with that concurrency key (by its hash)
 //! <prefix>:blocked:<key>         LIST  ids skipped because their concurrency key was full
 //! <prefix>:blocked               HASH  per queue, how many of its ids wait in blocked lists
@@ -68,6 +69,14 @@
 //! only if that succeeded, the job's push. However many workers run it for a
 //! tick, one job is enqueued.
 //!
+//! Finished jobs follow the queue's [`Retention`](crate::Retention). Done
+//! and cancelled jobs get a TTL of `finished` when they finish, so Redis
+//! expires them itself. Dead jobs record when they died; cleaning up pops
+//! the oldest ids off the end of `dead` while they are older than `dead`,
+//! and deletes their jobs, in one script per batch. Dead jobs from before
+//! retention have no `finished_at`: they share the time cleanup first
+//! encountered a legacy job, so a backlog waits only one retention period.
+//!
 //! We use lists instead of `PUBLISH`/`SUBSCRIBE` because pub/sub delivers each
 //! message to every subscriber, and messages sent while no worker is connected
 //! are lost.
@@ -81,9 +90,9 @@ use std::{
 
 use redis::{Client, Connection, RedisResult};
 
-use super::{GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
+use super::{Cleaned, GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
 use crate::{
-    Error, JobId, JobRecord, JobState, RecurringRecord, Result, Signal,
+    Error, JobId, JobRecord, JobState, RecurringRecord, Result, Retention, Signal,
     job::{from_millis, millis},
     monitor::{
         JobMetric, ListFilter, METRICS_RETENTION_MINUTES, MetricBucket, QueueStats, Stats,
@@ -116,8 +125,37 @@ return 0
 /// Separates queue, job and counter name in metric hash fields.
 const FIELD_SEP: char = '\u{1f}';
 
-/// How long finished (done or cancelled) jobs stay queryable before Redis expires them.
-const DONE_TTL_SECS: u64 = 24 * 60 * 60;
+/// Deletes up to ARGV[3] dead jobs that died before ARGV[2] (ms), oldest
+/// first, from the end of the dead list (KEYS[1]). ARGV[1] is the key prefix,
+/// ARGV[4] the current time (ms): a dead job without `finished_at` (from
+/// before retention) gets the shared migration time. Ids whose job is gone
+/// are dropped. Looks at ARGV[3] ids at most. Returns how many jobs it
+/// deleted, and 1 if it stopped at that budget rather than at a job too
+/// recent or the end of the list.
+const CLEAN_DEAD: &str = r"
+local p, cutoff, limit = ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3])
+local deleted, more = 0, 1
+for _ = 1, limit do
+  local id = redis.call('LINDEX', KEYS[1], -1)
+  if not id then more = 0; break end
+  local job = p .. 'job:' .. id
+  local f = redis.call('HMGET', job, 'state', 'finished_at')
+  if f[1] == 'dead' and not f[2] then
+    local migration = p .. 'dead:legacy_finished_at'
+    redis.call('SET', migration, ARGV[4], 'NX')
+    f[2] = redis.call('GET', migration)
+    redis.call('HSET', job, 'finished_at', f[2])
+  end
+  if f[1] == 'dead' and tonumber(f[2]) >= cutoff then more = 0; break end
+  redis.call('RPOP', KEYS[1])
+  if f[1] == 'dead' then
+    redis.call('DEL', job)
+    deleted = deleted + 1
+  end
+end
+if limit == 0 then more = 0 end
+return {deleted, more}
+";
 
 /// Stores a job's data (KEYS[2]) only while the job's id is still in the
 /// worker's processing list (KEYS[1]).
@@ -232,7 +270,7 @@ if removed == 0 and f[2] then
 end
 if removed == 0 then return 0 end
 redis.call('HSET', job, 'state', 'cancelled')
-redis.call('EXPIRE', job, tonumber(ARGV[3]))
+if tonumber(ARGV[3]) > 0 then redis.call('EXPIRE', job, tonumber(ARGV[3])) end
 redis.call('LPUSH', p .. 'recent:cancelled', id)
 redis.call('LTRIM', p .. 'recent:cancelled', 0, tonumber(ARGV[4]) - 1)
 if f[3] and redis.call('GET', p .. 'unique:' .. f[3]) == id then
@@ -351,6 +389,7 @@ pub struct RedisQueue {
     /// The pub/sub listener thread, started by the first waiting claim or
     /// result wait.
     subscriber: OnceLock<()>,
+    retention: Retention,
 }
 
 /// The two things a worker process listens for: a job was pushed (idle claims
@@ -429,6 +468,22 @@ impl RedisQueue {
             display: format!("redis:{} (prefix {prefix})", redact(url)),
             signals: Arc::default(),
             subscriber: OnceLock::new(),
+            retention: Retention::default(),
+        })
+    }
+
+    /// Keeps finished jobs for `retention`. Done and cancelled jobs get
+    /// their TTL when they finish, so a change applies to jobs finishing
+    /// after it.
+    pub fn retention(mut self, retention: Retention) -> Self {
+        self.retention = retention;
+        self
+    }
+
+    /// The TTL of done and cancelled jobs, in seconds; 0 for none.
+    fn finished_ttl_secs(&self) -> u64 {
+        self.retention.finished.duration().map_or(0, |keep| {
+            keep.as_secs() + u64::from(keep.subsec_nanos() > 0)
         })
     }
 
@@ -804,51 +859,52 @@ impl Store for RedisQueue {
 
     fn complete(&self, worker: &str, job: &JobRecord) -> Result<()> {
         let data = serde_json::to_string(job)?;
-        self.with_conn(|con| {
-            redis::pipe()
-                .atomic()
-                .cmd("LREM")
-                .arg(self.processing_key(worker))
-                .arg(1)
-                .arg(&job.id)
-                .ignore()
-                .cmd("SREM")
-                .arg(self.slots_key(&job.queue))
-                .arg(&job.id)
-                .ignore()
-                .cmd("HSET")
+        let mut pipe = redis::pipe();
+        pipe.atomic()
+            .cmd("LREM")
+            .arg(self.processing_key(worker))
+            .arg(1)
+            .arg(&job.id)
+            .ignore()
+            .cmd("SREM")
+            .arg(self.slots_key(&job.queue))
+            .arg(&job.id)
+            .ignore()
+            .cmd("HSET")
+            .arg(self.job_key(&job.id))
+            .arg("state")
+            .arg(JobState::Done.as_str())
+            .arg("data")
+            .arg(&data)
+            .ignore();
+        let ttl = self.finished_ttl_secs();
+        if ttl > 0 {
+            pipe.cmd("EXPIRE")
                 .arg(self.job_key(&job.id))
-                .arg("state")
-                .arg(JobState::Done.as_str())
-                .arg("data")
-                .arg(&data)
-                .ignore()
-                .cmd("EXPIRE")
-                .arg(self.job_key(&job.id))
-                .arg(DONE_TTL_SECS)
-                .ignore()
-                .cmd("EVAL")
-                .arg(with_release(RELEASE))
-                .arg(0)
-                .arg(format!("{}:", self.prefix))
-                .arg(&job.id)
-                .arg(1)
-                .ignore()
-                .cmd("LPUSH")
-                .arg(self.key("recent:done"))
-                .arg(&job.id)
-                .ignore()
-                .cmd("LTRIM")
-                .arg(self.key("recent:done"))
-                .arg(0)
-                .arg(RECENT_CAP - 1)
-                .ignore()
-                .cmd("PUBLISH")
-                .arg(self.key("done"))
-                .arg(&job.id)
-                .ignore()
-                .exec(con)
-        })
+                .arg(ttl)
+                .ignore();
+        }
+        pipe.cmd("EVAL")
+            .arg(with_release(RELEASE))
+            .arg(0)
+            .arg(format!("{}:", self.prefix))
+            .arg(&job.id)
+            .arg(1)
+            .ignore()
+            .cmd("LPUSH")
+            .arg(self.key("recent:done"))
+            .arg(&job.id)
+            .ignore()
+            .cmd("LTRIM")
+            .arg(self.key("recent:done"))
+            .arg(0)
+            .arg(RECENT_CAP - 1)
+            .ignore()
+            .cmd("PUBLISH")
+            .arg(self.key("done"))
+            .arg(&job.id)
+            .ignore();
+        self.with_conn(|con| pipe.exec(con))
     }
 
     fn fail(&self, worker: &str, job: &JobRecord, next: JobState) -> Result<()> {
@@ -889,6 +945,11 @@ impl Store for RedisQueue {
                 .ignore(),
             // A dead job wakes result waiters.
             JobState::Dead => pipe
+                .cmd("HSET")
+                .arg(self.job_key(&job.id))
+                .arg("finished_at")
+                .arg(millis(SystemTime::now()))
+                .ignore()
                 .cmd("LPUSH")
                 .arg(self.key("dead"))
                 .arg(&job.id)
@@ -955,7 +1016,7 @@ impl Store for RedisQueue {
                 .arg(0)
                 .arg(format!("{}:", self.prefix))
                 .arg(id)
-                .arg(DONE_TTL_SECS)
+                .arg(self.finished_ttl_secs())
                 .arg(RECENT_CAP)
                 .query(con)
         })?;
@@ -1087,6 +1148,28 @@ impl Store for RedisQueue {
                 .query(con)
         })?;
         Ok((pushed > 0).then_some(job.id))
+    }
+
+    /// Done and cancelled jobs expire on their own; this deletes dead ones.
+    fn clean_finished(&self, now: SystemTime, limit: usize) -> Result<Cleaned> {
+        let Some(cutoff) = self.retention.dead.cutoff(now) else {
+            return Ok(Cleaned::default());
+        };
+        let (deleted, more): (usize, u8) = self.with_conn(|con| {
+            redis::cmd("EVAL")
+                .arg(CLEAN_DEAD)
+                .arg(1)
+                .arg(self.key("dead"))
+                .arg(format!("{}:", self.prefix))
+                .arg(millis(cutoff))
+                .arg(limit)
+                .arg(millis(SystemTime::now()))
+                .query(con)
+        })?;
+        Ok(Cleaned {
+            deleted,
+            more: more > 0,
+        })
     }
 
     fn describe(&self) -> String {

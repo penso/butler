@@ -89,6 +89,10 @@
 //! retention have no `finished_at`: they share the time cleanup first
 //! encountered a legacy job, so a backlog waits only one retention period.
 //!
+//! Redis Cluster is not supported: most scripts build key names from data
+//! they read, and a few declare no key. `docs/redis-cluster.md` has the
+//! audit, and what support would take.
+//!
 //! We use lists instead of `PUBLISH`/`SUBSCRIBE` because pub/sub delivers each
 //! message to every subscriber, and messages sent while no worker is connected
 //! are lost.

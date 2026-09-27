@@ -141,8 +141,8 @@ Redis, on other servers. Add workers as the queue grows and route jobs using
 **Recover after a worker stops.** Claims live in the backend under a worker's
 identity. An independent heartbeat keeps long-running jobs from looking
 abandoned; expired heartbeats let another worker requeue them. On graceful
-shutdown, workers stop claiming new jobs and wait for active jobs, while
-checkpointed jobs can yield and resume later. The test suite exercises
+shutdown, workers stop claiming new jobs and wait for active jobs, up to a
+`shutdown_timeout`, while checkpointed jobs can yield and resume later. The test suite exercises
 recovery with real worker processes that abort mid-job.
 
 **Keep the Rust API across the queue boundary.** The macro generates argument
@@ -588,6 +588,9 @@ pub async fn send_digest(user_id: u64) { ... }
 #[butler::job(retries = 10, backoff = "polynomial")]  // its own retry policy
 pub async fn sync_crm(account_id: u64) -> Result<(), CrmError> { ... }
 
+#[butler::job(max_resumptions = 10)]         // with a Progress: see "Job continuations"
+pub async fn import(id: u64, progress: Progress<Step>) -> Result<(), ImportError> { ... }
+
 #[butler::job(concurrency_key = "account_id", limit = 1)]  // one per account at a time
 pub async fn sync_account(account_id: u64, full: bool) { ... }
 
@@ -674,7 +677,7 @@ let id = send_email::prepare("ada@example.com", "Welcome")?.now().await?;
   An `async fn` job runs in your task, so a panic in it propagates, like any
   function call.
 - A `Progress` starts from its default; checkpoints are neither saved nor
-  interrupted.
+  interrupted. A step that calls `progress.requeue(..)` resumes at once.
 
 ### Bulk enqueuing
 
@@ -952,7 +955,15 @@ anything from that crate, the linker leaves the crate's code out, including
 its automatic registration.
 
 Without tokio, `Worker::run()` runs jobs on plain threads using butler's own
-`block_on`. Job bodies then can't use tokio timers or I/O.
+`block_on`. Job bodies then can't use tokio timers or I/O. `run_until(stop)`
+runs until a flag you set, for your own signal handling.
+
+On shutdown, both stop claiming and wait for running jobs for up to
+`shutdown_timeout_secs` (25 s by default, under the usual 30 s before a
+`SIGKILL`; `.shutdown_timeout(..)` in code). Jobs with a
+[`Progress`](#job-continuations) stop at their next checkpoint instead.
+Jobs still running past the timeout are left to be requeued once the
+worker's heartbeat expires.
 
 In tests, `worker.drain()` runs the work on its configured queues, including
 retries, and returns when those queues are empty.
@@ -1097,14 +1108,31 @@ process_import(42).await?;   // callers don't pass the Progress: the worker does
   its next checkpoint, and `?` carries the `Interrupted` out. The job goes
   back on its queue with its progress, and the next worker resumes it. It
   isn't counted as a failed attempt. Jobs without a `Progress` are still
-  waited for, as before. So a two-hour import no longer holds up a deploy for
-  two hours.
+  waited for, up to `shutdown_timeout_secs` (25 s by default). So a two-hour
+  import no longer holds up a deploy for two hours.
+- **Resumption limit:** each shutdown interruption counts in the job's
+  `resumptions`. With `#[job(max_resumptions = 10)]` (or the worker's
+  `max_resumptions`; no limit by default), the interruption after the tenth
+  counts as a failed attempt (`JobError::ResumeLimit`) and goes through the
+  job's retry policy, so a job interrupted at every deploy ends up dead, in
+  your `on_dead` hooks, instead of cycling forever. A dashboard retry resets
+  the count. Crash recovery and `requeue` don't count.
+- **Isolated steps:** `progress.requeue(next)?` moves to `next` and ends the
+  current execution: the job goes back on its queue, and the next
+  step starts in a fresh one, possibly on another worker, like ActiveJob's
+  `isolated: true`. It counts neither as an attempt nor as a resumption.
 - **Crashes:** [crash recovery](#crashed-workers-dont-lose-jobs) requeues the
   job with its last persisted progress. Work since that checkpoint may repeat;
   without a saved checkpoint, it starts from the beginning. Saves happen when
   the job calls a checkpoint, subject to `checkpoint_interval_ms` throttling,
   so that interval is not a maximum age for saved progress. A real-process
   test aborts a worker and checks that the next worker resumes saved progress.
+- **Shutdown timeout:** jobs still running `shutdown_timeout_secs` after the
+  shutdown signal are given up on: the worker stops its heartbeat and returns
+  without retiring, and once the heartbeat expires another worker requeues
+  them, as after a crash. Exit the process when `run`/`run_async` returns.
+  Until then, the heartbeat keeps running, so a job finishing during shutdown
+  is never recovered while it runs.
 - **Retries:** a job that fails at record 900,000 retries from its last
   checkpoint, not from zero.
 - **Changed types:** if a deploy changes `S` so saved progress no longer
@@ -1367,6 +1395,8 @@ poll_interval_ms = 100       # file: how often idle workers check; redis, memory
 heartbeat_ttl_secs = 30      # a crashed worker's jobs are requeued after this
 recover_interval_secs = 10   # how often to look for crashed workers
 checkpoint_interval_ms = 1000  # jobs with a Progress: how often it is saved
+max_resumptions = 10         # optional: jobs with a Progress, shutdown interruptions before one counts as a failure
+shutdown_timeout_secs = 25   # on shutdown, the longest to wait for running jobs
 queues = ["default"]         # or ["critical", "default"], or [["critical", 6], ["default", 1]]
 claimers = 16                # claim loops side by side (default: the number of CPUs)
 

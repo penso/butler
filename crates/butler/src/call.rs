@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::{
     JobDef, JobError, JobHandle, Result,
-    progress::{Checkpoints, Invocation},
+    progress::{Checkpoints, Interruption, Invocation},
 };
 
 /// The future an awaited [`JobCall`] becomes: it enqueues the job and returns
@@ -131,14 +131,28 @@ impl<T: DeserializeOwned + Send + 'static> IntoFuture for JobCall<T> {
     }
 }
 
-/// Runs a job's generated code directly, once: no queue, no retries, and
-/// checkpoints that neither save nor stop.
+/// Runs a job's generated code directly: no queue, no retries, and
+/// checkpoints that neither save nor stop. A step that asks to be requeued
+/// ([`Progress::requeue`](crate::Progress::requeue)) resumes at once, from
+/// the progress it set.
 pub(crate) async fn run_now(def: &'static JobDef, args: Vec<Value>) -> Result<Value, JobError> {
-    let checkpoints = Checkpoints::new(
-        None,
-        Duration::ZERO,
-        || false,
-        Box::new(|_| Box::pin(async { Ok(()) })),
-    );
-    (def.perform)(Invocation { args, checkpoints }).await
+    let mut saved = None;
+    loop {
+        let checkpoints = Checkpoints::new(
+            saved,
+            Duration::ZERO,
+            || false,
+            Box::new(|_| Box::pin(async { Ok(()) })),
+        );
+        let invocation = Invocation {
+            args: args.clone(),
+            checkpoints: checkpoints.clone(),
+        };
+        match (def.perform)(invocation).await {
+            Err(_) if checkpoints.interruption() == Some(Interruption::Requeued) => {
+                saved = checkpoints.latest();
+            }
+            outcome => return outcome,
+        }
+    }
 }

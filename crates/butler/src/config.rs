@@ -22,6 +22,9 @@
 //! poll_interval_ms = 100
 //! heartbeat_ttl_secs = 30      # crashed workers' jobs are requeued after this
 //! recover_interval_secs = 10
+//! shutdown_timeout_secs = 25  # on shutdown, the longest to wait for running jobs
+//! max_resumptions = 10         # optional: shutdown interruptions of a job with a
+//!                              # Progress before one counts as a failed attempt
 //! queues = [["critical", 6], ["default", 3], ["low", 1]]   # or ["critical", "default"]
 //!
 //! [worker.queue_limits]        # optional, per queue and per worker process
@@ -253,6 +256,15 @@ pub struct WorkerConfig {
     /// For jobs with a `Progress`: the most often their progress is saved to
     /// the backend, so a crash resumes them from at most this long ago.
     pub checkpoint_interval_ms: u64,
+    /// For jobs with a `Progress`: how many times a worker shutdown may
+    /// interrupt one at a checkpoint without counting an attempt, unless it
+    /// sets its own with `#[job(max_resumptions = N)]`. Past it, the next
+    /// interruption is a failed attempt. No limit if not set.
+    pub max_resumptions: Option<u32>,
+    /// On shutdown, the longest to wait for running jobs, at least 1. Jobs
+    /// still running then are left to be requeued once this worker's
+    /// heartbeat expires, as after a crash.
+    pub shutdown_timeout_secs: u64,
     /// Queues to serve. Plain names are strict priority, in order:
     /// `["critical", "default"]`. Any `[name, weight]` pair makes it weighted,
     /// with plain names weighing 1: `[["critical", 6], ["default", 1]]`.
@@ -297,6 +309,8 @@ impl Default for WorkerConfig {
             heartbeat_ttl_secs: 30,
             recover_interval_secs: 10,
             checkpoint_interval_ms: 1_000,
+            max_resumptions: None,
+            shutdown_timeout_secs: 25,
             queues: vec![QueueEntry::Name(DEFAULT_QUEUE.to_owned())],
             queue_limits: HashMap::new(),
             global_queue_limits: HashMap::new(),
@@ -325,6 +339,10 @@ impl WorkerConfig {
         Duration::from_millis(self.checkpoint_interval_ms)
     }
 
+    pub fn shutdown_timeout(&self) -> Duration {
+        Duration::from_secs(self.shutdown_timeout_secs)
+    }
+
     pub fn priority(&self) -> QueuePriority {
         let weighted = self
             .queues
@@ -339,9 +357,13 @@ impl WorkerConfig {
         }))
     }
 
-    /// Rejects queue names that can't be file names or Redis keys, and zero
-    /// weights, which would mean a queue is listed but never served.
+    /// Rejects queue names that can't be file names or Redis keys, zero
+    /// weights, which would mean a queue is listed but never served, and a
+    /// zero shutdown timeout, which would abandon every running job at once.
     fn validate(&self) -> Result<()> {
+        if self.shutdown_timeout_secs == 0 {
+            return Err(Error::InvalidShutdownTimeout);
+        }
         for entry in &self.queues {
             let reason = match entry {
                 _ if !is_valid_queue_name(entry.name()) => {
@@ -646,6 +668,21 @@ mod tests {
             matches!(duplicate, Error::DuplicateRecurring { .. }),
             "{duplicate:?}"
         );
+    }
+
+    #[test]
+    fn continuation_limits_load_with_defaults_and_are_validated() {
+        let default = load("").unwrap().worker;
+        assert_eq!(default.max_resumptions, None);
+        assert_eq!(default.shutdown_timeout(), Duration::from_secs(25));
+
+        let set = load("[worker]\nmax_resumptions = 5\nshutdown_timeout_secs = 60\n").unwrap();
+        assert_eq!(set.worker.max_resumptions, Some(5));
+        assert_eq!(set.worker.shutdown_timeout(), Duration::from_secs(60));
+
+        let zero = load("[worker]\nshutdown_timeout_secs = 0\n").unwrap_err();
+        assert!(matches!(zero, Error::InvalidShutdownTimeout), "{zero:?}");
+        assert!(load("[worker]\nmax_resumptions = -1\n").is_err());
     }
 
     #[test]

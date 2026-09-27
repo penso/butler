@@ -92,6 +92,11 @@ pub enum Error {
     #[error("two recurring schedules have the key `{key}`")]
     DuplicateRecurring { key: String },
 
+    /// `shutdown_timeout_secs = 0` would give up on every running job at
+    /// once, even ones that would stop at their next checkpoint.
+    #[error("shutdown_timeout_secs must be at least 1")]
+    InvalidShutdownTimeout,
+
     /// An [enqueue layer](crate::EnqueueLayer) refused the job; `source` is
     /// its reason. Nothing was enqueued.
     #[error("enqueueing `{name}` was vetoed")]
@@ -141,6 +146,14 @@ pub enum JobError {
     /// example after a deploy that changed it.
     #[error("saved job progress doesn't match the job's progress type")]
     BadProgress(#[source] serde_json::Error),
+
+    /// A worker shutdown interrupted the job at a checkpoint again, after it
+    /// had already resumed `max` times: this interruption counts as a failed
+    /// attempt, so the retry policy bounds a job that keeps being interrupted.
+    #[error(
+        "interrupted at a checkpoint after {max} resumptions, the most allowed (max_resumptions)"
+    )]
+    ResumeLimit { max: u32 },
 
     #[cfg(feature = "tokio")]
     #[error("job task was cancelled")]

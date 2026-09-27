@@ -107,6 +107,17 @@ impl Dashboard {
     }
 }
 
+/// The dashboard's own page. axum serves a nested router's root at the bare
+/// prefix (`/admin/jobs`), not with a trailing slash, so only a dashboard at
+/// the root links to `/`.
+pub(crate) fn home(base: &str) -> String {
+    if base.is_empty() {
+        "/".to_owned()
+    } else {
+        base.to_owned()
+    }
+}
+
 /// The dashboard at the root of its own router.
 pub fn router(queue: impl Into<Queue>) -> Router {
     Dashboard::new(queue).router()

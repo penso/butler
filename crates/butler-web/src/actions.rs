@@ -33,7 +33,7 @@ fn back(state: &AppState, return_to: Option<&str>) -> Redirect {
         .filter(|path| {
             path.starts_with('/') && !path.starts_with("//") && path.starts_with(&state.base)
         })
-        .map_or_else(|| format!("{}/", state.base), str::to_owned);
+        .map_or_else(|| crate::home(&state.base), str::to_owned);
     Redirect::to(&target)
 }
 

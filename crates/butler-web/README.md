@@ -59,4 +59,5 @@ Server-rendered [Askama](https://crates.io/crates/askama) templates, Tailwind
 CSS v4, [uPlot](https://github.com/leeoniya/uPlot) for charts, and one small
 script for the live parts, all compiled into the binary: no CDN, nothing to
 deploy next to it. After changing templates or `ui/input.css`, rebuild the
-stylesheet with `just web-css` (needs the standalone `tailwindcss` CLI).
+stylesheet with `just web-css` (needs the standalone `tailwindcss` CLI,
+v4.2.1 like CI, which fails when the committed stylesheet is stale).

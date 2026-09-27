@@ -93,6 +93,37 @@ jobs:
       - name: Check TOML formatting
         run: '"$RUNNER_TEMP/taplo" fmt --check'
 
+  # The dashboard's stylesheet is committed so the crate publishes as is;
+  # rebuild it with the pinned Tailwind CLI and fail if it is stale.
+  web-css:
+    name: Dashboard CSS is up to date
+    needs: zizmor
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Tailwind CSS CLI
+        env:
+          TAILWIND_SHA256: 39e8d4e24b3c83b0a6e69e100a972fbc75d5fef8dce47b3ddac3cf92dea81fe3
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/tailwindcss" https://github.com/tailwindlabs/tailwindcss/releases/download/v4.2.1/tailwindcss-linux-x64
+          echo "$TAILWIND_SHA256  $RUNNER_TEMP/tailwindcss" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/tailwindcss"
+      - name: Rebuild assets/app.css and compare
+        working-directory: crates/butler-web
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/tailwindcss" -i ui/input.css -o assets/app.css --minify
+          if ! git diff --exit-code --stat -- assets/app.css; then
+            echo "::error file=crates/butler-web/assets/app.css::assets/app.css is stale: run \`just web-css\` (Tailwind CSS v4.2.1) and commit the result"
+            exit 1
+          fi
+
   cargo-deny:
     name: cargo-deny (${{ matrix.check }})
     needs: zizmor

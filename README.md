@@ -205,17 +205,24 @@ Queueing adds serialization and storage overhead compared with a direct call.
 Workers make progress concurrently: Tokio tasks overlap I/O, and synchronous
 jobs use the blocking pool for CPU-bound work.
 
-The following measurements were recorded on a 16-CPU machine with `just bench`,
-in one process using the in-memory backend. They illustrate worker concurrency,
-not durable-backend throughput or a comparison with another job library:
+The following measurements come from `just bench` (a release build), in one
+process using the in-memory backend, on an **Apple M4 Max: 16 CPUs (12
+performance and 4 efficiency cores), 64 GB of RAM, macOS 27, Rust 1.96.1**. A
+re-run on that hardware on 2026-09-27, with other work running, came within 4%
+of each figure. They illustrate worker concurrency, not durable-backend
+throughput or a comparison with another job library, and they'll differ on
+other machines; the bench prints the CPU count, OS and architecture it ran on.
+They aren't generated in CI, where shared runners vary too much for absolute
+numbers to mean anything:
 
 - 2,000 async jobs that each wait 50 ms finished in 117 ms (about 17,000
   jobs/s); one at a time they would take 100 s, so **about 850× faster**.
 - **100,000 async jobs that each wait 1 s, all allowed to run at once,
   finished in 1.88 s** (about 53,000 jobs/s, 430 MB peak memory); one at a
   time they would take 28 hours.
-- 32 CPU-bound jobs took 2.80 s at concurrency 1 and 217 ms at concurrency 16,
-  **12.9× faster**.
+- 32 CPU-bound jobs (two per CPU) took 2.80 s at concurrency 1 and 217 ms at
+  concurrency 16, **12.9× faster**: less than 16×, in part because 4 of the cores are
+  efficiency cores.
 
 Async jobs are tokio tasks, so thousands can wait at once on a few threads.
 CPU-bound jobs are plain `fn`s that run on tokio's blocking pool, one core

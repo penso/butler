@@ -117,10 +117,13 @@ jobs:
         run: rustup show
       # Publishes butler-macros before butler-jobs, and butler-jobs before
       # butler-web, waiting for each to be available in the index.
+      # crates.io only offers trusted publishing for crates that already
+      # exist, so the first release needs a token. Once 0.1.0 is out, switch
+      # to rust-lang/crates-io-auth-action and drop this ignore.
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked --workspace
+        run: cargo publish --locked --workspace # zizmor: ignore[use-trusted-publishing]
 
   tag:
     name: Tag and release

@@ -1421,8 +1421,9 @@ skipped when none is reachable. Code conventions are in `AGENTS.md`.
    and that the tag is new, publishes `butler-macros`, `butler-jobs` and
    `butler-web`, then tags `v<version>` with a GitHub release.
 
-The crates.io token lives only in the `crates-io` environment, which only
-`main` can use.
+Publishing uses crates.io trusted publishing: there is no stored registry
+token. crates.io accepts each crate only from this repository's `publish.yml`
+running in the `crates-io` environment, which only `main` can use.
 
 ## License
 

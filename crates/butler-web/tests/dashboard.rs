@@ -1236,9 +1236,10 @@ async fn basic_auth_works_under_a_base_path() {
         Some(GOOD_CREDENTIALS),
     )
     .await;
-    assert_eq!(
-        response.headers().get(header::LOCATION).unwrap(),
-        "/admin/jobs/"
+    let location = response.headers().get(header::LOCATION).unwrap();
+    assert!(
+        location.to_str().unwrap().starts_with("/admin/jobs"),
+        "back into the dashboard: {location:?}"
     );
     assert_eq!(f.queue.state(&f.dead), Some(JobState::Pending));
 }

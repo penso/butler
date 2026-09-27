@@ -31,6 +31,17 @@
 //!     }
 //! }
 //! ```
+//!
+//! A worker shutdown interrupts the job at its next checkpoint. Each such
+//! interruption is counted in the job's
+//! [`resumptions`](crate::JobRecord::resumptions); past `max_resumptions`
+//! (`#[job(max_resumptions = N)]`, or the worker's setting), one more counts
+//! as a failed attempt, so a job interrupted at every deploy is bounded by its
+//! retry policy instead of cycling forever.
+//!
+//! [`Progress::requeue`] ends the current execution on purpose, like
+//! ActiveJob's isolated steps: the job goes back on its queue, and the next
+//! step starts in a fresh execution, possibly on another worker.
 
 use std::{
     fmt,
@@ -39,7 +50,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -67,6 +78,23 @@ pub struct Interrupted;
 ///
 /// Read it through `Deref` (`*progress`, `progress.get()`), and move forward
 /// with [`set`](Progress::set), which is a checkpoint.
+///
+/// `#[job(max_resumptions = N)]` bounds how many worker shutdowns may
+/// interrupt the job without counting an attempt:
+///
+/// ```no_run
+/// #[butler::job(max_resumptions = 5)]
+/// async fn import(id: u64, progress: butler::Progress<u64>) {}
+/// # fn main() {}
+/// ```
+///
+/// A job without a `Progress` is never interrupted, so it can't set one:
+///
+/// ```compile_fail
+/// #[butler::job(max_resumptions = 5)]
+/// async fn import(id: u64) {}
+/// # fn main() {}
+/// ```
 pub struct Progress<S> {
     state: S,
     checkpoints: Checkpoints,
@@ -100,6 +128,51 @@ impl<S: Serialize + DeserializeOwned + Default> Progress<S> {
         self.checkpoint().await
     }
 
+    /// Moves to `next` and ends this execution, like ActiveJob's isolated
+    /// steps: always returns [`Interrupted`], and once the job returns it
+    /// (propagate it with `?`), the worker puts the job back on its queue
+    /// with `next` as its progress, as for a retry. The next step then starts
+    /// in a fresh execution, possibly on another worker.
+    ///
+    /// Use it before a long step that shouldn't share an execution with the
+    /// ones before it, for example to give it a full shutdown deadline. It
+    /// counts neither as a failed attempt nor towards `max_resumptions`. In
+    /// [inline tests](crate::testing) and with `.now()`, the job resumes at
+    /// once.
+    ///
+    /// ```ignore
+    /// Import::Records { after } => {
+    ///     // ... import the records ...
+    ///     progress.requeue(Import::Finalize)?;
+    /// }
+    /// ```
+    pub fn requeue(&mut self, next: S) -> Result<(), Interrupted> {
+        self.state = next;
+        // The worker stores this with the job as it requeues it: no save here.
+        self.remember();
+        self.checkpoints.0.stop(Interruption::Requeued);
+        Err(Interrupted)
+    }
+
+    /// Serializes the current progress as the latest, and returns it.
+    fn remember(&self) -> Option<Value> {
+        match serde_json::to_value(&self.state) {
+            Ok(value) => {
+                *self
+                    .checkpoints
+                    .0
+                    .latest
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(value.clone());
+                Some(value)
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "job progress could not be serialized");
+                None
+            }
+        }
+    }
+
     /// A checkpoint: remembers the current progress, saves it to the backend
     /// if the last save is older than the worker's `checkpoint_interval`, and
     /// returns [`Interrupted`] if the worker is stopping.
@@ -108,24 +181,18 @@ impl<S: Serialize + DeserializeOwned + Default> Progress<S> {
     /// the next starts.
     pub async fn checkpoint(&mut self) -> Result<(), Interrupted> {
         let inner = &self.checkpoints.0;
-        match serde_json::to_value(&self.state) {
-            Ok(value) => {
-                *inner.latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(value.clone());
-                if inner.save_due() {
-                    match (inner.save)(value).await {
-                        Ok(()) => inner.saved_now(),
-                        // Best effort: the worker also stores the latest
-                        // progress when the job fails or is interrupted.
-                        Err(err) => {
-                            tracing::warn!(error = %Chain(&err), "could not save job progress")
-                        }
-                    }
+        if let Some(value) = self.remember().filter(|_| inner.save_due()) {
+            match (inner.save)(value).await {
+                Ok(()) => inner.saved_now(),
+                // Best effort: the worker also stores the latest progress
+                // when the job fails or is interrupted.
+                Err(err) => {
+                    tracing::warn!(error = %Chain(&err), "could not save job progress")
                 }
             }
-            Err(err) => tracing::error!(error = %err, "job progress could not be serialized"),
         }
         if (inner.should_stop)() {
-            inner.interrupted.store(true, Ordering::Release);
+            inner.stop(Interruption::Stopping);
             return Err(Interrupted);
         }
         Ok(())
@@ -150,6 +217,32 @@ impl<S: fmt::Debug> fmt::Debug for Progress<S> {
 pub(crate) type Save = Box<dyn Fn(Value) -> SaveFuture + Send + Sync>;
 pub(crate) type SaveFuture = Pin<Box<dyn Future<Output = crate::Result<()>> + Send>>;
 
+/// Why a run of a job with a [`Progress`] returned [`Interrupted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Interruption {
+    /// A checkpoint saw the worker stopping: one more resumption.
+    Stopping,
+    /// The job asked for it with [`Progress::requeue`].
+    Requeued,
+}
+
+impl Interruption {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Stopping),
+            2 => Some(Self::Requeued),
+            _ => None,
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Stopping => 1,
+            Self::Requeued => 2,
+        }
+    }
+}
+
 /// What the worker gives a job run so its [`Progress`] can resume and
 /// checkpoint. Shared: the worker reads back the latest progress and whether
 /// the run was interrupted.
@@ -161,7 +254,8 @@ struct Inner {
     /// Progress to resume from, if any.
     saved: Option<Value>,
     latest: Mutex<Option<Value>>,
-    interrupted: AtomicBool,
+    /// The last [`Interruption`] of this run, as its `as_u8`; 0 for none.
+    interrupted: AtomicU8,
     should_stop: Box<dyn Fn() -> bool + Send + Sync>,
     save: Save,
     interval: Duration,
@@ -169,6 +263,10 @@ struct Inner {
 }
 
 impl Inner {
+    fn stop(&self, why: Interruption) {
+        self.interrupted.store(why.as_u8(), Ordering::Release);
+    }
+
     fn save_due(&self) -> bool {
         self.last_save
             .lock()
@@ -194,7 +292,7 @@ impl Checkpoints {
         Self(Arc::new(Inner {
             saved,
             latest: Mutex::new(None),
-            interrupted: AtomicBool::new(false),
+            interrupted: AtomicU8::new(0),
             should_stop: Box::new(should_stop),
             save,
             interval,
@@ -202,9 +300,15 @@ impl Checkpoints {
         }))
     }
 
-    /// Whether a checkpoint returned [`Interrupted`] during this run.
+    /// Why this run returned [`Interrupted`], if it did.
+    pub(crate) fn interruption(&self) -> Option<Interruption> {
+        Interruption::from_u8(self.0.interrupted.load(Ordering::Acquire))
+    }
+
+    /// Whether a checkpoint or [`Progress::requeue`] returned [`Interrupted`]
+    /// during this run.
     pub(crate) fn interrupted(&self) -> bool {
-        self.0.interrupted.load(Ordering::Acquire)
+        self.interruption().is_some()
     }
 
     /// The progress at the last checkpoint of this run, if any.

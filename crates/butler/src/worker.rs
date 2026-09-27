@@ -4,6 +4,7 @@ use std::{
     sync::{
         Arc, Mutex, PoisonError, RwLock, TryLockError,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -12,16 +13,16 @@ use std::{
 use tracing::{Instrument, Span, field};
 
 use crate::{
-    Backoff, Config, Cron, DeadJob, Error, Failed, GlobalLimit, Job, JobContext, JobDef, JobError,
-    Layer, NewJob, Next, PreparedJob, Queue, QueuePriority, Recurring, RecurringConfig, Result,
-    RetryPolicy, RunFuture, WorkerConfig, block_on,
+    Backoff, Cleaned, Config, Cron, DeadJob, Error, Failed, GlobalLimit, Job, JobContext, JobDef,
+    JobError, Layer, NewJob, Next, PreparedJob, Queue, QueuePriority, Recurring, RecurringConfig,
+    Result, RetryPolicy, RunFuture, WorkerConfig, block_on,
     error::Chain,
     executor::panic_message,
     job::millis,
     limits::{Permit, QueueLimits},
     middleware::{DeadHook, Handler, run_dead_hooks, run_handler},
     monitor::JobMetric,
-    progress::{Checkpoints, Invocation},
+    progress::{Checkpoints, Interruption, Invocation},
     recurring::REGISTER_INTERVAL,
     state::Processing,
 };
@@ -65,6 +66,13 @@ const PROMOTE_INTERVAL: Duration = KEEPER_TICK;
 /// resuming one takes effect within about this long.
 const PAUSED_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How often the keeper deletes finished jobs past their retention, and how
+/// many at most per call. A full batch means more are waiting: the next one
+/// runs at the next keeper tick, so a backlog drains without holding the
+/// backend (or delaying the heartbeat) for long at a time.
+const CLEAN_INTERVAL: Duration = Duration::from_secs(60);
+const CLEAN_BATCH: usize = 1_000;
+
 /// Pulls jobs from a [`Queue`] and runs them. It can run every `#[job]`
 /// function compiled into the current binary.
 ///
@@ -87,6 +95,12 @@ pub struct Worker {
     concurrency: usize,
     max_retries: u32,
     backoff: Backoff,
+    /// Worker shutdowns a job with a `Progress` may be interrupted by without
+    /// counting an attempt, unless it sets its own; `None` for no limit.
+    max_resumptions: Option<u32>,
+    /// On shutdown, the longest to wait for running jobs before leaving them
+    /// to heartbeat recovery.
+    shutdown_timeout: Duration,
     poll_interval: Duration,
     heartbeat_ttl: Duration,
     recover_interval: Duration,
@@ -123,6 +137,9 @@ struct Upkeep {
     recovered: Option<Instant>,
     promoted: Option<Instant>,
     paused: Option<Instant>,
+    cleaned: Option<Instant>,
+    /// The last cleanup deleted a full batch.
+    clean_backlog: bool,
 }
 
 impl Worker {
@@ -160,6 +177,8 @@ impl Worker {
             concurrency: defaults.concurrency,
             max_retries: defaults.max_retries,
             backoff: defaults.backoff,
+            max_resumptions: defaults.max_resumptions,
+            shutdown_timeout: defaults.shutdown_timeout(),
             poll_interval: defaults.poll_interval(),
             heartbeat_ttl: defaults.heartbeat_ttl(),
             recover_interval: defaults.recover_interval(),
@@ -191,6 +210,8 @@ impl Worker {
             .claimers(config.claimers)
             .max_retries(config.max_retries)
             .backoff(config.backoff)
+            .max_resumptions(config.max_resumptions)
+            .shutdown_timeout(config.shutdown_timeout())
             .poll_interval(config.poll_interval())
             .heartbeat_ttl(config.heartbeat_ttl())
             .checkpoint_interval(config.checkpoint_interval())
@@ -391,6 +412,74 @@ impl Worker {
         self
     }
 
+    /// How many times a job with a [`Progress`](crate::Progress) may be
+    /// interrupted at a checkpoint by a worker shutdown and put back on its
+    /// queue without counting an attempt, unless it sets its own with
+    /// `#[job(max_resumptions = N)]`. Past it, the next interruption counts
+    /// as a failed attempt ([`JobError::ResumeLimit`]) and goes through the
+    /// job's retry policy, so a job interrupted at every deploy ends up dead
+    /// (and in the `on_dead` hooks) rather than cycling forever. `None`, the
+    /// default, sets no limit.
+    ///
+    /// Only interruptions at a checkpoint count: not
+    /// [`Progress::requeue`](crate::Progress::requeue), nor a job recovered
+    /// after its worker crashed or [gave up on it](Worker::shutdown_timeout).
+    pub fn max_resumptions(mut self, max: impl Into<Option<u32>>) -> Self {
+        self.max_resumptions = max.into();
+        self
+    }
+
+    /// The resumption limit for job `name`: its own, or this worker's.
+    fn max_resumptions_of(&self, name: &str) -> Option<u32> {
+        self.jobs
+            .get(name)
+            .and_then(|def| def.max_resumptions)
+            .or(self.max_resumptions)
+    }
+
+    /// On shutdown, the longest [`run_until`](Worker::run_until) and
+    /// [`run_async`](Worker::run_async) wait for running jobs to finish, from
+    /// the moment they are asked to stop. Jobs with a `Progress` stop at
+    /// their next checkpoint and go back on their queue; other jobs run to
+    /// the end. Past the timeout, the worker stops its heartbeat and returns
+    /// without retiring: the jobs still running are left in its processing
+    /// area, and another worker puts them back on their queues once the
+    /// heartbeat expires (after `heartbeat_ttl`), as after a crash. Exit the
+    /// process soon after, or those jobs may run twice. Defaults to 25
+    /// seconds, under the usual 30-second grace period before a `SIGKILL`;
+    /// `Duration::MAX` waits for as long as the jobs take.
+    pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = timeout;
+        self
+    }
+
+    /// When a shutdown that starts now stops waiting for jobs, or `None` to
+    /// wait for as long as they take.
+    fn shutdown_deadline(&self) -> Option<Instant> {
+        Instant::now().checked_add(self.shutdown_timeout)
+    }
+
+    fn log_gave_up(&self, running: usize) {
+        tracing::warn!(
+            worker = %self.id,
+            running,
+            timeout_ms = u64::try_from(self.shutdown_timeout.as_millis()).unwrap_or(u64::MAX),
+            "shutdown timeout reached with jobs still running; they go back on their queues once this worker's heartbeat expires"
+        );
+    }
+
+    /// Puts back a job claimed as the worker started stopping, without
+    /// running it. A claim that was waiting when the shutdown began can
+    /// still return a job, often one just interrupted by this very
+    /// shutdown: running it would only interrupt it again at once, and each
+    /// time would count towards its `max_resumptions`.
+    fn release_unstarted(&self, job: Job<Processing>) -> Result<()> {
+        let id = job.id().to_owned();
+        self.queue.requeue(&self.id, job)?;
+        tracing::debug!(job = %id, "stopping: put back a job claimed but not started");
+        Ok(())
+    }
+
     /// The retry policy for job `name`: its own settings, or this worker's.
     fn retry_policy(&self, name: &str) -> RetryPolicy {
         let def = self.jobs.get(name);
@@ -444,21 +533,28 @@ impl Worker {
     }
 
     /// Runs until `stop` is set, then waits for the threads to finish their
-    /// current jobs.
+    /// current jobs, for up to the [`shutdown_timeout`](Worker::shutdown_timeout).
     pub fn run_until(mut self, stop: Arc<AtomicBool>) {
         // Checkpoints see the same flag: stopping interrupts continuable jobs.
         self.stopping = Arc::clone(&stop);
         self.log_upkeep(true);
+        // Stopped only once no job runs, or the worker gives up on them: a
+        // job still finishing after `stop` must keep its heartbeat, or
+        // another worker would recover it while it runs.
+        let keeper_stop = Arc::new(AtomicBool::new(false));
         let keeper = {
             let worker = self.clone();
-            let stop = Arc::clone(&stop);
+            let keeper_stop = Arc::clone(&keeper_stop);
             thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
+                while !keeper_stop.load(Ordering::Relaxed) {
                     worker.log_upkeep(false);
+                    worker.clean_finished();
                     thread::sleep(KEEPER_TICK);
                 }
             })
         };
+        // Each job thread sends one message as it ends, even by a panic.
+        let (ended, ends) = mpsc::channel::<()>();
 
         let threads = if self.concurrency > MAX_THREADS {
             tracing::warn!(
@@ -474,7 +570,9 @@ impl Worker {
             .map(|_| {
                 let worker = self.clone();
                 let stop = Arc::clone(&stop);
+                let ended = Ended(ended.clone());
                 thread::spawn(move || {
+                    let _ended = ended;
                     while !stop.load(Ordering::Relaxed) {
                         let started = Instant::now();
                         match worker.work_one_within(worker.poll_interval) {
@@ -496,7 +594,43 @@ impl Worker {
                 })
             })
             .collect();
-        for thread in threads.into_iter().chain([keeper]) {
+        drop(ended);
+
+        let mut running = threads.len();
+        // Before `stop`, only a thread that panicked outside a job ends.
+        while running > 0 && !stop.load(Ordering::Relaxed) {
+            if ends.recv_timeout(KEEPER_TICK).is_ok() {
+                running -= 1;
+            }
+        }
+        let deadline = self.shutdown_deadline();
+        while running > 0 {
+            let ended = match deadline {
+                Some(deadline) => {
+                    ends.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                }
+                None => ends.recv().map_err(mpsc::RecvTimeoutError::from),
+            };
+            match ended {
+                Ok(()) => running -= 1,
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                // Every thread has ended.
+                Err(mpsc::RecvTimeoutError::Disconnected) => running = 0,
+            }
+        }
+
+        keeper_stop.store(true, Ordering::Relaxed);
+        if keeper.join().is_err() {
+            tracing::error!("the worker's keeper thread panicked");
+        }
+        if running > 0 {
+            // The job threads are left running, detached: joining them could
+            // wait forever. Not retired, so the jobs they hold are recovered
+            // once the heartbeat, now stopped, expires.
+            self.log_gave_up(running);
+            return;
+        }
+        for thread in threads {
             if thread.join().is_err() {
                 tracing::error!("a worker thread panicked outside of a job");
             }
@@ -532,6 +666,11 @@ impl Worker {
             Claimed::Nothing { throttled: true } => return Ok(Step::Throttled),
             Claimed::Nothing { throttled: false } => return Ok(Step::Idle),
         };
+        if self.stopping.load(Ordering::Acquire) {
+            self.release_unstarted(job)?;
+            drop(permit);
+            return Ok(Step::Idle);
+        }
         let span = self.span(&job);
         let checkpoints = self.checkpoints(&job);
         let started = Instant::now();
@@ -734,6 +873,43 @@ impl Worker {
         Ok(())
     }
 
+    /// Deletes a batch of finished jobs past the backend's retention, when
+    /// due: every [`CLEAN_INTERVAL`], or at the next tick while the backend
+    /// reports more to look at (a full batch, or a scan budget spent). Only
+    /// the keeper does it, never a thread about to run a job.
+    fn clean_finished(&self) {
+        let now = Instant::now();
+        {
+            let last = self.upkeep.lock().unwrap_or_else(PoisonError::into_inner);
+            let every = if last.clean_backlog {
+                Duration::ZERO
+            } else {
+                CLEAN_INTERVAL
+            };
+            if last
+                .cleaned
+                .is_some_and(|at| now.duration_since(at) < every)
+            {
+                return;
+            }
+        }
+        let cleaned = self.queue.clean_finished(SystemTime::now(), CLEAN_BATCH);
+        let mut last = self.upkeep.lock().unwrap_or_else(PoisonError::into_inner);
+        last.cleaned = Some(now);
+        last.clean_backlog = cleaned.as_ref().is_ok_and(|cleaned| cleaned.more);
+        match cleaned {
+            Ok(Cleaned { deleted: 0, .. }) => {}
+            Ok(Cleaned { deleted, .. }) => {
+                tracing::debug!(deleted, "deleted finished jobs past their retention")
+            }
+            Err(err) => tracing::warn!(
+                worker = %self.id,
+                error = %Chain(&err),
+                "could not delete finished jobs past their retention"
+            ),
+        }
+    }
+
     /// Reads the paused queues from the backend, and logs when one this
     /// worker serves is paused or resumed.
     fn refresh_paused(&self) -> Result<()> {
@@ -774,9 +950,9 @@ impl Worker {
     }
 
     /// The span every run of `job` is in, with its id, name, queue and
-    /// attempt. `outcome` (`done`, `retry`, `dead` or `interrupted`) and,
-    /// for a retry, `retry_at_ms` (ms since the Unix epoch) are recorded
-    /// when it finishes.
+    /// attempt. `outcome` (`done`, `retry`, `dead`, `interrupted` or
+    /// `requeued`) and, for a retry, `retry_at_ms` (ms since the Unix epoch)
+    /// are recorded when it finishes.
     fn span(&self, job: &Job<Processing>) -> Span {
         tracing::info_span!(
             "job",
@@ -869,12 +1045,27 @@ impl Worker {
             Some(progress) => job.with_progress(progress),
             None => job,
         };
-        if checkpoints.interrupted() {
-            self.queue.interrupt(&self.id, job)?;
-            span.record("outcome", "interrupted");
-            tracing::info!("job interrupted at a checkpoint; it will resume from there");
-            return Ok(None);
-        }
+        let err = match checkpoints.interruption() {
+            Some(Interruption::Requeued) => {
+                self.queue.requeue(&self.id, job)?;
+                span.record("outcome", "requeued");
+                tracing::debug!("job requeued itself; its next step starts in a fresh execution");
+                return Ok(None);
+            }
+            Some(Interruption::Stopping) => match self.max_resumptions_of(&job_name) {
+                Some(max) if job.resumptions() >= max => {
+                    // Too many already: this one is a failed attempt.
+                    JobError::ResumeLimit { max }
+                }
+                _ => {
+                    self.queue.interrupt(&self.id, job)?;
+                    span.record("outcome", "interrupted");
+                    tracing::info!("job interrupted at a checkpoint; it will resume from there");
+                    return Ok(None);
+                }
+            },
+            None => err,
+        };
         let error = Chain(&err).to_string();
         self.record(&metric(true));
         let policy = self.retry_policy(&job_name);
@@ -916,7 +1107,8 @@ impl Worker {
     /// Runs the worker inside the current tokio runtime until `shutdown`
     /// completes. Each job is a tokio task, so job bodies can use tokio timers
     /// and I/O. At most `concurrency` jobs run at once. On shutdown, the worker
-    /// stops claiming jobs, waits for the running ones to finish, and retires.
+    /// stops claiming jobs, waits for the running ones to finish, for up to
+    /// the [`shutdown_timeout`](Worker::shutdown_timeout), and retires.
     pub async fn run_async(self, shutdown: impl Future<Output = ()>) {
         use tokio::{sync::Semaphore, task::JoinSet};
 
@@ -935,6 +1127,11 @@ impl Worker {
             async move {
                 loop {
                     upkeep(worker.clone(), false).await;
+                    let w = worker.clone();
+                    if let Err(err) = tokio::task::spawn_blocking(move || w.clean_finished()).await
+                    {
+                        tracing::error!(error = %err, "cleaning up finished jobs panicked");
+                    }
                     tokio::time::sleep(KEEPER_TICK).await;
                 }
             }
@@ -953,14 +1150,34 @@ impl Worker {
         }
 
         shutdown.await;
+        let deadline = self.shutdown_deadline();
         // Continuable jobs stop at their next checkpoint and requeue.
         self.stopping.store(true, Ordering::Release);
         let _ = stop.send(true);
+        // Not bounded by the deadline: a claim that started must finish (see
+        // `claim_loop`), and each waits at most `poll_interval`.
         while claimers.join_next().await.is_some() {}
         let all = u32::try_from(self.concurrency).unwrap_or(u32::MAX);
-        drop(permits.acquire_many(all).await);
+        let drained = permits.acquire_many(all);
+        let drained = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline.into(), drained)
+                .await
+                .is_ok(),
+            None => {
+                drop(drained.await);
+                true
+            }
+        };
 
+        // The keeper ran until now, so jobs finishing after the shutdown
+        // signal kept their heartbeat.
         keeper.abort();
+        if !drained {
+            // The job tasks keep running while the runtime does; their jobs
+            // are recovered once the heartbeat, now stopped, expires.
+            self.log_gave_up(self.concurrency - permits.available_permits());
+            return;
+        }
         let worker = self.clone();
         if let Err(err) = tokio::task::spawn_blocking(move || worker.log_retire()).await {
             tracing::error!(error = %err, "could not retire worker");
@@ -1028,6 +1245,17 @@ impl Worker {
     }
 
     async fn execute_async(&self, job: Job<Processing>) {
+        if self.stopping.load(Ordering::Acquire) {
+            let worker = self.clone();
+            let released = crate::executor::unblock(self.queue.blocks(), move || {
+                worker.release_unstarted(job)
+            })
+            .await;
+            if let Err(err) = released {
+                tracing::error!(error = %Chain(&err), "could not put back a job claimed while stopping");
+            }
+            return;
+        }
         let span = self.span(&job);
         let checkpoints = self.checkpoints(&job);
         let started = Instant::now();
@@ -1063,6 +1291,17 @@ impl Worker {
                 span.in_scope(|| tracing::error!(error = %err, "an on_dead hook panicked"));
             }
         }
+    }
+}
+
+/// Tells [`Worker::run_until`] that a job thread ended, when dropped: at the
+/// end of its loop, or while unwinding from a panic outside a job.
+struct Ended(mpsc::Sender<()>);
+
+impl Drop for Ended {
+    fn drop(&mut self) {
+        // The receiver is gone only if `run_until` gave up on this thread.
+        let _ = self.0.send(());
     }
 }
 

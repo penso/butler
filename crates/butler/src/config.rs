@@ -4,6 +4,8 @@
 //! ```toml
 //! [queue]
 //! backend = "redis"            # "file" (default), "redis", or "memory" (in-process)
+//! keep_finished = "1d"         # done and cancelled jobs, then deleted (default "1d")
+//! keep_dead = "forever"        # dead jobs (default: until discarded or retried)
 //!
 //! [queue.file]
 //! dir = ".butler"
@@ -11,6 +13,7 @@
 //! [queue.redis]
 //! url = "redis://127.0.0.1:6379/"
 //! prefix = "butler"
+//! max_idle_connections = 32   # idle connections kept for reuse, per process
 //!
 //! [worker]
 //! concurrency = 4
@@ -19,6 +22,9 @@
 //! poll_interval_ms = 100
 //! heartbeat_ttl_secs = 30      # crashed workers' jobs are requeued after this
 //! recover_interval_secs = 10
+//! shutdown_timeout_secs = 25  # on shutdown, the longest to wait for running jobs
+//! max_resumptions = 10         # optional: shutdown interruptions of a job with a
+//!                              # Progress before one counts as a failed attempt
 //! queues = [["critical", 6], ["default", 3], ["low", 1]]   # or ["critical", "default"]
 //!
 //! [worker.queue_limits]        # optional, per queue and per worker process
@@ -51,7 +57,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    Backoff, Cron, Error, FileQueue, Queue, QueuePriority, Result,
+    Backoff, Cron, Error, FileQueue, Keep, Queue, QueuePriority, Result, Retention,
     job::{DEFAULT_QUEUE, is_valid_queue_name},
     recurring,
 };
@@ -117,13 +123,43 @@ impl RecurringConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct QueueConfig {
     pub backend: BackendKind,
+    /// How long done and cancelled jobs (and their results) are kept:
+    /// `"forever"`, or a duration of at least a minute such as `"7d"`.
+    /// Running workers delete older ones. Default: a day.
+    pub keep_finished: Keep,
+    /// How long dead jobs are kept, as `keep_finished`. Default: forever,
+    /// until discarded or retried.
+    pub keep_dead: Keep,
     pub file: FileConfig,
     pub redis: RedisConfig,
     pub sqlite: SqliteConfig,
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        let retention = Retention::default();
+        Self {
+            backend: BackendKind::default(),
+            keep_finished: retention.finished,
+            keep_dead: retention.dead,
+            file: FileConfig::default(),
+            redis: RedisConfig::default(),
+            sqlite: SqliteConfig::default(),
+        }
+    }
+}
+
+impl QueueConfig {
+    pub fn retention(&self) -> Retention {
+        Retention {
+            finished: self.keep_finished,
+            dead: self.keep_dead,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -174,6 +210,15 @@ pub struct RedisConfig {
     pub url: String,
     /// Namespace for all keys, so several apps can share one Redis.
     pub prefix: String,
+    /// How many idle connections each process keeps for reuse. Not a limit
+    /// on connections in use: see
+    /// [`RedisQueue::max_idle_connections`](crate::RedisQueue::max_idle_connections).
+    pub max_idle_connections: usize,
+}
+
+impl RedisConfig {
+    /// The default of [`max_idle_connections`](Self::max_idle_connections).
+    pub const DEFAULT_MAX_IDLE_CONNECTIONS: usize = 32;
 }
 
 impl Default for RedisConfig {
@@ -181,6 +226,7 @@ impl Default for RedisConfig {
         Self {
             url: "redis://127.0.0.1:6379/".into(),
             prefix: "butler".into(),
+            max_idle_connections: Self::DEFAULT_MAX_IDLE_CONNECTIONS,
         }
     }
 }
@@ -210,6 +256,15 @@ pub struct WorkerConfig {
     /// For jobs with a `Progress`: the most often their progress is saved to
     /// the backend, so a crash resumes them from at most this long ago.
     pub checkpoint_interval_ms: u64,
+    /// For jobs with a `Progress`: how many times a worker shutdown may
+    /// interrupt one at a checkpoint without counting an attempt, unless it
+    /// sets its own with `#[job(max_resumptions = N)]`. Past it, the next
+    /// interruption is a failed attempt. No limit if not set.
+    pub max_resumptions: Option<u32>,
+    /// On shutdown, the longest to wait for running jobs, at least 1. Jobs
+    /// still running then are left to be requeued once this worker's
+    /// heartbeat expires, as after a crash.
+    pub shutdown_timeout_secs: u64,
     /// Queues to serve. Plain names are strict priority, in order:
     /// `["critical", "default"]`. Any `[name, weight]` pair makes it weighted,
     /// with plain names weighing 1: `[["critical", 6], ["default", 1]]`.
@@ -254,6 +309,8 @@ impl Default for WorkerConfig {
             heartbeat_ttl_secs: 30,
             recover_interval_secs: 10,
             checkpoint_interval_ms: 1_000,
+            max_resumptions: None,
+            shutdown_timeout_secs: 25,
             queues: vec![QueueEntry::Name(DEFAULT_QUEUE.to_owned())],
             queue_limits: HashMap::new(),
             global_queue_limits: HashMap::new(),
@@ -282,6 +339,10 @@ impl WorkerConfig {
         Duration::from_millis(self.checkpoint_interval_ms)
     }
 
+    pub fn shutdown_timeout(&self) -> Duration {
+        Duration::from_secs(self.shutdown_timeout_secs)
+    }
+
     pub fn priority(&self) -> QueuePriority {
         let weighted = self
             .queues
@@ -296,9 +357,13 @@ impl WorkerConfig {
         }))
     }
 
-    /// Rejects queue names that can't be file names or Redis keys, and zero
-    /// weights, which would mean a queue is listed but never served.
+    /// Rejects queue names that can't be file names or Redis keys, zero
+    /// weights, which would mean a queue is listed but never served, and a
+    /// zero shutdown timeout, which would abandon every running job at once.
     fn validate(&self) -> Result<()> {
+        if self.shutdown_timeout_secs == 0 {
+            return Err(Error::InvalidShutdownTimeout);
+        }
         for entry in &self.queues {
             let reason = match entry {
                 _ if !is_valid_queue_name(entry.name()) => {
@@ -366,17 +431,25 @@ impl Config {
 
     /// Opens the configured backend.
     pub fn connect(&self) -> Result<Queue> {
+        let retention = self.queue.retention();
         match self.queue.backend {
-            BackendKind::File => Ok(FileQueue::new(&self.queue.file.dir)?.into()),
-            BackendKind::Memory => Ok(crate::MemoryQueue::shared().into()),
+            BackendKind::File => Ok(FileQueue::new(&self.queue.file.dir)?
+                .retention(retention)
+                .into()),
+            BackendKind::Memory => Ok(crate::MemoryQueue::shared().retention(retention).into()),
             #[cfg(feature = "sqlite")]
-            BackendKind::Sqlite => Ok(crate::SqliteQueue::open(&self.queue.sqlite.path)?.into()),
+            BackendKind::Sqlite => Ok(crate::SqliteQueue::open(&self.queue.sqlite.path)?
+                .retention(retention)
+                .into()),
             #[cfg(not(feature = "sqlite"))]
             BackendKind::Sqlite => Err(Error::BackendDisabled("sqlite")),
             #[cfg(feature = "redis")]
             BackendKind::Redis => {
                 let redis = &self.queue.redis;
-                Ok(crate::RedisQueue::connect(&redis.url, &redis.prefix)?.into())
+                Ok(crate::RedisQueue::connect(&redis.url, &redis.prefix)?
+                    .max_idle_connections(redis.max_idle_connections)
+                    .retention(retention)
+                    .into())
             }
             #[cfg(not(feature = "redis"))]
             BackendKind::Redis => Err(Error::BackendDisabled("redis")),
@@ -404,6 +477,10 @@ mod tests {
         assert_eq!(config.queue.backend, BackendKind::Redis);
         assert_eq!(config.queue.redis.url, "redis://example:6380/");
         assert_eq!(config.queue.redis.prefix, "butler");
+        assert_eq!(
+            config.queue.redis.max_idle_connections,
+            RedisConfig::DEFAULT_MAX_IDLE_CONNECTIONS
+        );
         assert_eq!(config.queue.file.dir, PathBuf::from(".butler"));
         assert_eq!(config.worker.concurrency, 8);
         assert_eq!(config.worker.max_retries, 3);
@@ -494,6 +571,39 @@ mod tests {
     }
 
     #[test]
+    fn retention_loads_with_defaults_and_rejects_bad_values() {
+        let defaults = load("").unwrap().queue.retention();
+        assert_eq!(defaults, Retention::default());
+        assert_eq!(
+            defaults.finished,
+            Keep::For(Duration::from_secs(24 * 60 * 60))
+        );
+        assert_eq!(defaults.dead, Keep::Forever);
+
+        let set = load("[queue]\nkeep_finished = \"7d\"\nkeep_dead = \"90d\"\n").unwrap();
+        assert_eq!(
+            set.queue.retention(),
+            Retention {
+                finished: Keep::For(Duration::from_secs(7 * 24 * 60 * 60)),
+                dead: Keep::For(Duration::from_secs(90 * 24 * 60 * 60)),
+            }
+        );
+        let forever = load("[queue]\nkeep_finished = \"forever\"\n").unwrap();
+        assert_eq!(forever.queue.keep_finished, Keep::Forever);
+
+        for bad in ["\"7\"", "\"10s\"", "\"never\"", "7"] {
+            assert!(
+                load(&format!("[queue]\nkeep_finished = {bad}\n")).is_err(),
+                "{bad}"
+            );
+            assert!(
+                load(&format!("[queue]\nkeep_dead = {bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn recurring_entries_load_with_defaults_and_are_validated() {
         let config = load(
             "[[recurring]]\njob = \"report\"\ncron = \"0 3 * * *\"\nargs = [42, \"summary\", { Mixed = true }]\n\
@@ -558,6 +668,28 @@ mod tests {
             matches!(duplicate, Error::DuplicateRecurring { .. }),
             "{duplicate:?}"
         );
+    }
+
+    #[test]
+    fn continuation_limits_load_with_defaults_and_are_validated() {
+        let default = load("").unwrap().worker;
+        assert_eq!(default.max_resumptions, None);
+        assert_eq!(default.shutdown_timeout(), Duration::from_secs(25));
+
+        let set = load("[worker]\nmax_resumptions = 5\nshutdown_timeout_secs = 60\n").unwrap();
+        assert_eq!(set.worker.max_resumptions, Some(5));
+        assert_eq!(set.worker.shutdown_timeout(), Duration::from_secs(60));
+
+        let zero = load("[worker]\nshutdown_timeout_secs = 0\n").unwrap_err();
+        assert!(matches!(zero, Error::InvalidShutdownTimeout), "{zero:?}");
+        assert!(load("[worker]\nmax_resumptions = -1\n").is_err());
+    }
+
+    #[test]
+    fn redis_idle_connections_load_from_the_file() {
+        let config = load("[queue.redis]\nmax_idle_connections = 4\n").unwrap();
+        assert_eq!(config.queue.redis.max_idle_connections, 4);
+        assert!(load("[queue.redis]\nmax_idle_connections = -1\n").is_err());
     }
 
     #[test]

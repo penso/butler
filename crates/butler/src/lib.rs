@@ -41,6 +41,7 @@ mod prepared;
 mod progress;
 mod queues;
 pub mod recurring;
+mod retention;
 mod retry;
 mod signal;
 pub mod testing;
@@ -54,7 +55,8 @@ pub use arg::JobArg;
 #[cfg(feature = "redis")]
 pub use backend::RedisQueue;
 pub use backend::{
-    Backend, FileQueue, GlobalLimit, MemoryQueue, Monitor, NewJob, Promoted, Queue, Store, Watch,
+    Backend, Cleaned, FileQueue, GlobalLimit, MemoryQueue, Monitor, NewJob, Promoted, Queue, Store,
+    Watch,
 };
 #[cfg(feature = "sqlite")]
 pub use backend::{SQLITE_WATCH_TICK, SqliteQueue};
@@ -77,6 +79,7 @@ pub use prepared::{PreparedJob, enqueue_all};
 pub use progress::{Interrupted, Progress};
 pub use queues::QueuePriority;
 pub use recurring::{Cron, Recurring, RecurringRecord};
+pub use retention::{Keep, Retention};
 pub use retry::{Backoff, JITTER, MAX_BACKOFF, Retry, RetryPolicy, Retryable};
 pub use signal::{JobWatch, Signal};
 pub use worker::Worker;
@@ -140,6 +143,9 @@ pub struct JobDef {
     pub retries: Option<u32>,
     /// Set with `#[job(backoff = "...")]`; the worker's backoff otherwise.
     pub backoff: Option<Backoff>,
+    /// Set with `#[job(max_resumptions = N)]`; the worker's
+    /// `max_resumptions` otherwise.
+    pub max_resumptions: Option<u32>,
     /// Set with `#[job(concurrency_key = "...", limit = N)]`.
     pub concurrency: Option<ConcurrencyLimit>,
     /// Set with `#[job(unique = "...")]`.

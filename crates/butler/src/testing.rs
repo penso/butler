@@ -132,7 +132,8 @@ impl InlineJobs {
         self
     }
 
-    /// How many times a job was interrupted and resumed.
+    /// How many times a job was interrupted and resumed, including steps that
+    /// asked to be requeued with [`Progress::requeue`](crate::Progress::requeue).
     pub fn interruptions(&self) -> u32 {
         self.interruptions.load(Ordering::SeqCst)
     }

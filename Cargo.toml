@@ -1,5 +1,11 @@
 [workspace]
-members  = ["crates/butler", "crates/butler-macros", "crates/butler-web", "examples/demo"]
+members = [
+  "crates/butler",
+  "crates/butler-macros",
+  "crates/butler-web",
+  "e2e/server",
+  "examples/demo",
+]
 resolver = "3"
 
 # Shared by every crate.

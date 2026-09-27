@@ -1,0 +1,12 @@
+{
+  "name": "butler-dashboard-e2e",
+  "private": true,
+  "description": "Browser tests for the butler-web dashboard. Not part of any published crate.",
+  "scripts": {
+    "server": "cargo build --locked -p butler-e2e-server",
+    "test": "npm run server && playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}

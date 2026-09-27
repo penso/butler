@@ -126,3 +126,60 @@ fn no_runtime_needed() {
     }));
     assert_eq!(value, Some(10));
 }
+
+/// A plain `tokio::spawn` is outside the scope; `testing::spawn` carries it
+/// into the task, on whichever thread runs it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spawned_tasks_run_jobs_inline_when_they_carry_the_scope() {
+    let jobs = InlineJobs::new();
+    let handles = jobs
+        .perform(async {
+            let tasks: Vec<_> = (100..110u64)
+                .map(|user| {
+                    butler::testing::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        process_user(user).await.unwrap()
+                    })
+                })
+                .collect();
+            let mut handles = Vec::new();
+            for task in tasks {
+                handles.push(task.await.unwrap());
+            }
+            handles
+        })
+        .await;
+    for (user, handle) in (100..110u64).zip(handles) {
+        assert!(processed(user), "{user}");
+        assert_eq!(handle.result().await.unwrap(), Some(user * 10));
+    }
+    assert_eq!(jobs.performed_names().len(), 10);
+}
+
+#[tokio::test]
+async fn propagate_carries_the_scope_into_any_spawned_future() {
+    let jobs = InlineJobs::new();
+    jobs.perform(async {
+        let mut set = tokio::task::JoinSet::new();
+        set.spawn(butler::testing::propagate(async {
+            signup(120).await.unwrap();
+        }));
+        set.join_all().await;
+    })
+    .await;
+    assert!(processed(120));
+    assert_eq!(jobs.performed_names(), ["process_user", "signup"]);
+}
+
+#[test]
+fn propagate_carries_the_scope_onto_another_thread() {
+    let jobs = InlineJobs::new();
+    butler::block_on(jobs.perform(async {
+        // Created in the scope, run by a thread that knows nothing of it.
+        let job = butler::testing::propagate(async { crunch(21).await.unwrap() });
+        std::thread::spawn(move || butler::block_on(job))
+            .join()
+            .unwrap();
+    }));
+    assert_eq!(jobs.performed_names(), ["crunch"]);
+}

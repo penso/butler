@@ -367,3 +367,46 @@ async fn recording_does_not_touch_the_configured_queue() {
     assert_eq!(jobs.enqueued_names(), ["crunch"]);
     assert_eq!(queue.state(spawned.id()), Some(JobState::Pending));
 }
+
+/// `testing::spawn` records the jobs of spawned tasks, across threads.
+#[cfg(feature = "tokio")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spawned_tasks_are_recorded_when_they_carry_the_scope() {
+    let jobs = RecordedJobs::new();
+    jobs.record(async {
+        let tasks: Vec<_> = (0..10u32)
+            .map(|n| {
+                butler::testing::spawn(async move {
+                    tokio::task::yield_now().await;
+                    crunch(n).await.unwrap();
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+    })
+    .await;
+    assert_eq!(jobs.enqueued_of(&crunch::JOB).len(), 10);
+}
+
+/// The scope a future was created in follows it; one created outside any
+/// scope takes whichever scope polls it.
+#[tokio::test]
+async fn propagate_keeps_the_scope_it_was_created_in() {
+    let recorded = RecordedJobs::new();
+    let inline = InlineJobs::new();
+
+    // On purpose: the future is created inside the recording, run outside it.
+    #[allow(clippy::async_yields_async)]
+    let carried = recorded
+        .record(async { butler::testing::propagate(async { crunch(1).await.unwrap() }) })
+        .await;
+    inline.perform(carried).await;
+    assert_eq!(recorded.enqueued_names(), ["crunch"]);
+    assert!(inline.performed_names().is_empty());
+
+    let plain = butler::testing::propagate(async { crunch(2).await.unwrap() });
+    recorded.record(plain).await;
+    assert_eq!(recorded.enqueued_names(), ["crunch", "crunch"]);
+}

@@ -71,8 +71,9 @@ after crashes. Reliability and correct job lifecycle semantics come first.
 - `butler::testing` runs jobs inline in tests by calling the job's `JobDef`
   directly from the enqueue path, or records them (`RecordedJobs`) instead of
   enqueueing. Both hook every enqueue path after the enqueue layers, through
-  one thread-local scope where the innermost wins. Keep it free of queue and
-  worker state.
+  one thread-local scope where the innermost wins. Spawned tasks see it only
+  through `testing::spawn`/`propagate`, which carry the scope into the future.
+  Keep it free of queue and worker state.
 - `Backend::push_many` should be one step where the backend allows it (one
   round trip, one transaction); the default loops over `push`.
 - Continuations: a checkpoint saves progress (throttled by

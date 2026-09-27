@@ -4,6 +4,7 @@
 //! ```text
 //! butler_jobs     id, queue, state, worker, seq, data (job JSON), finished_seq, run_at
 //! butler_workers  worker, expires_at_ms (the heartbeat)
+//! butler_paused   queue, paused_at_ms: queues workers don't claim from
 //! ```
 //!
 //! A claim is one `UPDATE ... RETURNING` that moves the oldest pending row of
@@ -97,6 +98,11 @@ CREATE TABLE IF NOT EXISTS butler_metrics (
 CREATE TABLE IF NOT EXISTS butler_counters (
     name  TEXT PRIMARY KEY,
     value INTEGER NOT NULL
+);
+-- Queues an operator paused; created when an older database is opened.
+CREATE TABLE IF NOT EXISTS butler_paused (
+    queue        TEXT PRIMARY KEY,
+    paused_at_ms INTEGER NOT NULL
 );
 ";
 
@@ -568,6 +574,14 @@ impl Store for SqliteQueue {
         Ok(recovered)
     }
 
+    fn paused_queues(&self) -> Result<Vec<String>> {
+        self.with_conn(|conn| {
+            conn.prepare("SELECT queue FROM butler_paused ORDER BY queue")?
+                .query_map([], |row| row.get(0))?
+                .collect()
+        })
+    }
+
     fn describe(&self) -> String {
         format!("sqlite:{}", self.path.display())
     }
@@ -742,6 +756,26 @@ impl Monitor for SqliteQueue {
         Ok(changed > 0)
     }
 
+    fn pause_queue(&self, queue: &str) -> Result<bool> {
+        let paused = self.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO butler_paused (queue, paused_at_ms) VALUES (?1, ?2)",
+                params![queue, now_ms()],
+            )
+        })?;
+        Ok(paused > 0)
+    }
+
+    fn resume_queue(&self, queue: &str) -> Result<bool> {
+        let resumed = self.with_conn(|conn| {
+            conn.execute("DELETE FROM butler_paused WHERE queue = ?1", params![queue])
+        })?;
+        if resumed > 0 {
+            self.signals.pushed.notify();
+        }
+        Ok(resumed > 0)
+    }
+
     /// One transaction: the bucket and both lifetime counters.
     fn record_metric(&self, metric: &JobMetric) -> Result<()> {
         let prune = self
@@ -836,6 +870,42 @@ mod tests {
         data   TEXT NOT NULL,
         finished_seq INTEGER
     );";
+
+    #[test]
+    fn a_0_1_database_gains_paused_queues_and_keeps_its_jobs() {
+        let path = std::env::temp_dir().join(format!(
+            "butler-sqlite-migrate-paused-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            // `butler_jobs` as 0.1.0 created it, with a job it wrote.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE butler_jobs (
+                    id TEXT PRIMARY KEY, queue TEXT NOT NULL, state TEXT NOT NULL,
+                    worker TEXT, seq INTEGER NOT NULL, data TEXT NOT NULL,
+                    finished_seq INTEGER, run_at INTEGER
+                );",
+            )
+            .unwrap();
+            let data = r#"{"id":"1-1-0","name":"old","queue":"default","args":[],
+                "attempts":0,"enqueued_at_ms":1,"last_error":null}"#;
+            conn.execute(
+                "INSERT INTO butler_jobs (id, queue, state, seq, data)
+                 VALUES ('1-1-0', 'default', 'pending', 1, ?1)",
+                params![data],
+            )
+            .unwrap();
+        }
+        let queue = SqliteQueue::open(&path).unwrap();
+        drop(SqliteQueue::open(&path).unwrap());
+        assert!(queue.paused_queues().unwrap().is_empty());
+        assert!(queue.pause_queue("default").unwrap());
+        assert_eq!(queue.paused_queues().unwrap(), ["default"]);
+        assert_eq!(queue.get("1-1-0").unwrap().unwrap().0, JobState::Pending);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn an_older_database_gains_scheduling_and_keeps_its_jobs() {

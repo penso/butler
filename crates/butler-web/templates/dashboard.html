@@ -84,18 +84,28 @@
   <div class="card overflow-hidden">
     <div class="px-5 pt-5 pb-2">
       <h2 class="text-sm font-semibold">Queues</h2>
-      <p class="text-xs text-[var(--muted)]">Jobs waiting, live</p>
+      <p class="text-xs text-[var(--muted)]">Jobs waiting, live. A paused queue keeps taking jobs; workers don't run them until it is resumed.</p>
     </div>
     <table class="table">
-      <thead><tr><th>Queue</th><th class="text-right">Pending</th></tr></thead>
+      <thead><tr><th>Queue</th><th class="text-right">Pending</th><th class="text-right"></th></tr></thead>
       <tbody>
         {% for queue in queues %}
         <tr>
-          <td><a class="link mono" href="{{ base }}/jobs?state=pending&queue={{ queue.name }}">{{ queue.name }}</a></td>
+          <td>
+            <a class="link mono" href="{{ base }}/jobs?state=pending&queue={{ queue.name }}">{{ queue.name }}</a>
+            {% if queue.paused %}<span class="badge badge-scheduled ml-1">paused</span>{% endif %}
+          </td>
           <td class="text-right tabular-nums" data-queue-pending="{{ queue.name }}">{{ queue.pending }}</td>
+          <td class="text-right">
+            {% if queue.paused %}
+            <form method="post" action="{{ base }}/queues/{{ queue.name }}/resume"><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn btn-accent">Resume</button></form>
+            {% else %}
+            <form method="post" action="{{ base }}/queues/{{ queue.name }}/pause" data-confirm="Pause {{ queue.name }}? Workers stop taking its jobs; running ones finish."><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn">Pause</button></form>
+            {% endif %}
+          </td>
         </tr>
         {% else %}
-        <tr><td colspan="2" class="text-[var(--muted)]">No queue has had a job yet.</td></tr>
+        <tr><td colspan="3" class="text-[var(--muted)]">No queue has had a job yet.</td></tr>
         {% endfor %}
       </tbody>
     </table>

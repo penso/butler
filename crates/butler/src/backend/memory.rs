@@ -50,6 +50,8 @@ struct State {
     /// Per worker. A set: a worker can hold a great many jobs at once, and
     /// finishing one must not scan the others.
     processing: HashMap<String, HashSet<JobId>>,
+    /// Queues an operator paused.
+    paused: BTreeSet<String>,
     /// When each worker's heartbeat expires.
     heartbeats: HashMap<String, Instant>,
     /// History, per (minute, queue, job).
@@ -335,6 +337,10 @@ impl Store for MemoryQueue {
         Ok(recovered)
     }
 
+    fn paused_queues(&self) -> Result<Vec<String>> {
+        Ok(self.lock().paused.iter().cloned().collect())
+    }
+
     /// Every call is a few map updates under a lock.
     fn blocks(&self) -> bool {
         false
@@ -471,6 +477,19 @@ impl Monitor for MemoryQueue {
             state.jobs.remove(id);
         }
         Ok(finished)
+    }
+
+    fn pause_queue(&self, queue: &str) -> Result<bool> {
+        Ok(self.lock().paused.insert(queue.to_owned()))
+    }
+
+    fn resume_queue(&self, queue: &str) -> Result<bool> {
+        let resumed = self.lock().paused.remove(queue);
+        if resumed {
+            // Idle claims waiting on this queue can take its jobs now.
+            self.inner.pushed.notify_all();
+        }
+        Ok(resumed)
     }
 
     fn record_metric(&self, metric: &JobMetric) -> Result<()> {

@@ -70,7 +70,8 @@ types, and the `reports` module belong to your application. See
   per-queue limits, and bulk enqueueing. Async jobs run as Tokio tasks;
   synchronous jobs use its blocking pool. A thread worker also runs without Tokio.
 - **Built-in visibility.** A live web dashboard for throughput, workers,
-  queues, job details, scheduled jobs, and retry/cancel/discard/run-now actions.
+  queues, job details, scheduled jobs, retry/cancel/discard/run-now actions,
+  and pausing or resuming a queue.
 
 Delivery is **at least once**: jobs must be safe to repeat, including work done
 since the last saved checkpoint. Durable backends recover work after worker
@@ -213,8 +214,8 @@ each. See [Concurrency and cores](#concurrency-and-cores) for tuning.
 
 `butler-web` shows live counts streamed over server-sent events, throughput and
 duration charts, queues, workers, and job details. Retry or discard failed
-jobs, cancel pending work, run scheduled jobs now, and inspect arguments,
-results, errors, and saved progress from one place.
+jobs, cancel pending work, run scheduled jobs now, pause and resume queues,
+and inspect arguments, results, errors, and saved progress from one place.
 
 ![butler-web dashboard, dark theme](https://raw.githubusercontent.com/penso/butler/main/docs/images/dashboard-dark.png)
 
@@ -1069,6 +1070,14 @@ To override a job's queue for one call, prepare it and pick the queue:
   worker prints the queues it serves at startup. Dedicated workers are a
   common pattern: one worker for `["critical"]` only, another for the rest.
 - Retries and crash recovery put a job back on its own queue.
+- **Pausing a queue** stops every worker from claiming its jobs without
+  stopping the workers: `queue.pause_queue("mailers")?`, or Pause on the
+  dashboard's Queues table, then `resume_queue`. The paused set lives in the
+  backend, and each worker reads it every second, so a pause takes effect
+  within about a second; jobs already running finish. A paused queue still
+  accepts jobs, and scheduled jobs and retries are still promoted onto it;
+  they wait there until it is resumed. A worker serving only paused queues
+  sits idle.
 - Queue names are 1 to 64 of `A-Z a-z 0-9 _ - .` and don't start with a dot. The
   macro checks this at compile time, and the config when it loads.
 
@@ -1222,6 +1231,7 @@ without crashing can also see its job run a second time elsewhere.
 
 ```text
 pending/<queue>/  scheduled/  processing/<worker>/  workers/<worker>  done/  dead/  cancelled/
+paused/<queue>
 ```
 
 Each write goes to `tmp/` first and is then renamed into place, so nothing ever
@@ -1248,6 +1258,7 @@ time. The file backend can't block waiting for a job, so idle workers sleep
 | `butler:wake` | pub/sub channel | a message per push, retry and recovery; wakes idle workers |
 | `butler:done` | pub/sub channel | a message per job done, dead or cancelled; wakes `wait_result` |
 | `butler:job:<id>` | HASH | `state`, `queue`, and `data` (job JSON); done and cancelled jobs expire after 24h |
+| `butler:paused` | SET | paused queues, which workers leave out of their claims |
 
 A claim is an `LMOVE queue:<queue> processing:<worker>` for each queue the
 worker serves, in its priority order. Redis runs each one atomically, so only
@@ -1288,6 +1299,7 @@ processes on the same machine:
 |---|---|---|
 | `butler_jobs` | `id, queue, state, worker, seq, data, run_at` | every job; `data` is the job JSON, `seq` the order in its queue, `run_at` a scheduled job's time in ms |
 | `butler_workers` | `worker, expires_at_ms` | heartbeats, for crash recovery |
+| `butler_paused` | `queue, paused_at_ms` | paused queues; created when an older database is opened |
 
 A claim is one `UPDATE ... RETURNING` that moves the oldest pending row of a
 queue to `processing` under the claiming worker. SQLite runs it under its write
@@ -1342,6 +1354,12 @@ promote them, and reading one fails with `Error::UnknownState`. Jobs already
 queued need nothing: their records read as before. Retries now wait
 (exponential backoff by default); `backoff = "fixed:0s"` in `[worker]` keeps
 the old immediate retries.
+
+**Upgrading to paused queues.** Pausing adds storage only: a
+`<prefix>:paused` set in Redis, a `butler_paused` table in SQLite (created
+when a database is opened), and a `paused/` directory for the file backend.
+Workers of an older version don't read it and keep claiming from a paused
+queue, so upgrade every worker before relying on a pause.
 
 ## Limitations
 

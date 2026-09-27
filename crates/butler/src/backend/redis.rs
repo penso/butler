@@ -9,6 +9,7 @@
 //! <prefix>:workers               SET   worker ids that may hold jobs
 //! <prefix>:dead                  LIST  ids that exhausted their retries
 //! <prefix>:job:<id>              HASH  { state, queue, data (job JSON) }
+//! <prefix>:paused                SET   queues workers don't claim from
 //! ```
 //!
 //! A claim is an `LMOVE queue:<q> processing:<worker>` for each queue the
@@ -803,6 +804,13 @@ impl Store for RedisQueue {
         Ok(recovered)
     }
 
+    fn paused_queues(&self) -> Result<Vec<String>> {
+        let mut paused: Vec<String> =
+            self.with_conn(|con| redis::cmd("SMEMBERS").arg(self.key("paused")).query(con))?;
+        paused.sort();
+        Ok(paused)
+    }
+
     fn describe(&self) -> String {
         self.display.clone()
     }
@@ -1053,6 +1061,33 @@ impl Monitor for RedisQueue {
                 .exec(con)
         })?;
         Ok(true)
+    }
+
+    fn pause_queue(&self, queue: &str) -> Result<bool> {
+        let added: u8 = self.with_conn(|con| {
+            redis::cmd("SADD")
+                .arg(self.key("paused"))
+                .arg(queue)
+                .query(con)
+        })?;
+        Ok(added > 0)
+    }
+
+    /// Also wakes idle claims, which can take the queue's jobs again.
+    fn resume_queue(&self, queue: &str) -> Result<bool> {
+        let (removed,): (u8,) = self.with_conn(|con| {
+            redis::pipe()
+                .atomic()
+                .cmd("SREM")
+                .arg(self.key("paused"))
+                .arg(queue)
+                .cmd("PUBLISH")
+                .arg(self.key("wake"))
+                .arg(queue)
+                .ignore()
+                .query(con)
+        })?;
+        Ok(removed > 0)
     }
 
     fn record_metric(&self, metric: &JobMetric) -> Result<()> {

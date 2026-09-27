@@ -34,6 +34,7 @@ impl IntoResponse for WebError {
         let status = match &self {
             WebError::NotFound(_) => StatusCode::NOT_FOUND,
             WebError::Queue(butler::Error::Unsupported(_)) => StatusCode::NOT_IMPLEMENTED,
+            WebError::Queue(butler::Error::InvalidQueue { .. }) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         if status.is_server_error() {

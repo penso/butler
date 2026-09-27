@@ -13,6 +13,7 @@
 //! <dir>/done/                  succeeded
 //! <dir>/dead/                  failed after exhausting retries
 //! <dir>/cancelled/             removed from pending/ before a worker claimed it
+//! <dir>/paused/<queue>          a queue workers don't claim from
 //! ```
 //!
 //! Cancelling is a rename from `pending/<queue>/` or `scheduled/` to
@@ -50,6 +51,7 @@ const LOOKUP_ORDER: [JobState; 6] = [
 ];
 
 const WORKERS: &str = "workers";
+const PAUSED: &str = "paused";
 
 #[derive(Debug, Clone)]
 pub struct FileQueue {
@@ -423,6 +425,23 @@ impl Store for FileQueue {
         Ok(recovered)
     }
 
+    fn paused_queues(&self) -> Result<Vec<String>> {
+        let entries = match fs::read_dir(self.root.join(PAUSED)) {
+            Ok(entries) => entries,
+            // Nothing was ever paused.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut paused = Vec::new();
+        for entry in entries {
+            if let Some(queue) = entry?.file_name().to_str() {
+                paused.push(queue.to_owned());
+            }
+        }
+        paused.sort();
+        Ok(paused)
+    }
+
     fn describe(&self) -> String {
         format!("file:{}", self.root.display())
     }
@@ -556,6 +575,29 @@ impl Monitor for FileQueue {
         match self.find_scheduled(id)? {
             Some(path) => self.enqueue_scheduled(&path),
             None => Ok(false),
+        }
+    }
+
+    /// The marker is created exclusively, so of two pauses one reports it.
+    fn pause_queue(&self, queue: &str) -> Result<bool> {
+        let dir = self.root.join(PAUSED);
+        fs::create_dir_all(&dir)?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(queue))
+        {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn resume_queue(&self, queue: &str) -> Result<bool> {
+        match fs::remove_file(self.root.join(PAUSED).join(queue)) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
         }
     }
 

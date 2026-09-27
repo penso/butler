@@ -420,3 +420,70 @@ async fn a_retry_waiting_its_turn_shows_its_error_and_next_attempt() {
     );
     assert!(html.contains("503 from the CRM"));
 }
+
+#[tokio::test]
+async fn queues_can_be_paused_and_resumed_from_the_dashboard() {
+    let f = fixture("");
+    let (_, html) = get(&f.app, "/").await;
+    assert!(html.contains(r#"action="/queues/mailers/pause""#));
+    assert!(!html.contains(">paused<"));
+
+    let (status, _) = post(&f.app, "/queues/mailers/pause", "cross-site", "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(f.queue.paused_queues().unwrap().is_empty(), "unchanged");
+
+    let (status, location) = post(
+        &f.app,
+        "/queues/mailers/pause",
+        "same-origin",
+        "return_to=%2F",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location.as_deref(), Some("/"));
+    assert_eq!(f.queue.paused_queues().unwrap(), ["mailers"]);
+    // A queue that never had a job can be paused ahead of time, and is listed.
+    post(&f.app, "/queues/imports/pause", "same-origin", "").await;
+    let (_, html) = get(&f.app, "/").await;
+    assert!(html.contains(">paused<"));
+    assert!(html.contains(r#"action="/queues/mailers/resume""#));
+    assert!(html.contains(r#"href="/jobs?state=pending&queue=imports""#));
+
+    let (_, location) = post(
+        &f.app,
+        "/queues/mailers/resume",
+        "same-origin",
+        "return_to=https%3A%2F%2Fevil.example%2F",
+    )
+    .await;
+    assert_eq!(location.as_deref(), Some("/"), "never an open redirect");
+    assert_eq!(f.queue.paused_queues().unwrap(), ["imports"]);
+
+    let (status, _) = post(&f.app, "/queues/..bad/pause", "same-origin", "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "not a queue name");
+}
+
+#[tokio::test]
+async fn pause_and_resume_keep_the_base_path() {
+    let f = fixture("/admin/jobs");
+    let app = Router::new().nest("/admin/jobs", f.app.clone());
+    let (status, html) = get(&app, "/admin/jobs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(r#"action="/admin/jobs/queues/mailers/pause""#));
+    assert!(html.contains(r#"name="return_to" value="/admin/jobs""#));
+    let (_, location) = post(
+        &app,
+        "/admin/jobs/queues/mailers/pause",
+        "same-origin",
+        "return_to=%2Fadmin%2Fjobs",
+    )
+    .await;
+    assert_eq!(location.as_deref(), Some("/admin/jobs"));
+    let (status, html) = get(&app, location.as_deref().unwrap()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the redirect lands on the dashboard"
+    );
+    assert!(html.contains(r#"action="/admin/jobs/queues/mailers/resume""#));
+}

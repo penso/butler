@@ -2,7 +2,7 @@
 //! machine can share, with no server to run.
 //!
 //! ```text
-//! butler_jobs     id, queue, state, worker, seq, data (job JSON), finished_seq, run_at
+//! butler_jobs     id, queue, state, worker, seq, data (job JSON), finished_seq, run_at, slot
 //! butler_workers  worker, expires_at_ms (the heartbeat)
 //! butler_recurring        key, data (schedule JSON), created_at_ms, seen_at_ms, last_tick_ms, last_job_id
 //! butler_recurring_ticks  key, tick_ms, job_id: primary key (key, tick_ms)
@@ -18,6 +18,13 @@
 //! ones at the back of their queue, in run-time order; claims only take
 //! `pending` rows, so a scheduled job can't run early. Databases created
 //! before scheduling existed get the `run_at` column when opened.
+//!
+//! A claim under a global queue limit sets `slot = 1`, and only succeeds
+//! while fewer than the limit of that queue's `processing` rows have it: the
+//! count is part of the claim's one `UPDATE`. Anything that moves the job out
+//! of `processing` (done, a retry, dead, an interruption, recovery) frees the
+//! slot, since only processing rows count. Databases from before global
+//! limits get the `slot` column when opened.
 //!
 //! A recurring tick is an `INSERT OR IGNORE` into `butler_recurring_ticks`,
 //! whose primary key is `(key, tick_ms)`, and the job's insert, in one
@@ -50,7 +57,7 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use super::{Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
+use super::{GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
 use crate::{
     Error, JobId, JobRecord, JobState, RecurringRecord, Result, Signal,
     job::{from_millis, millis},
@@ -80,7 +87,9 @@ CREATE TABLE IF NOT EXISTS butler_jobs (
     -- watcher can ask which jobs finished since it last looked.
     finished_seq INTEGER,
     -- When a scheduled job may run, in ms since the epoch.
-    run_at INTEGER
+    run_at INTEGER,
+    -- 1 while claimed under a global queue limit, counted while processing.
+    slot INTEGER
 );
 CREATE INDEX IF NOT EXISTS butler_jobs_claim ON butler_jobs (state, queue, seq);
 CREATE INDEX IF NOT EXISTS butler_jobs_finished ON butler_jobs (finished_seq);
@@ -194,19 +203,38 @@ impl SqliteQueue {
         });
     }
 
-    /// Takes the oldest pending job of the first non-empty queue. Never waits.
-    fn sweep(&self, worker: &str, queues: &[&str]) -> Result<Option<JobRecord>> {
+    /// Takes the oldest pending job of the first non-empty queue, skipping
+    /// queues at their global limit. Never waits.
+    fn sweep(
+        &self,
+        worker: &str,
+        queues: &[&str],
+        limits: &[GlobalLimit<'_>],
+    ) -> Result<Option<JobRecord>> {
         for queue in queues {
             let data: Option<String> = self.with_conn(|conn| {
-                conn.query_row(
-                    "UPDATE butler_jobs SET state = 'processing', worker = ?1
-                     WHERE id = (SELECT id FROM butler_jobs
-                                 WHERE state = 'pending' AND queue = ?2
-                                 ORDER BY seq LIMIT 1)
-                     RETURNING data",
-                    params![worker, queue],
-                    |row| row.get(0),
-                )
+                match GlobalLimit::of(limits, queue) {
+                    None => conn.query_row(
+                        "UPDATE butler_jobs SET state = 'processing', worker = ?1, slot = NULL
+                         WHERE id = (SELECT id FROM butler_jobs
+                                     WHERE state = 'pending' AND queue = ?2
+                                     ORDER BY seq LIMIT 1)
+                         RETURNING data",
+                        params![worker, queue],
+                        |row| row.get(0),
+                    ),
+                    Some(max) => conn.query_row(
+                        "UPDATE butler_jobs SET state = 'processing', worker = ?1, slot = 1
+                         WHERE id = (SELECT id FROM butler_jobs
+                                     WHERE state = 'pending' AND queue = ?2
+                                     ORDER BY seq LIMIT 1)
+                           AND (SELECT COUNT(*) FROM butler_jobs
+                                WHERE state = 'processing' AND queue = ?2 AND slot = 1) < ?3
+                         RETURNING data",
+                        params![worker, queue, i64::try_from(max).unwrap_or(i64::MAX)],
+                        |row| row.get(0),
+                    ),
+                }
                 .optional()
             })?;
             if let Some(data) = data {
@@ -227,6 +255,12 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         .exists([])?;
     if !has_run_at {
         tx.execute_batch("ALTER TABLE butler_jobs ADD COLUMN run_at INTEGER")?;
+    }
+    let has_slot = tx
+        .prepare("SELECT 1 FROM pragma_table_info('butler_jobs') WHERE name = 'slot'")?
+        .exists([])?;
+    if !has_slot {
+        tx.execute_batch("ALTER TABLE butler_jobs ADD COLUMN slot INTEGER")?;
     }
     tx.execute_batch(SCHEDULED_INDEX)?;
     tx.commit()
@@ -463,6 +497,16 @@ impl Store for SqliteQueue {
     }
 
     fn claim(&self, worker: &str, queues: &[&str], wait: Duration) -> Result<Option<JobRecord>> {
+        self.claim_within_limits(worker, queues, &[], wait)
+    }
+
+    fn claim_within_limits(
+        &self,
+        worker: &str,
+        queues: &[&str],
+        limits: &[GlobalLimit<'_>],
+        wait: Duration,
+    ) -> Result<Option<JobRecord>> {
         if queues.is_empty() {
             return Ok(None);
         }
@@ -473,7 +517,7 @@ impl Store for SqliteQueue {
         loop {
             // Read before sweeping: a commit during the sweep still wakes us.
             let seen = self.signals.pushed.generation();
-            if let Some(job) = self.sweep(worker, queues)? {
+            if let Some(job) = self.sweep(worker, queues, limits)? {
                 return Ok(Some(job));
             }
             let now = Instant::now();
@@ -999,6 +1043,58 @@ mod tests {
         data   TEXT NOT NULL,
         finished_seq INTEGER
     );";
+
+    /// `butler_jobs` as 0.1.0 created it, before global queue limits.
+    const JOBS_TABLE_0_1: &str = "
+    CREATE TABLE butler_jobs (
+        id TEXT PRIMARY KEY, queue TEXT NOT NULL, state TEXT NOT NULL, worker TEXT,
+        seq INTEGER NOT NULL, data TEXT NOT NULL, finished_seq INTEGER, run_at INTEGER
+    );";
+
+    #[test]
+    fn a_0_1_database_gains_global_limits_and_keeps_its_jobs() {
+        let path = std::env::temp_dir().join(format!(
+            "butler-sqlite-migrate-slots-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(JOBS_TABLE_0_1).unwrap();
+            // Two pending jobs and one a 0.1.0 worker is running, as it wrote them.
+            for (id, state, seq) in [
+                ("1-1-0", "processing", 1),
+                ("2-1-0", "pending", 2),
+                ("3-1-0", "pending", 3),
+            ] {
+                let data = format!(
+                    r#"{{"id":"{id}","name":"old","queue":"mailers","args":[],
+                    "attempts":0,"enqueued_at_ms":1,"last_error":null}}"#
+                );
+                conn.execute(
+                    "INSERT INTO butler_jobs (id, queue, state, worker, seq, data)
+                     VALUES (?1, 'mailers', ?2, 'old-worker', ?3, ?4)",
+                    params![id, state, seq, data],
+                )
+                .unwrap();
+            }
+        }
+        let queue = SqliteQueue::open(&path).unwrap();
+        drop(SqliteQueue::open(&path).unwrap());
+        let limits = [GlobalLimit {
+            queue: "mailers",
+            max: 1,
+        }];
+        let claim = || {
+            queue
+                .claim_within_limits("w", &["mailers"], &limits, Duration::ZERO)
+                .unwrap()
+        };
+        // The old worker's running job took no slot: it isn't counted.
+        assert_eq!(claim().unwrap().id, "2-1-0");
+        assert!(claim().is_none(), "the one slot is taken");
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// The whole schema as 0.1.0 (before recurring jobs) created it.
     const SCHEMA_0_1: &str = "

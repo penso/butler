@@ -13,8 +13,8 @@ use std::{
 };
 
 use butler::{
-    AnyJob, Backoff, Cron, Failed, FileQueue, JITTER, JobState, MemoryQueue, NewJob, Queue,
-    Recurring, RecurringRecord, Retry, RetryPolicy,
+    AnyJob, Backoff, Cron, Failed, FileQueue, GlobalLimit, JITTER, JobState, MemoryQueue, NewJob,
+    Queue, Recurring, RecurringRecord, Retry, RetryPolicy,
     monitor::{JobMetric, ListFilter},
 };
 use serde_json::json;
@@ -966,6 +966,171 @@ fn metadata_is_kept_through_scheduling_claims_retries_and_recovery() {
         queue.promote(later).unwrap();
         assert_eq!(queue.state(&scheduled), Some(JobState::Pending), "{name}");
         assert_eq!(meta_of(&scheduled), expected, "{name}");
+    }
+}
+
+const MAILERS: &[&str] = &["mailers"];
+
+fn at_most(max: usize) -> [GlobalLimit<'static>; 1] {
+    [GlobalLimit {
+        queue: "mailers",
+        max,
+    }]
+}
+
+#[test]
+fn a_global_limit_caps_running_jobs_across_workers() {
+    for (queue, _) in backends("global-limit") {
+        let name = queue.describe();
+        for n in 0..5 {
+            queue.push("send", "mailers", vec![json!(n)]).unwrap();
+        }
+        let other = queue.push("other", "default", vec![]).unwrap();
+        let limits = at_most(2);
+        let claim = |worker: &str, queues: &[&str]| {
+            queue
+                .claim_within_limits(worker, queues, &limits, NOW)
+                .unwrap()
+        };
+
+        let first = claim("w1", MAILERS).unwrap();
+        claim("w2", MAILERS).unwrap();
+        assert!(claim("w3", MAILERS).is_none(), "{name}: two are running");
+        // A full queue doesn't hold back the others.
+        let next = claim("w3", &["mailers", "default"]).unwrap();
+        assert_eq!(next.id(), other, "{name}");
+
+        // Finishing one frees its slot for any worker.
+        queue.complete("w1", first, json!(null)).unwrap();
+        claim("w3", MAILERS).unwrap();
+        assert!(claim("w4", MAILERS).is_none(), "{name}");
+
+        // Claims without the limit take no slot and aren't bounded by it.
+        assert!(queue.claim("w5", MAILERS, NOW).unwrap().is_some(), "{name}");
+        assert!(claim("w4", MAILERS).is_none(), "{name}");
+    }
+}
+
+#[test]
+fn every_way_out_of_processing_frees_a_global_slot() {
+    for (queue, _) in backends("global-release") {
+        let name = queue.describe();
+        for n in 0..6 {
+            queue.push("send", "mailers", vec![json!(n)]).unwrap();
+        }
+        let limits = at_most(1);
+        let claim = || {
+            queue
+                .claim_within_limits("w", MAILERS, &limits, NOW)
+                .unwrap()
+        };
+        let full = |step: &str| {
+            assert!(claim().is_none(), "{name}: the slot is held before {step}");
+        };
+
+        let job = claim().unwrap();
+        full("a retry");
+        queue.fail("w", job, "again".into(), 3).unwrap();
+
+        let job = claim().unwrap();
+        full("a delayed retry");
+        let policy = RetryPolicy::new(3, Backoff::Fixed(HOUR));
+        queue.fail("w", job, "later".into(), policy).unwrap();
+
+        let job = claim().unwrap();
+        full("dying");
+        queue.fail("w", job, "dead".into(), 0).unwrap();
+
+        let job = claim().unwrap();
+        full("an interruption");
+        queue.interrupt("w", job).unwrap();
+
+        let job = claim().unwrap();
+        full("completing");
+        queue.complete("w", job, json!(null)).unwrap();
+        assert!(claim().is_some(), "{name}: free again");
+    }
+}
+
+#[test]
+fn recovering_a_crashed_worker_frees_its_global_slots() {
+    for (queue, _) in backends("global-recover") {
+        let name = queue.describe();
+        for n in 0..3 {
+            queue.push("send", "mailers", vec![json!(n)]).unwrap();
+        }
+        let limits = at_most(2);
+        queue.heartbeat("crashed", Duration::from_secs(60)).unwrap();
+        queue.heartbeat("alive", Duration::from_secs(60)).unwrap();
+        queue
+            .claim_within_limits("crashed", MAILERS, &limits, NOW)
+            .unwrap()
+            .unwrap();
+        queue
+            .claim_within_limits("crashed", MAILERS, &limits, NOW)
+            .unwrap()
+            .unwrap();
+        assert!(
+            queue
+                .claim_within_limits("alive", MAILERS, &limits, NOW)
+                .unwrap()
+                .is_none(),
+            "{name}"
+        );
+
+        queue
+            .heartbeat("crashed", Duration::from_millis(1))
+            .unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(queue.recover().unwrap(), 2, "{name}");
+        // Both slots came back.
+        assert!(
+            queue
+                .claim_within_limits("alive", MAILERS, &limits, NOW)
+                .unwrap()
+                .is_some(),
+            "{name}"
+        );
+        assert!(
+            queue
+                .claim_within_limits("alive", MAILERS, &limits, NOW)
+                .unwrap()
+                .is_some(),
+            "{name}"
+        );
+        assert!(
+            queue
+                .claim_within_limits("alive", MAILERS, &limits, NOW)
+                .unwrap()
+                .is_none(),
+            "{name}: still two at most"
+        );
+    }
+}
+
+#[test]
+fn concurrent_claims_never_exceed_a_global_limit() {
+    for (queue, _) in backends("global-race") {
+        let name = queue.describe();
+        for n in 0..12 {
+            queue.push("send", "mailers", vec![json!(n)]).unwrap();
+        }
+        let claimers: Vec<_> = (0..8)
+            .map(|n| {
+                let queue = queue.clone();
+                thread::spawn(move || {
+                    queue
+                        .claim_within_limits(&format!("w{n}"), MAILERS, &at_most(3), NOW)
+                        .unwrap()
+                        .is_some()
+                })
+            })
+            .collect();
+        let claimed = claimers
+            .into_iter()
+            .filter_map(|claimer| claimer.join().unwrap().then_some(()))
+            .count();
+        assert_eq!(claimed, 3, "{name}");
     }
 }
 

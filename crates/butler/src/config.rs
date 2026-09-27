@@ -21,8 +21,11 @@
 //! recover_interval_secs = 10
 //! queues = [["critical", 6], ["default", 3], ["low", 1]]   # or ["critical", "default"]
 //!
-//! [worker.queue_limits]        # optional, per queue, on top of `concurrency`
+//! [worker.queue_limits]        # optional, per queue and per worker process
 //! mailers = 20
+//!
+//! [worker.global_queue_limits] # optional, per queue across every worker
+//! reports = 5
 //!
 //! [[recurring]]                # optional, any number: a job on a cron schedule
 //! job = "nightly_report"       # the job's name
@@ -213,8 +216,15 @@ pub struct WorkerConfig {
     pub queues: Vec<QueueEntry>,
     /// Caps on jobs running at once, per queue, on top of `concurrency`:
     /// `[worker.queue_limits]` then `mailers = 20`. Queues not listed are only
-    /// bound by `concurrency`.
+    /// bound by `concurrency`. Each worker process counts its own jobs, so
+    /// three workers with `mailers = 20` can run 60 mailer jobs at once.
     pub queue_limits: HashMap<String, usize>,
+    /// Caps on jobs running at once, per queue, across every worker that has
+    /// the same cap: `[worker.global_queue_limits]` then `mailers = 20`. The
+    /// backend keeps the count, so three workers with `mailers = 20` run 20
+    /// mailer jobs at once between them. Costs a little more per claim than
+    /// `queue_limits`; both can apply to the same queue.
+    pub global_queue_limits: HashMap<String, usize>,
 }
 
 /// One entry of `[worker] queues`.
@@ -246,6 +256,7 @@ impl Default for WorkerConfig {
             checkpoint_interval_ms: 1_000,
             queues: vec![QueueEntry::Name(DEFAULT_QUEUE.to_owned())],
             queue_limits: HashMap::new(),
+            global_queue_limits: HashMap::new(),
         }
     }
 }
@@ -301,7 +312,7 @@ impl WorkerConfig {
                 reason,
             });
         }
-        for (queue, max) in &self.queue_limits {
+        for (queue, max) in self.queue_limits.iter().chain(&self.global_queue_limits) {
             let reason = if !is_valid_queue_name(queue) {
                 "use 1 to 64 of A-Z a-z 0-9 _ - . (not starting with a dot)"
             } else if *max == 0 {
@@ -442,6 +453,23 @@ mod tests {
 
         let zero = load("[worker.queue_limits]\nmailers = 0\n").unwrap_err();
         assert!(matches!(zero, Error::InvalidQueue { ref name, .. } if name == "mailers"));
+    }
+
+    #[test]
+    fn global_queue_limits_are_a_separate_key() {
+        let config = load(
+            "[worker.queue_limits]\nmailers = 20\n[worker.global_queue_limits]\nmailers = 50\nreports = 2\n",
+        )
+        .unwrap();
+        assert_eq!(config.worker.queue_limits.get("mailers"), Some(&20));
+        assert_eq!(config.worker.global_queue_limits.get("mailers"), Some(&50));
+        assert_eq!(config.worker.global_queue_limits.get("reports"), Some(&2));
+        assert!(load("").unwrap().worker.global_queue_limits.is_empty());
+
+        let zero = load("[worker.global_queue_limits]\nreports = 0\n").unwrap_err();
+        assert!(matches!(zero, Error::InvalidQueue { ref name, .. } if name == "reports"));
+        let bad = load("[worker.global_queue_limits]\n\"../x\" = 1\n").unwrap_err();
+        assert!(matches!(bad, Error::InvalidQueue { .. }), "{bad:?}");
     }
 
     #[test]

@@ -77,6 +77,29 @@ pub trait Store: Send + Sync + 'static {
     /// `None` right away, and the worker polls them instead.
     fn claim(&self, worker: &str, queues: &[&str], wait: Duration) -> Result<Option<JobRecord>>;
 
+    /// Like [`claim`](Store::claim), with global limits: a queue in `limits`
+    /// is skipped while `max` of its jobs claimed this way are running,
+    /// across every worker. Checking the count and claiming are one atomic
+    /// step. The job holds its slot until it is completed, failed (retried,
+    /// scheduled, dead or interrupted), or recovered after its worker
+    /// stopped, so a crashed worker's slots come back through
+    /// [`recover`](Store::recover). Queues not in `limits` are claimed as
+    /// `claim` does, without a slot.
+    ///
+    /// The default only handles an empty `limits`, by calling `claim`.
+    fn claim_within_limits(
+        &self,
+        worker: &str,
+        queues: &[&str],
+        limits: &[GlobalLimit<'_>],
+        wait: Duration,
+    ) -> Result<Option<JobRecord>> {
+        if limits.is_empty() {
+            return self.claim(worker, queues, wait);
+        }
+        Err(Error::Unsupported("global queue limits"))
+    }
+
     /// Marks a job `worker` claimed as done.
     fn complete(&self, worker: &str, job: &JobRecord) -> Result<()>;
 
@@ -214,6 +237,24 @@ pub trait Watch: Send + Sync + 'static {
     /// default, makes waiters poll at the interval they were given.
     fn watch_finished(&self, _id: &str) -> Option<Arc<Signal>> {
         None
+    }
+}
+
+/// At most `max` jobs of `queue` running at once across every worker, for
+/// [`Store::claim_within_limits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalLimit<'a> {
+    pub queue: &'a str,
+    pub max: usize,
+}
+
+impl<'a> GlobalLimit<'a> {
+    /// The limit for `queue` in `limits`, if it has one.
+    pub fn of(limits: &[GlobalLimit<'a>], queue: &str) -> Option<usize> {
+        limits
+            .iter()
+            .find(|limit| limit.queue == queue)
+            .map(|limit| limit.max)
     }
 }
 
@@ -372,10 +413,27 @@ impl Queue {
         queues: &[&str],
         wait: Duration,
     ) -> Result<Option<Job<Processing>>> {
+        self.claim_within_limits(worker, queues, &[], wait)
+    }
+
+    /// Like [`claim`](Queue::claim), skipping each queue in `limits` while
+    /// `max` of its jobs claimed this way run across every worker; see
+    /// [`Store::claim_within_limits`]. A slot freed elsewhere is noticed at
+    /// the next check, within about 100 ms while waiting.
+    pub fn claim_within_limits(
+        &self,
+        worker: &str,
+        queues: &[&str],
+        limits: &[GlobalLimit<'_>],
+        wait: Duration,
+    ) -> Result<Option<Job<Processing>>> {
         let deadline = Instant::now() + wait;
         // Checked first: promoting costs a backend call, and a busy queue
         // rarely needs it.
-        if let Some(record) = self.0.claim(worker, queues, Duration::ZERO)? {
+        if let Some(record) = self
+            .0
+            .claim_within_limits(worker, queues, limits, Duration::ZERO)?
+        {
             return Ok(Some(Job::from_record(record)));
         }
         loop {
@@ -393,7 +451,7 @@ impl Queue {
                 None => left,
             };
             let started = Instant::now();
-            if let Some(record) = self.0.claim(worker, queues, until)? {
+            if let Some(record) = self.0.claim_within_limits(worker, queues, limits, until)? {
                 return Ok(Some(Job::from_record(record)));
             }
             // After the last wait, make one final promotion/nonblocking claim:

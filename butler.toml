@@ -29,8 +29,14 @@ checkpoint_interval_ms = 1000
 queues = [["critical", 3], ["default", 1]]
 
 # Optional caps on jobs running at once, per queue, on top of `concurrency`.
+# Counted in each worker process: three workers with mailers = 20 can run 60.
 # [worker.queue_limits]
 # mailers = 20
+
+# Optional caps counted by the backend, across every worker with the same cap:
+# three workers with exports = 5 run 5 export jobs at once between them.
+# [worker.global_queue_limits]
+# exports = 5
 
 # Jobs the workers enqueue on a cron schedule, once per tick between them.
 # Five fields, as in crontab: minute hour day-of-month month day-of-week.

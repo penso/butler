@@ -16,6 +16,7 @@
 //! <prefix>:unique:<key>          STRING  the id of the job holding that unique key (by its hash)
 //! <prefix>:paused                SET   queues workers don't claim from
 //! <prefix>:slots:<queue>         SET   ids running in one of the queue's global-limit slots
+//! <prefix>:active:<queue>        SET   ids of the queue running on any worker
 //! <prefix>:recurring             SET   keys of the recurring schedules workers registered
 //! <prefix>:recurring:<key>       HASH  { data (schedule JSON), created_at, seen_at, last_tick, last_job }
 //! <prefix>:recurring:tick:<key>:<ms>  STRING  the job enqueued for that tick; expires after a day
@@ -63,6 +64,12 @@
 //! started for `until_started`), and returns the holder otherwise. The lock
 //! is cleared at claim (`until_started`), or when the job is done, dead or
 //! cancelled.
+//!
+//! Every claim adds the id to `active:<q>`, and completing, failing and
+//! recovering the job remove it, in the same step, so the dashboard counts
+//! running jobs per queue with one `SCARD` each. An older version's workers
+//! don't maintain the set; `recover` prunes ids whose jobs no longer run
+//! when the sets hold more ids than the processing lists.
 //!
 //! Under a global queue limit, the claim script first checks
 //! `SCARD slots:<q>`: at the limit it claims nothing, otherwise it adds the
@@ -189,16 +196,33 @@ redis.call('HSET', job, 'state', 'pending')
 redis.call('HDEL', job, 'worker')
 release(ARGV[1], id, false)
 redis.call('SREM', ARGV[1] .. 'slots:' .. queue, id)
+redis.call('SREM', ARGV[1] .. 'active:' .. queue, id)
 redis.call('PUBLISH', ARGV[1] .. 'wake', queue)
 return id
 ";
 
+/// Removes from a queue's set of running ids (KEYS[1]) each id of ARGV[2..]
+/// whose job isn't processing, checked per id so a job claimed meanwhile
+/// stays. ARGV[1] is the key prefix. Returns how many it removed.
+const PRUNE_ACTIVE: &str = r"
+local removed = 0
+for i = 2, #ARGV do
+  if redis.call('HGET', ARGV[1] .. 'job:' .. ARGV[i], 'state') ~= 'processing' then
+    removed = removed + redis.call('SREM', KEYS[1], ARGV[i])
+  end
+end
+return removed
+";
+
+/// How many ids one [`PRUNE_ACTIVE`] call checks.
+const PRUNE_BATCH: usize = 1_000;
+
 /// Claims the oldest job of a queue (KEYS[1]) that may start into a
 /// processing list (KEYS[2]), marked processing and held by worker ARGV[4].
 /// ARGV[1] is the key prefix, ARGV[2] the queue's name. With a global limit
-/// ARGV[3] (`''` for none),
-/// claims nothing while the queue's slot set (KEYS[3]) holds that many ids,
-/// and adds the claimed id to it. Parks jobs whose concurrency key is full
+/// ARGV[3] (`''` for none), claims nothing while the queue's slot set
+/// (KEYS[3]) holds that many ids, and adds the claimed id to it. Adds it to
+/// the queue's set of running ids (KEYS[4]) too. Parks jobs whose concurrency key is full
 /// on that key's blocked list, and drops ids without job data. Returns
 /// `{1, id, data}`, `{0, '', ''}` when nothing may start, or `{2, '', ''}`
 /// after skipping many jobs, to be called again.
@@ -222,6 +246,7 @@ for _ = 1, 100 do
     redis.call('HSET', job, 'state', 'processing', 'worker', ARGV[4])
     if f[2] then redis.call('SADD', p .. 'running:' .. f[2], id) end
     if limit then redis.call('SADD', KEYS[3], id) end
+    redis.call('SADD', KEYS[4], id)
     if f[5] == 'until_started' and redis.call('GET', p .. 'unique:' .. f[4]) == id then
       redis.call('DEL', p .. 'unique:' .. f[4])
     end
@@ -518,6 +543,11 @@ impl RedisQueue {
         format!("{}:slots:{queue}", self.prefix)
     }
 
+    /// The ids of `queue` that workers are running.
+    fn active_key(&self, queue: &str) -> String {
+        format!("{}:active:{queue}", self.prefix)
+    }
+
     fn processing_key(&self, worker: &str) -> String {
         format!("{}:processing:{worker}", self.prefix)
     }
@@ -568,10 +598,11 @@ impl RedisQueue {
                 let (status, _id, data): (u8, String, String) = self.with_conn(|con| {
                     redis::cmd("EVAL")
                         .arg(CLAIM)
-                        .arg(3)
+                        .arg(4)
                         .arg(self.queue_key(queue))
                         .arg(&processing)
                         .arg(self.slots_key(queue))
+                        .arg(self.active_key(queue))
                         .arg(format!("{}:", self.prefix))
                         .arg(*queue)
                         .arg(
@@ -591,6 +622,55 @@ impl RedisQueue {
             }
         }
         Ok(None)
+    }
+
+    /// Removes ids of jobs that stopped running from the queues' `active:`
+    /// sets. This version keeps them exact; an older one's workers don't
+    /// remove ids when they recover, complete or fail a job this version
+    /// claimed. Only when the sets hold more ids than the processing lists
+    /// together does it read the sets, so it costs two small reads otherwise.
+    fn prune_active(&self) -> Result<()> {
+        let queues: Vec<String> =
+            self.with_conn(|con| redis::cmd("SMEMBERS").arg(self.key("queues")).query(con))?;
+        let workers: Vec<String> =
+            self.with_conn(|con| redis::cmd("SMEMBERS").arg(self.key("workers")).query(con))?;
+        if queues.is_empty() {
+            return Ok(());
+        }
+        // One transaction, so a claim or a finish can't land between reads.
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        for queue in &queues {
+            pipe.cmd("SCARD").arg(self.active_key(queue));
+        }
+        for worker in &workers {
+            pipe.cmd("LLEN").arg(self.processing_key(worker));
+        }
+        let sizes: Vec<u64> = self.with_conn(|con| pipe.query(con))?;
+        let (active, held) = sizes.split_at(queues.len());
+        if active.iter().sum::<u64>() <= held.iter().sum::<u64>() {
+            return Ok(());
+        }
+        for queue in &queues {
+            let key = self.active_key(queue);
+            let ids: Vec<String> =
+                self.with_conn(|con| redis::cmd("SMEMBERS").arg(&key).query(con))?;
+            for chunk in ids.chunks(PRUNE_BATCH) {
+                let removed: u64 = self.with_conn(|con| {
+                    redis::cmd("EVAL")
+                        .arg(PRUNE_ACTIVE)
+                        .arg(1)
+                        .arg(&key)
+                        .arg(format!("{}:", self.prefix))
+                        .arg(chunk)
+                        .query(con)
+                })?;
+                if removed > 0 {
+                    tracing::debug!(queue, removed, "dropped finished jobs from running counts");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Starts, once per queue, the thread that turns pub/sub messages into
@@ -853,6 +933,10 @@ impl Store for RedisQueue {
                 .arg(self.slots_key(&job.queue))
                 .arg(&job.id)
                 .ignore()
+                .cmd("SREM")
+                .arg(self.active_key(&job.queue))
+                .arg(&job.id)
+                .ignore()
                 .cmd("HSET")
                 .arg(self.job_key(&job.id))
                 .arg("state")
@@ -904,6 +988,10 @@ impl Store for RedisQueue {
             .ignore()
             .cmd("SREM")
             .arg(self.slots_key(&job.queue))
+            .arg(&job.id)
+            .ignore()
+            .cmd("SREM")
+            .arg(self.active_key(&job.queue))
             .arg(&job.id)
             .ignore()
             .cmd("HSET")
@@ -1064,6 +1152,7 @@ impl Store for RedisQueue {
                     .exec(con)
             })?;
         }
+        self.prune_active()?;
         Ok(recovered)
     }
 
@@ -1150,6 +1239,7 @@ impl Monitor for RedisQueue {
             pipe.cmd("LLEN").arg(self.queue_key(queue));
             // Jobs parked because their concurrency key was full.
             pipe.cmd("HGET").arg(self.key("blocked")).arg(queue);
+            pipe.cmd("SCARD").arg(self.active_key(queue));
         }
         for worker in &workers {
             pipe.cmd("LLEN").arg(self.processing_key(worker));
@@ -1171,6 +1261,7 @@ impl Monitor for RedisQueue {
             .map(|name| QueueStats {
                 name,
                 pending: count(next()) + count(next()),
+                running: count(next()),
             })
             .collect();
         queue_stats.sort_by(|a, b| a.name.cmp(&b.name));

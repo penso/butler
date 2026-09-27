@@ -105,3 +105,47 @@ fn checkpoints_of_jobs_claimed_by_an_older_version_still_check_the_holder() {
     queue.checkpoint("old", &stranger).unwrap();
     assert_eq!(progress(&queue, &id), Some(json!({ "after": 1 })));
 }
+
+fn running(queue: &Queue, name: &str) -> u64 {
+    queue
+        .stats()
+        .unwrap()
+        .queues
+        .iter()
+        .find(|q| q.name == name)
+        .map_or(0, |q| q.running)
+}
+
+/// An older version recovers jobs without removing them from `active:`
+/// sets; the next `recover` of this version drops the ids whose jobs no
+/// longer run, and keeps those that do.
+#[test]
+fn recover_prunes_running_counts_left_by_an_older_version() {
+    let Some((queue, mut raw, prefix)) = redis("prune") else {
+        return;
+    };
+    queue.heartbeat("w", Duration::from_secs(60)).unwrap();
+    let stale = queue.push("a", "default", vec![]).unwrap();
+    queue.push("b", "default", vec![]).unwrap();
+    queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+    let kept = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+    assert_eq!(running(&queue, "default"), 2);
+
+    // What an older version's recovery did with the first job: back on its
+    // queue, pending, and nothing else.
+    let _: () = raw
+        .lrem(format!("{prefix}:processing:w"), 1, &stale)
+        .unwrap();
+    let _: () = raw
+        .rpush(format!("{prefix}:queue:default"), &stale)
+        .unwrap();
+    let _: () = raw
+        .hset(format!("{prefix}:job:{stale}"), "state", "pending")
+        .unwrap();
+    assert_eq!(running(&queue, "default"), 2, "the stale id still counts");
+
+    assert_eq!(queue.recover().unwrap(), 0, "w is alive");
+    assert_eq!(running(&queue, "default"), 1);
+    let members: Vec<String> = raw.smembers(format!("{prefix}:active:default")).unwrap();
+    assert_eq!(members, [kept.id().to_string()]);
+}

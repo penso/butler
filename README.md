@@ -218,7 +218,8 @@ each. See [Concurrency and cores](#concurrency-and-cores) for tuning.
 ## Web dashboard
 
 `butler-web` shows live counts streamed over server-sent events, throughput and
-duration charts, queues, workers, and job details. Retry or discard failed
+duration charts, queues with their pending and running jobs, workers, and job
+details. Retry or discard failed
 jobs, cancel pending work, run scheduled jobs now, pause and resume queues,
 see each recurring schedule's next and last run, and inspect arguments,
 results, errors, and saved progress from one place.
@@ -1441,6 +1442,7 @@ between the two loses that one tick.
 | `butler:unique:<key>` | STRING | the id of the job holding a unique key (by the key's hash) |
 | `butler:paused` | SET | paused queues, which workers leave out of their claims |
 | `butler:slots:<queue>` | SET | ids running in one of the queue's global-limit slots |
+| `butler:active:<queue>` | SET | ids of the queue that workers are running, for per-queue running counts |
 | `butler:recurring` | SET | keys of the recurring schedules workers registered |
 | `butler:recurring:<key>` | HASH | `data` (schedule JSON), `created_at`, `seen_at`, `last_tick`, `last_job` |
 | `butler:recurring:tick:<key>:<ms>` | STRING | the job enqueued for that tick; expires after 24h |
@@ -1459,7 +1461,10 @@ The claim also writes the worker's id into the job hash's `worker` field,
 which completing, failing and recovering the job remove. A checkpoint is a
 script that saves the job's progress only while that field names the saving
 worker: one hash read, however many jobs the worker holds, so a worker whose
-heartbeat lapsed can't overwrite the progress of the job's next run.
+heartbeat lapsed can't overwrite the progress of the job's next run. The
+claim adds the id to `active:<queue>` too, and completing, failing and
+recovering the job remove it in the same step, so `stats()` counts each
+queue's running jobs with one `SCARD`.
 
 **Idle workers are woken by pub/sub, not polling.** Every push, retry and
 recovery also `PUBLISH`es to `butler:wake`. Each worker process keeps one
@@ -1626,6 +1631,16 @@ and the first worker is in fact still running (its heartbeat lapsed, it didn't
 crash), the first worker's checkpoints can overwrite the new run's progress
 until the new run saves over them. Claims by this version rewrite the field,
 so the window closes once every worker runs it.
+
+**Upgrading to per-queue running counts.** `QueueStats` gains `running`, and
+the dashboard's Queues table a Running column. SQLite, file and memory
+derive it from what they already store. Redis adds `active:<queue>` sets,
+which only this version maintains: jobs claimed before the upgrade aren't
+counted until they finish, and jobs an older process claims or recovers
+while versions are mixed can leave the count too low or too high. Each
+`recover` (every `recover_interval_secs`) compares the sets with the
+processing lists and, when the sets hold more, drops ids whose jobs are no
+longer processing, so counts settle once every worker runs this version.
 
 ## Limitations
 

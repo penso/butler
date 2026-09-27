@@ -409,6 +409,63 @@ fn a_checkpoint_saves_only_while_the_worker_holds_the_job() {
 }
 
 #[test]
+fn stats_count_running_jobs_per_queue_through_every_way_out() {
+    for (queue, _) in backends("running-per-queue") {
+        let name = queue.describe();
+        let running = |queue: &Queue| -> Vec<(String, u64, u64)> {
+            queue
+                .stats()
+                .unwrap()
+                .queues
+                .into_iter()
+                // The file backend always lists `default`.
+                .filter(|q| q.name != "default")
+                .map(|q| (q.name, q.pending, q.running))
+                .collect()
+        };
+        let row = |name: &str, pending, running| (name.to_owned(), pending, running);
+        queue.heartbeat("w", Duration::from_secs(60)).unwrap();
+        queue.heartbeat("doomed", Duration::from_secs(60)).unwrap();
+        for (job, on) in [
+            ("a", "mail"),
+            ("b", "mail"),
+            ("c", "mail"),
+            ("d", "reports"),
+        ] {
+            queue.push(job, on, vec![]).unwrap();
+        }
+        let first = queue.claim("w", &["mail"], NOW).unwrap().unwrap();
+        let second = queue.claim("w", &["mail"], NOW).unwrap().unwrap();
+        queue.claim("doomed", &["mail"], NOW).unwrap().unwrap();
+        queue.claim("doomed", &["reports"], NOW).unwrap().unwrap();
+        assert_eq!(
+            running(&queue),
+            [row("mail", 0, 3), row("reports", 0, 1)],
+            "{name}"
+        );
+        assert_eq!(queue.stats().unwrap().processing, 4, "{name}");
+
+        queue.complete("w", first, json!(null)).unwrap();
+        // A retry goes back to pending.
+        queue.fail("w", second, "boom".into(), 1).unwrap();
+        assert_eq!(
+            running(&queue),
+            [row("mail", 1, 1), row("reports", 0, 1)],
+            "{name}"
+        );
+
+        queue.heartbeat("doomed", Duration::from_millis(1)).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(queue.recover().unwrap(), 2, "{name}");
+        assert_eq!(
+            running(&queue),
+            [row("mail", 2, 0), row("reports", 1, 0)],
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn stats_listing_retry_and_discard_for_a_dashboard() {
     for (queue, _) in backends("monitor") {
         let name = queue.describe();

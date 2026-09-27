@@ -837,7 +837,8 @@ impl Monitor for SqliteQueue {
     fn stats(&self) -> Result<Stats> {
         self.with_conn(|conn| {
             let mut stats = Stats::default();
-            let mut queues: BTreeMap<String, u64> = BTreeMap::new();
+            // Per queue: pending, running.
+            let mut queues: BTreeMap<String, (u64, u64)> = BTreeMap::new();
             let mut by_state = conn
                 .prepare("SELECT queue, state, COUNT(*) FROM butler_jobs GROUP BY queue, state")?;
             let rows = by_state.query_map([], |row| {
@@ -849,11 +850,14 @@ impl Monitor for SqliteQueue {
             })?;
             for row in rows {
                 let (queue, state, count) = row?;
-                let pending = queues.entry(queue).or_default();
+                let counts = queues.entry(queue).or_default();
                 match JobState::parse(&state) {
-                    Some(JobState::Pending) => *pending += count,
+                    Some(JobState::Pending) => counts.0 += count,
                     Some(JobState::Scheduled) => stats.scheduled += count,
-                    Some(JobState::Processing) => stats.processing += count,
+                    Some(JobState::Processing) => {
+                        stats.processing += count;
+                        counts.1 += count;
+                    }
                     Some(JobState::Done) => stats.done += count,
                     Some(JobState::Dead) => stats.dead += count,
                     Some(JobState::Cancelled) => stats.cancelled += count,
@@ -862,7 +866,11 @@ impl Monitor for SqliteQueue {
             }
             stats.queues = queues
                 .into_iter()
-                .map(|(name, pending)| QueueStats { name, pending })
+                .map(|(name, (pending, running))| QueueStats {
+                    name,
+                    pending,
+                    running,
+                })
                 .collect();
 
             let mut counters = conn.prepare("SELECT name, value FROM butler_counters")?;

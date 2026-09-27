@@ -531,15 +531,19 @@ impl Monitor for MemoryQueue {
             failed_total: state.failed_total,
             ..Stats::default()
         };
-        let mut queues: BTreeMap<&str, u64> = state
+        // Per queue: pending, running.
+        let mut queues: BTreeMap<&str, (u64, u64)> = state
             .pending
             .iter()
-            .map(|(queue, ids)| (queue.as_str(), ids.len() as u64))
+            .map(|(queue, ids)| (queue.as_str(), (ids.len() as u64, 0)))
             .collect();
         for (job_state, job) in state.jobs.values() {
-            queues.entry(job.queue.as_str()).or_default();
+            let counts = queues.entry(job.queue.as_str()).or_default();
             match job_state {
-                JobState::Processing => stats.processing += 1,
+                JobState::Processing => {
+                    stats.processing += 1;
+                    counts.1 += 1;
+                }
                 JobState::Done => stats.done += 1,
                 JobState::Dead => stats.dead += 1,
                 JobState::Cancelled => stats.cancelled += 1,
@@ -549,9 +553,10 @@ impl Monitor for MemoryQueue {
         }
         stats.queues = queues
             .into_iter()
-            .map(|(name, pending)| QueueStats {
+            .map(|(name, (pending, running))| QueueStats {
                 name: name.to_owned(),
                 pending,
+                running,
             })
             .collect();
         let now = Instant::now();

@@ -32,7 +32,8 @@ pub(crate) struct Snapshot {
     pub done: u64,
     pub cancelled: u64,
     pub workers_alive: usize,
-    pub queues: Vec<(String, u64)>,
+    /// Per queue: its name, pending jobs, and running jobs.
+    pub queues: Vec<(String, u64, u64)>,
     /// Set when the backend couldn't be read this time.
     pub error: Option<String>,
 }
@@ -57,7 +58,7 @@ impl Snapshot {
             queues: stats
                 .queues
                 .iter()
-                .map(|queue| (queue.name.clone(), queue.pending))
+                .map(|queue| (queue.name.clone(), queue.pending, queue.running))
                 .collect(),
             error: None,
         }

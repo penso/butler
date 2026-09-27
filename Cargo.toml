@@ -41,7 +41,7 @@ redis          = { default-features = false, version = "1.7.1" }
 rusqlite           = { features = ["bundled"], version = "0.40.2" }
 serde              = { features = ["derive"], version = "1.0.229" }
 serde_json         = "1.0.151"
-syn                = { features = ["full"], version = "2" }
+syn                = { features = ["full"], version = "3" }
 thiserror          = "2.0.19"
 tokio              = { default-features = false, version = "1.53.1" }
 tokio-stream       = "0.1.19"

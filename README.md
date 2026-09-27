@@ -100,6 +100,7 @@ crashes; storage durability still depends on the backend's configuration.
 - [Running the demo](#running-the-demo)
 - [Usage](#usage)
   - [Defining jobs](#defining-jobs)
+  - [Job names and renaming](#job-names-and-renaming)
   - [Working with an enqueued job](#working-with-an-enqueued-job)
   - [Running a job now](#running-a-job-now)
   - [Bulk enqueuing](#bulk-enqueuing)
@@ -384,8 +385,9 @@ flowchart LR
 1. **Registration, at link time.** `inventory::submit!` puts each job's `JobDef`
    in a linker section, so every `#[job]` compiled into the binary is found
    without a central list. `Worker::new` collects them into a
-   `HashMap<&'static str, fn(Vec<Value>) -> BoxFuture>`, and panics if two jobs
-   share a name. Jobs from a library crate can be added explicitly with
+   `HashMap<&'static str, fn(Vec<Value>) -> BoxFuture>`, keyed by each job's
+   name and its [aliases](#job-names-and-renaming), and panics if two jobs
+   share one. Jobs from a library crate can be added explicitly with
    `.register(my_crate::send_email::JOB)`.
 2. **Lookup, per job.** One hash lookup by name gives a plain function pointer;
    no reflection, no string matching beyond that lookup. An unknown name (a job from a newer
@@ -582,6 +584,9 @@ pub async fn resize_image(path: String, width: u32) -> Result<(), ImageError> { 
 #[butler::job(name = "billing.charge")]      // stable name, survives renames
 pub async fn charge(customer_id: u64, cents: i64) { ... }
 
+#[butler::job(name = "billing.refund", aliases = ["refund"])]  // was `fn refund`
+pub async fn issue_refund(customer_id: u64, cents: i64) { ... }
+
 #[butler::job(queue = "mailers")]             // route to a named queue
 pub async fn send_digest(user_id: u64) { ... }
 
@@ -632,6 +637,43 @@ pub fn thumbnail(path: PathBuf) -> Result<Vec<u8>, ImageError> { ... }
 - An `async fn` job runs as its own task on the worker's tokio runtime. A plain
   `fn` job runs on tokio's blocking thread pool, so CPU-heavy or blocking work
   never stalls the async threads. Either way, the body must be `Send`.
+
+### Job names and renaming
+
+A queued job is stored with its **name**, not a reference to your code, and a
+worker finds the function to run by that name. By default the name is the
+function's, so **renaming a job function strands every job already queued
+under the old name**: workers built from the new code fail them with
+`UnknownJob` until they die. Schedules in `[[recurring]]` and jobs enqueued by
+an older release still running elsewhere use the old name too.
+
+Give jobs a stable name that doesn't depend on the function, from the start:
+
+```rust
+#[butler::job(name = "billing.charge")]
+pub async fn charge(customer_id: u64, cents: i64) { ... }
+```
+
+When a name has to change anyway, keep the old ones as aliases:
+
+```rust
+#[butler::job(name = "billing.charge_v2", aliases = ["charge", "billing.charge"])]
+pub async fn charge(customer_id: u64, cents: i64) { ... }
+```
+
+- New jobs are enqueued under `name`. Workers run jobs queued under `name` or
+  any alias with this function, and a `[[recurring]]` entry may use either.
+- Jobs keep the name they were queued under, as shown in the dashboard. Their
+  concurrency and unique keys include it too, so while old and new names are
+  both queued, `concurrency_key` limits and `unique` apply to each name
+  separately.
+- The arguments must still decode: aliases rename a job, they don't convert
+  old argument shapes.
+- An alias can't be empty, repeat the name, or appear twice (compile errors),
+  and no two jobs in a worker may answer to the same name or alias:
+  `Worker::new` and `Worker::register` panic, naming both jobs.
+- Deploy workers that know the alias before enqueuers that use the new name,
+  and drop an alias once nothing is queued under it.
 
 ### Working with an enqueued job
 
@@ -1813,7 +1855,8 @@ longer processing, so counts settle once every worker runs this version.
   limit (jobs per second).
 - **Job names are the contract.** Renaming a function strands jobs already
   queued under the old name. Use `#[job(name = "...")]` for names that need to
-  stay stable.
+  stay stable, and `aliases` when one has to change (see
+  [Job names and renaming](#job-names-and-renaming)).
 
 ## Layout
 

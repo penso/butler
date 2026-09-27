@@ -92,6 +92,26 @@ pub enum Error {
     #[error("two recurring schedules have the key `{key}`")]
     DuplicateRecurring { key: String },
 
+    /// A job's name or alias is empty, or repeated within the job. `#[job]`
+    /// rejects these at compile time; this is for hand-built [`JobDef`]s.
+    ///
+    /// [`JobDef`]: crate::JobDef
+    #[error("job `{job}`: invalid name or alias `{name}`: {reason}")]
+    InvalidJobName {
+        job: String,
+        name: String,
+        reason: &'static str,
+    },
+
+    /// Two jobs registered in one worker answer to the same name, as a name
+    /// or an alias: a worker couldn't tell which one a queued job means.
+    #[error("jobs `{job}` and `{other}` both answer to `{name}`")]
+    JobNameTaken {
+        name: String,
+        job: String,
+        other: String,
+    },
+
     /// `shutdown_timeout_secs = 0` would give up on every running job at
     /// once, even ones that would stop at their next checkpoint.
     #[error("shutdown_timeout_secs must be at least 1")]

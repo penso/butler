@@ -48,8 +48,10 @@ after crashes. Reliability and correct job lifecycle semantics come first.
   `JobCall`. Preserve its `Send + 'static` guarantee (and its futures') and the
   `JobArg<T>` conversions, including integer-literal inference.
 - Persisted job names, argument shapes, and progress are compatibility contracts.
-  Stable `#[job(name = "...")]` names survive Rust function renames. Keep macro
-  and runtime queue-name validation aligned. Cross-crate jobs may need explicit
+  Stable `#[job(name = "...")]` names survive Rust function renames, and
+  `aliases` keep jobs queued under earlier names running. Keep macro and runtime
+  validation aligned: queue names (`is_valid_queue_name`), and job names and
+  aliases (`JobDef::check_names`). Cross-crate jobs may need explicit
   `Worker::register(job::JOB)` so the linker includes their registration.
 - The worker and the enqueue path only talk to storage through `Backend`. A
   backend's `claim`, `cancel` and `recover` must each be atomic per job:

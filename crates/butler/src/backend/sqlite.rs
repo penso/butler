@@ -8,6 +8,7 @@
 //! butler_paused   queue, paused_at_ms: queues workers don't claim from
 //! butler_recurring        key, data (schedule JSON), created_at_ms, seen_at_ms, last_tick_ms, last_job_id
 //! butler_recurring_ticks  key, tick_ms, job_id: primary key (key, tick_ms)
+//! butler_job_counts       queue, state, n: jobs per queue and state, kept by triggers
 //! ```
 //!
 //! A claim is one `UPDATE ... RETURNING` that moves the oldest pending row of
@@ -42,6 +43,14 @@
 //! running for `until_finished`) in the same immediate transaction, and
 //! returns it instead of inserting. Databases from before these columns get
 //! them when opened.
+//!
+//! The dashboard's counts come from `butler_job_counts`, not from counting
+//! `butler_jobs`: triggers on `butler_jobs` adjust it on every insert, delete,
+//! and change of queue or state, inside the statement that made the change.
+//! So it is exact for any write, from any version or process (a job deleted
+//! by hand included), and `stats()` reads a few rows however many jobs are
+//! kept. Databases from before it get the table and triggers when opened,
+//! with counts taken from their rows then.
 //!
 //! Waking waiters, without a server to publish through:
 //!
@@ -161,6 +170,38 @@ CREATE INDEX IF NOT EXISTS butler_jobs_scheduled ON butler_jobs (state, run_at);
 CREATE INDEX IF NOT EXISTS butler_jobs_ckey ON butler_jobs (ckey, state) WHERE ckey IS NOT NULL;
 CREATE INDEX IF NOT EXISTS butler_jobs_ukey ON butler_jobs (ukey) WHERE ukey IS NOT NULL;";
 
+/// Jobs per queue and state, and the triggers that keep it exact. Created,
+/// and filled from the rows already there, by [`migrate`], in the same
+/// transaction: a database is never seen with the table but not its counts.
+/// Rows whose count dropped to zero are kept (a queue's pending count comes
+/// and goes all the time) and skipped on reads.
+///
+/// Preparing a statement that writes `butler_jobs` compiles these triggers
+/// into it, so the hot writes (push, claim, complete, fail) use cached
+/// statements rather than preparing them on every call.
+const JOB_COUNTS: &str = "
+CREATE TABLE butler_job_counts (
+    queue TEXT NOT NULL,
+    state TEXT NOT NULL,
+    n     INTEGER NOT NULL,
+    PRIMARY KEY (queue, state)
+) WITHOUT ROWID;
+CREATE TRIGGER butler_jobs_count_insert AFTER INSERT ON butler_jobs BEGIN
+    INSERT INTO butler_job_counts (queue, state, n) VALUES (NEW.queue, NEW.state, 1)
+        ON CONFLICT (queue, state) DO UPDATE SET n = n + 1;
+END;
+CREATE TRIGGER butler_jobs_count_update AFTER UPDATE OF queue, state ON butler_jobs
+WHEN OLD.queue IS NOT NEW.queue OR OLD.state IS NOT NEW.state BEGIN
+    UPDATE butler_job_counts SET n = n - 1 WHERE queue = OLD.queue AND state = OLD.state;
+    INSERT INTO butler_job_counts (queue, state, n) VALUES (NEW.queue, NEW.state, 1)
+        ON CONFLICT (queue, state) DO UPDATE SET n = n + 1;
+END;
+CREATE TRIGGER butler_jobs_count_delete AFTER DELETE ON butler_jobs BEGIN
+    UPDATE butler_job_counts SET n = n - 1 WHERE queue = OLD.queue AND state = OLD.state;
+END;
+INSERT INTO butler_job_counts (queue, state, n)
+    SELECT queue, state, COUNT(*) FROM butler_jobs GROUP BY queue, state;";
+
 /// A pending job may start: its concurrency key, if any, has room.
 const HAS_ROOM: &str = "(j.ckey IS NULL OR j.climit > (SELECT COUNT(*) FROM butler_jobs r
                           WHERE r.ckey = j.ckey AND r.state = 'processing'))";
@@ -253,19 +294,17 @@ impl SqliteQueue {
         for queue in queues {
             let data: Option<String> = self.with_conn(|conn| {
                 match GlobalLimit::of(limits, queue) {
-                    None => conn.query_row(
-                        &format!(
+                    None => conn
+                        .prepare_cached(&format!(
                             "UPDATE butler_jobs SET state = 'processing', worker = ?1, slot = NULL
                              WHERE id = (SELECT j.id FROM butler_jobs j
                                          WHERE j.state = 'pending' AND j.queue = ?2 AND {HAS_ROOM}
                                          ORDER BY j.seq LIMIT 1)
                              RETURNING data"
-                        ),
-                        params![worker, queue],
-                        |row| row.get(0),
-                    ),
-                    Some(max) => conn.query_row(
-                        &format!(
+                        ))?
+                        .query_row(params![worker, queue], |row| row.get(0)),
+                    Some(max) => conn
+                        .prepare_cached(&format!(
                             "UPDATE butler_jobs SET state = 'processing', worker = ?1, slot = 1
                              WHERE id = (SELECT j.id FROM butler_jobs j
                                          WHERE j.state = 'pending' AND j.queue = ?2 AND {HAS_ROOM}
@@ -273,10 +312,11 @@ impl SqliteQueue {
                                AND (SELECT COUNT(*) FROM butler_jobs
                                     WHERE state = 'processing' AND queue = ?2 AND slot = 1) < ?3
                              RETURNING data"
+                        ))?
+                        .query_row(
+                            params![worker, queue, i64::try_from(max).unwrap_or(i64::MAX)],
+                            |row| row.get(0),
                         ),
-                        params![worker, queue, i64::try_from(max).unwrap_or(i64::MAX)],
-                        |row| row.get(0),
-                    ),
                 }
                 .optional()
             })?;
@@ -321,6 +361,12 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         }
     }
     tx.execute_batch(SCHEDULED_INDEX)?;
+    let has_counts = tx
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'butler_job_counts'")?
+        .exists([])?;
+    if !has_counts {
+        tx.execute_batch(JOB_COUNTS)?;
+    }
     tx.commit()
 }
 
@@ -330,6 +376,10 @@ fn connect(path: &Path) -> rusqlite::Result<Connection> {
     // WAL: readers don't block the writer, and `data_version` is cheap.
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // A write to `butler_jobs` fires the count triggers, which makes SQLite
+    // keep a statement journal for it; in memory, rather than a temporary
+    // file, that roughly doubles bulk pushes.
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
     Ok(conn)
 }
 
@@ -456,26 +506,24 @@ fn now_ms() -> i64 {
 fn insert(tx: &Connection, job: &JobRecord, data: &str) -> rusqlite::Result<(JobId, bool)> {
     if let Some(unique) = &job.unique {
         let holder: Option<String> = tx
-            .query_row(UNIQUE_HOLDER, params![unique.key], |row| row.get(0))
+            .prepare_cached(UNIQUE_HOLDER)?
+            .query_row(params![unique.key], |row| row.get(0))
             .optional()?;
         if let Some(holder) = holder {
             return Ok((holder, false));
         }
     }
-    tx.execute(
-        INSERT_JOB,
-        params![
-            job.id,
-            job.queue,
-            new_state(job).as_str(),
-            data,
-            run_at_column(job),
-            job.concurrency.as_ref().map(|c| &c.key),
-            job.concurrency.as_ref().map(|c| c.limit),
-            job.unique.as_ref().map(|u| &u.key),
-            job.unique.as_ref().map(|u| u.until.as_str()),
-        ],
-    )?;
+    tx.prepare_cached(INSERT_JOB)?.execute(params![
+        job.id,
+        job.queue,
+        new_state(job).as_str(),
+        data,
+        run_at_column(job),
+        job.concurrency.as_ref().map(|c| &c.key),
+        job.concurrency.as_ref().map(|c| c.limit),
+        job.unique.as_ref().map(|u| &u.key),
+        job.unique.as_ref().map(|u| u.until.as_str()),
+    ])?;
     Ok((job.id.clone(), true))
 }
 
@@ -604,13 +652,13 @@ impl Store for SqliteQueue {
     fn complete(&self, _worker: &str, job: &JobRecord) -> Result<()> {
         let data = serde_json::to_string(job)?;
         self.with_conn(|conn| {
-            conn.execute(
+            conn.prepare_cached(
                 "UPDATE butler_jobs
                  SET state = 'done', worker = NULL, data = ?2,
                      finished_seq = (SELECT COALESCE(MAX(finished_seq), 0) + 1 FROM butler_jobs)
                  WHERE id = ?1",
-                params![job.id, data],
-            )
+            )?
+            .execute(params![job.id, data])
         })?;
         self.signals.finished.notify(&job.id);
         Ok(())
@@ -619,26 +667,29 @@ impl Store for SqliteQueue {
     fn fail(&self, _worker: &str, job: &JobRecord, next: JobState) -> Result<()> {
         let data = serde_json::to_string(job)?;
         self.with_conn(|conn| match next {
-            JobState::Pending => conn.execute(
-                "UPDATE butler_jobs
-                 SET state = 'pending', worker = NULL, data = ?2,
-                     seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM butler_jobs)
-                 WHERE id = ?1",
-                params![job.id, data],
-            ),
-            JobState::Scheduled => conn.execute(
-                "UPDATE butler_jobs
-                 SET state = 'scheduled', worker = NULL, data = ?2, run_at = ?3
-                 WHERE id = ?1",
-                params![job.id, data, run_at_column(job)],
-            ),
-            _ => conn.execute(
-                "UPDATE butler_jobs
-                 SET state = ?3, worker = NULL, data = ?2,
-                     finished_seq = (SELECT COALESCE(MAX(finished_seq), 0) + 1 FROM butler_jobs)
-                 WHERE id = ?1",
-                params![job.id, data, next.as_str()],
-            ),
+            JobState::Pending => conn
+                .prepare_cached(
+                    "UPDATE butler_jobs
+                     SET state = 'pending', worker = NULL, data = ?2,
+                         seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM butler_jobs)
+                     WHERE id = ?1",
+                )?
+                .execute(params![job.id, data]),
+            JobState::Scheduled => conn
+                .prepare_cached(
+                    "UPDATE butler_jobs
+                     SET state = 'scheduled', worker = NULL, data = ?2, run_at = ?3
+                     WHERE id = ?1",
+                )?
+                .execute(params![job.id, data, run_at_column(job)]),
+            _ => conn
+                .prepare_cached(
+                    "UPDATE butler_jobs
+                     SET state = ?3, worker = NULL, data = ?2,
+                         finished_seq = (SELECT COALESCE(MAX(finished_seq), 0) + 1 FROM butler_jobs)
+                     WHERE id = ?1",
+                )?
+                .execute(params![job.id, data, next.as_str()]),
         })?;
         match next {
             JobState::Pending => self.signals.pushed.notify(),
@@ -833,86 +884,94 @@ impl Store for SqliteQueue {
     }
 }
 
+/// Every job's queue and state, counted: what the triggers keep in
+/// `butler_job_counts`, read in a few rows. Zero rows are left behind by
+/// jobs that moved on, and read as no row.
+const COUNTS: &str = "SELECT queue, state, n FROM butler_job_counts WHERE n > 0";
+
+/// The dashboard's numbers, with the jobs per queue and state from `by_state`
+/// (rows of queue, state, count): [`COUNTS`], or in tests a scan of the jobs.
+fn stats_with(conn: &Connection, by_state: &str) -> rusqlite::Result<Stats> {
+    let mut stats = Stats::default();
+    let mut queues: BTreeMap<String, u64> = BTreeMap::new();
+    let mut by_state = conn.prepare(by_state)?;
+    let rows = by_state.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            count(row.get::<_, i64>(2)?),
+        ))
+    })?;
+    for row in rows {
+        let (queue, state, count) = row?;
+        let pending = queues.entry(queue).or_default();
+        match JobState::parse(&state) {
+            Some(JobState::Pending) => *pending += count,
+            Some(JobState::Scheduled) => stats.scheduled += count,
+            Some(JobState::Processing) => stats.processing += count,
+            Some(JobState::Done) => stats.done += count,
+            Some(JobState::Dead) => stats.dead += count,
+            Some(JobState::Cancelled) => stats.cancelled += count,
+            None => {}
+        }
+    }
+    stats.queues = queues
+        .into_iter()
+        .map(|(name, pending)| QueueStats { name, pending })
+        .collect();
+
+    let mut counters = conn.prepare("SELECT name, value FROM butler_counters")?;
+    for row in counters.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, count(row.get::<_, i64>(1)?)))
+    })? {
+        match row? {
+            (name, value) if name == "processed" => stats.processed_total = value,
+            (name, value) if name == "failed" => stats.failed_total = value,
+            _ => {}
+        }
+    }
+
+    // Workers with a heartbeat, and any still holding jobs without one.
+    let mut workers: BTreeMap<String, WorkerStats> = BTreeMap::new();
+    let now = now_ms();
+    let mut beats = conn.prepare("SELECT worker, expires_at_ms FROM butler_workers")?;
+    for row in beats.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })? {
+        let (id, expires_at_ms) = row?;
+        workers.insert(
+            id.clone(),
+            WorkerStats {
+                id,
+                running: 0,
+                expires_in_ms: expires_at_ms - now,
+            },
+        );
+    }
+    let mut held = conn.prepare(
+        "SELECT worker, COUNT(*) FROM butler_jobs
+                 WHERE state = 'processing' AND worker IS NOT NULL GROUP BY worker",
+    )?;
+    for row in held.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, count(row.get::<_, i64>(1)?)))
+    })? {
+        let (id, running) = row?;
+        workers
+            .entry(id.clone())
+            .or_insert_with(|| WorkerStats {
+                id,
+                running: 0,
+                expires_in_ms: -1,
+            })
+            .running = running;
+    }
+    stats.workers = workers.into_values().collect();
+    Ok(stats)
+}
+
 impl Monitor for SqliteQueue {
     fn stats(&self) -> Result<Stats> {
-        self.with_conn(|conn| {
-            let mut stats = Stats::default();
-            let mut queues: BTreeMap<String, u64> = BTreeMap::new();
-            let mut by_state = conn
-                .prepare("SELECT queue, state, COUNT(*) FROM butler_jobs GROUP BY queue, state")?;
-            let rows = by_state.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    count(row.get::<_, i64>(2)?),
-                ))
-            })?;
-            for row in rows {
-                let (queue, state, count) = row?;
-                let pending = queues.entry(queue).or_default();
-                match JobState::parse(&state) {
-                    Some(JobState::Pending) => *pending += count,
-                    Some(JobState::Scheduled) => stats.scheduled += count,
-                    Some(JobState::Processing) => stats.processing += count,
-                    Some(JobState::Done) => stats.done += count,
-                    Some(JobState::Dead) => stats.dead += count,
-                    Some(JobState::Cancelled) => stats.cancelled += count,
-                    None => {}
-                }
-            }
-            stats.queues = queues
-                .into_iter()
-                .map(|(name, pending)| QueueStats { name, pending })
-                .collect();
-
-            let mut counters = conn.prepare("SELECT name, value FROM butler_counters")?;
-            for row in counters.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, count(row.get::<_, i64>(1)?)))
-            })? {
-                match row? {
-                    (name, value) if name == "processed" => stats.processed_total = value,
-                    (name, value) if name == "failed" => stats.failed_total = value,
-                    _ => {}
-                }
-            }
-
-            // Workers with a heartbeat, and any still holding jobs without one.
-            let mut workers: BTreeMap<String, WorkerStats> = BTreeMap::new();
-            let now = now_ms();
-            let mut beats = conn.prepare("SELECT worker, expires_at_ms FROM butler_workers")?;
-            for row in beats.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })? {
-                let (id, expires_at_ms) = row?;
-                workers.insert(
-                    id.clone(),
-                    WorkerStats {
-                        id,
-                        running: 0,
-                        expires_in_ms: expires_at_ms - now,
-                    },
-                );
-            }
-            let mut held = conn.prepare(
-                "SELECT worker, COUNT(*) FROM butler_jobs
-                 WHERE state = 'processing' AND worker IS NOT NULL GROUP BY worker",
-            )?;
-            for row in held.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, count(row.get::<_, i64>(1)?)))
-            })? {
-                let (id, running) = row?;
-                workers
-                    .entry(id.clone())
-                    .or_insert_with(|| WorkerStats {
-                        id,
-                        running: 0,
-                        expires_in_ms: -1,
-                    })
-                    .running = running;
-            }
-            stats.workers = workers.into_values().collect();
-            Ok(stats)
-        })
+        self.with_conn(|conn| stats_with(conn, COUNTS))
     }
 
     fn list(&self, filter: &ListFilter) -> Result<Vec<JobRecord>> {
@@ -1126,6 +1185,9 @@ impl Watch for SqliteQueue {
         Some(self.signals.finished.watch(id))
     }
 }
+
+#[cfg(test)]
+mod counts_tests;
 
 #[cfg(test)]
 mod tests {

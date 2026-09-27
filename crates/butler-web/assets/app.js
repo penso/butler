@@ -213,7 +213,11 @@
 
   function loadHistory() {
     if (!historyEl) return;
-    fetch(base + "/api/metrics?minutes=" + range)
+    // A queue's or a job's page narrows its charts to them.
+    var url = base + "/api/metrics?minutes=" + range;
+    if (historyEl.dataset.queue) url += "&queue=" + encodeURIComponent(historyEl.dataset.queue);
+    if (historyEl.dataset.job) url += "&job=" + encodeURIComponent(historyEl.dataset.job);
+    fetch(url)
       .then(function (response) {
         return response.json();
       })

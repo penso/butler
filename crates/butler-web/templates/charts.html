@@ -1,0 +1,23 @@
+<section class="mt-6 grid gap-6 lg:grid-cols-2">
+  <div class="card p-5">
+    <div class="mb-3 flex items-center justify-between">
+      <div>
+        <h2 class="text-sm font-semibold">History</h2>
+        <p class="text-xs text-[var(--muted)]">Processed and failed per minute</p>
+      </div>
+      <div class="flex gap-1" data-range-group>
+        <button type="button" class="range" data-range="60">1h</button>
+        <button type="button" class="range active" data-range="1440">24h</button>
+        <button type="button" class="range" data-range="10080">7d</button>
+      </div>
+    </div>
+    <div id="history-chart" data-queue="{{ chart_queue }}" data-job="{{ chart_job }}"></div>
+  </div>
+  <div class="card p-5">
+    <div class="mb-3">
+      <h2 class="text-sm font-semibold">Duration</h2>
+      <p class="text-xs text-[var(--muted)]">Average and slowest job per minute, in ms</p>
+    </div>
+    <div id="duration-chart"></div>
+  </div>
+</section>

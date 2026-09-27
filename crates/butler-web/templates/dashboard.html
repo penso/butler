@@ -56,29 +56,7 @@
   <div id="live-chart"></div>
 </section>
 
-<section class="mt-6 grid gap-6 lg:grid-cols-2">
-  <div class="card p-5">
-    <div class="mb-3 flex items-center justify-between">
-      <div>
-        <h2 class="text-sm font-semibold">History</h2>
-        <p class="text-xs text-[var(--muted)]">Processed and failed per minute</p>
-      </div>
-      <div class="flex gap-1" data-range-group>
-        <button type="button" class="range" data-range="60">1h</button>
-        <button type="button" class="range active" data-range="1440">24h</button>
-        <button type="button" class="range" data-range="10080">7d</button>
-      </div>
-    </div>
-    <div id="history-chart"></div>
-  </div>
-  <div class="card p-5">
-    <div class="mb-3">
-      <h2 class="text-sm font-semibold">Duration</h2>
-      <p class="text-xs text-[var(--muted)]">Average and slowest job per minute, in ms</p>
-    </div>
-    <div id="duration-chart"></div>
-  </div>
-</section>
+{% include "charts.html" %}
 
 <section class="mt-6 grid gap-6 lg:grid-cols-3">
   <div class="card overflow-hidden">
@@ -92,16 +70,16 @@
         {% for queue in queues %}
         <tr>
           <td>
-            <a class="link mono" href="{{ base }}/jobs?state=pending&queue={{ queue.name }}">{{ queue.name }}</a>
+            <a class="link mono" href="{{ base }}/queues/{{ queue.name|urlencode_strict }}">{{ queue.name }}</a>
             {% if queue.paused %}<span class="badge badge-scheduled ml-1">paused</span>{% endif %}
           </td>
           <td class="text-right tabular-nums" data-queue-pending="{{ queue.name }}">{{ queue.pending }}</td>
           <td class="text-right tabular-nums" data-queue-running="{{ queue.name }}">{{ queue.running }}</td>
           <td class="text-right">
             {% if queue.paused %}
-            <form method="post" action="{{ base }}/queues/{{ queue.name }}/resume"><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn btn-accent">Resume</button></form>
+            <form method="post" action="{{ base }}/queues/{{ queue.name|urlencode_strict }}/resume"><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn btn-accent">Resume</button></form>
             {% else %}
-            <form method="post" action="{{ base }}/queues/{{ queue.name }}/pause" data-confirm="Pause {{ queue.name }}? Workers stop taking its jobs; running ones finish."><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn">Pause</button></form>
+            <form method="post" action="{{ base }}/queues/{{ queue.name|urlencode_strict }}/pause" data-confirm="Pause {{ queue.name }}? Workers stop taking its jobs; running ones finish."><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn">Pause</button></form>
             {% endif %}
           </td>
         </tr>
@@ -123,8 +101,8 @@
       <tbody>
         {% for job in jobs %}
         <tr>
-          <td class="mono">{{ job.job }}</td>
-          <td class="mono text-[var(--muted)]">{{ job.queue }}</td>
+          <td><a class="link mono" href="{{ base }}/metrics/{{ job.job|urlencode_strict }}">{{ job.job }}</a></td>
+          <td><a class="mono text-[var(--muted)] hover:underline" href="{{ base }}/queues/{{ job.queue|urlencode_strict }}">{{ job.queue }}</a></td>
           <td class="text-right tabular-nums">{{ job.processed }}</td>
           <td class="text-right tabular-nums {% if job.failed > 0 %}text-[var(--error)]{% endif %}">{{ job.failure_rate }}</td>
           <td class="text-right tabular-nums">{{ job.avg }}</td>

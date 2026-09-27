@@ -16,7 +16,8 @@ use crate::{
     AppState, WebError,
     events::{Snapshot, read_stats},
     views::{
-        self, JobRow, JobSummary, STATES, ago, duration, script_json, state_label, thousands, until,
+        self, JobRow, JobSummary, STATES, Totals, ago, duration, script_json, state_label,
+        thousands, until,
     },
 };
 
@@ -57,6 +58,9 @@ struct DashboardPage {
     jobs: Vec<JobSummary>,
     snapshot_json: String,
     return_to: String,
+    /// What the history and duration charts cover: everything.
+    chart_queue: String,
+    chart_job: String,
 }
 
 pub(crate) async fn dashboard(
@@ -104,6 +108,8 @@ pub(crate) async fn dashboard(
         } else {
             state.base.clone()
         },
+        chart_queue: String::new(),
+        chart_job: String::new(),
     };
     Ok(Html(page.render()?))
 }
@@ -121,6 +127,34 @@ pub(crate) struct Series {
 #[derive(Deserialize)]
 pub(crate) struct SeriesQuery {
     minutes: Option<u64>,
+    /// Only this queue's jobs.
+    queue: Option<String>,
+    /// Only jobs with this name.
+    job: Option<String>,
+}
+
+/// Which metric buckets a chart or table covers: every job, one queue's, or
+/// one job name's (optionally on one queue).
+#[derive(Clone, Default)]
+pub(crate) struct Scope {
+    queue: Option<String>,
+    job: Option<String>,
+}
+
+impl Scope {
+    fn new(queue: Option<String>, job: Option<String>) -> Self {
+        Self {
+            queue: queue.filter(|queue| !queue.is_empty()),
+            job: job.filter(|job| !job.is_empty()),
+        }
+    }
+
+    fn covers(&self, bucket: &MetricBucket) -> bool {
+        self.queue
+            .as_ref()
+            .is_none_or(|queue| *queue == bucket.queue)
+            && self.job.as_ref().is_none_or(|job| *job == bucket.job)
+    }
 }
 
 pub(crate) async fn metrics_json(
@@ -133,20 +167,22 @@ pub(crate) async fn metrics_json(
         .clamp(5, butler::monitor::METRICS_RETENTION_MINUTES);
     let now = current_minute();
     let first = now.saturating_sub(span - 1);
+    let scope = Scope::new(query.queue, query.job);
     let buckets = blocking(&state.queue, move |queue| queue.metrics(first)).await?;
-    Ok(Json(series(first, now, &buckets)))
+    Ok(Json(series(
+        first,
+        now,
+        buckets.iter().filter(|bucket| scope.covers(bucket)),
+    )))
 }
 
-fn series(first: u64, last: u64, buckets: &[MetricBucket]) -> Series {
+fn series<'a>(first: u64, last: u64, buckets: impl Iterator<Item = &'a MetricBucket>) -> Series {
     let mut totals: BTreeMap<u64, MetricBucket> = (first..=last)
         .map(|minute| (minute, MetricBucket::default()))
         .collect();
     for bucket in buckets {
         if let Some(total) = totals.get_mut(&bucket.minute) {
-            total.processed += bucket.processed;
-            total.failed += bucket.failed;
-            total.total_ms += bucket.total_ms;
-            total.max_ms = total.max_ms.max(bucket.max_ms);
+            views::add(total, bucket);
         }
     }
     let mut out = Series {
@@ -165,6 +201,119 @@ fn series(first: u64, last: u64, buckets: &[MetricBucket]) -> Series {
         out.max_ms.push(total.max_ms);
     }
     out
+}
+
+#[derive(Template)]
+#[template(path = "queue.html")]
+struct QueuePage {
+    base: String,
+    nav: &'static str,
+    name: String,
+    pending: String,
+    running: String,
+    paused: bool,
+    totals: Totals,
+    jobs: Vec<JobSummary>,
+    return_to: String,
+    chart_queue: String,
+    chart_job: String,
+}
+
+/// One queue: its live counts, pause or resume, its charts, and its jobs.
+pub(crate) async fn queue(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Html<String>, WebError> {
+    if !butler::is_valid_queue_name(&name) {
+        return Err(butler::Error::InvalidQueue {
+            name,
+            reason: "use 1 to 64 of A-Z a-z 0-9 _ - . (not starting with a dot)",
+        }
+        .into());
+    }
+    let stats = read_stats(&state.queue).await?;
+    let since = current_minute().saturating_sub(DAY_MINUTES);
+    let buckets = blocking(&state.queue, move |queue| queue.metrics(since)).await?;
+    let paused = blocking(&state.queue, Queue::paused_queues).await?;
+    let counts = stats.queues.iter().find(|queue| queue.name == name);
+    let scope = Scope::new(Some(name.clone()), None);
+    let covered = || buckets.iter().filter(|bucket| scope.covers(bucket));
+    let page = QueuePage {
+        base: state.base.clone(),
+        nav: "dashboard",
+        pending: thousands(counts.map_or(0, |queue| queue.pending)),
+        running: thousands(counts.map_or(0, |queue| queue.running)),
+        paused: paused.contains(&name),
+        totals: Totals::new(covered()),
+        jobs: views::summarize(covered()),
+        return_to: format!("{}/queues/{name}", state.base),
+        chart_queue: name.clone(),
+        chart_job: String::new(),
+        name,
+    };
+    Ok(Html(page.render()?))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct JobMetricsQuery {
+    queue: Option<String>,
+}
+
+/// A queue a job ran on, as a filter on its page.
+pub(crate) struct QueueFilter {
+    pub name: String,
+    pub active: bool,
+}
+
+#[derive(Template)]
+#[template(path = "job_metrics.html")]
+struct JobMetricsPage {
+    base: String,
+    nav: &'static str,
+    name: String,
+    /// The queue the page is narrowed to, or "" for all of them.
+    queue: String,
+    /// Every queue the job ran on over the day.
+    queues: Vec<QueueFilter>,
+    totals: Totals,
+    /// Per queue, over the day.
+    rows: Vec<JobSummary>,
+    chart_queue: String,
+    chart_job: String,
+}
+
+/// One job name's charts and totals, on every queue or on one.
+pub(crate) async fn job_metrics(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(query): Query<JobMetricsQuery>,
+) -> Result<Html<String>, WebError> {
+    let since = current_minute().saturating_sub(DAY_MINUTES);
+    let buckets = blocking(&state.queue, move |queue| queue.metrics(since)).await?;
+    let every_queue = Scope::new(None, Some(name.clone()));
+    let rows = views::summarize(buckets.iter().filter(|bucket| every_queue.covers(bucket)));
+    let scope = Scope::new(query.queue, Some(name.clone()));
+    let queue = scope.queue.clone().unwrap_or_default();
+    let mut queues: Vec<QueueFilter> = rows
+        .iter()
+        .map(|row| QueueFilter {
+            active: row.queue == queue,
+            name: row.queue.clone(),
+        })
+        .collect();
+    queues.sort_by(|a, b| a.name.cmp(&b.name));
+    let page = JobMetricsPage {
+        base: state.base.clone(),
+        nav: "dashboard",
+        totals: Totals::new(buckets.iter().filter(|bucket| scope.covers(bucket))),
+        queues,
+        rows,
+        chart_queue: queue.clone(),
+        chart_job: name.clone(),
+        queue,
+        name,
+    };
+    Ok(Html(page.render()?))
 }
 
 pub(crate) struct Tab {
@@ -193,6 +342,8 @@ struct JobsPage {
     can_discard: bool,
     can_cancel: bool,
     can_run_now: bool,
+    /// Scheduled jobs can all be run now, or all cancelled.
+    can_bulk_schedule: bool,
     /// Scheduled jobs show when they run.
     show_run_at: bool,
     /// Dead jobs, and retries waiting their turn, show their last error.
@@ -273,6 +424,7 @@ pub(crate) async fn jobs(
         can_discard: job_state.is_finished(),
         can_cancel: matches!(job_state, JobState::Pending | JobState::Scheduled),
         can_run_now: job_state == JobState::Scheduled,
+        can_bulk_schedule: job_state == JobState::Scheduled,
         show_run_at: job_state == JobState::Scheduled,
         show_error: matches!(job_state, JobState::Dead | JobState::Scheduled),
     };

@@ -121,6 +121,50 @@ pub(crate) fn short_id(id: &str) -> String {
     id.chars().skip(len - 12).collect()
 }
 
+/// Adds `bucket`'s counts and durations to `total`.
+pub(crate) fn add(total: &mut MetricBucket, bucket: &MetricBucket) {
+    total.processed += bucket.processed;
+    total.failed += bucket.failed;
+    total.total_ms += bucket.total_ms;
+    total.max_ms = total.max_ms.max(bucket.max_ms);
+}
+
+/// Totals over a period, as the stat tiles above a chart show them.
+pub(crate) struct Totals {
+    pub processed: String,
+    pub failed: String,
+    pub failure_rate: String,
+    pub avg: String,
+    pub max: String,
+}
+
+impl Totals {
+    pub fn new<'a>(buckets: impl IntoIterator<Item = &'a MetricBucket>) -> Self {
+        let mut total = MetricBucket::default();
+        for bucket in buckets {
+            add(&mut total, bucket);
+        }
+        Self {
+            processed: thousands(total.processed),
+            failed: thousands(total.failed),
+            failure_rate: failure_rate(&total),
+            avg: duration(total.total_ms.checked_div(total.processed).unwrap_or(0)),
+            max: duration(total.max_ms),
+        }
+    }
+}
+
+fn failure_rate(total: &MetricBucket) -> String {
+    if total.processed == 0 {
+        "0%".to_owned()
+    } else {
+        format!(
+            "{:.1}%",
+            total.failed as f64 * 100.0 / total.processed as f64
+        )
+    }
+}
+
 /// Summary of one job name over the charted period.
 pub(crate) struct JobSummary {
     pub queue: String,
@@ -133,16 +177,17 @@ pub(crate) struct JobSummary {
     sort_key: u64,
 }
 
-pub(crate) fn summarize(buckets: &[MetricBucket]) -> Vec<JobSummary> {
+pub(crate) fn summarize<'a>(
+    buckets: impl IntoIterator<Item = &'a MetricBucket>,
+) -> Vec<JobSummary> {
     let mut by_job: std::collections::BTreeMap<(&str, &str), MetricBucket> = Default::default();
     for bucket in buckets {
-        let total = by_job
-            .entry((bucket.queue.as_str(), bucket.job.as_str()))
-            .or_default();
-        total.processed += bucket.processed;
-        total.failed += bucket.failed;
-        total.total_ms += bucket.total_ms;
-        total.max_ms = total.max_ms.max(bucket.max_ms);
+        add(
+            by_job
+                .entry((bucket.queue.as_str(), bucket.job.as_str()))
+                .or_default(),
+            bucket,
+        );
     }
     let mut rows: Vec<JobSummary> = by_job
         .into_iter()
@@ -151,14 +196,7 @@ pub(crate) fn summarize(buckets: &[MetricBucket]) -> Vec<JobSummary> {
             job: job.to_owned(),
             processed: thousands(total.processed),
             failed: total.failed,
-            failure_rate: if total.processed == 0 {
-                "0%".to_owned()
-            } else {
-                format!(
-                    "{:.1}%",
-                    total.failed as f64 * 100.0 / total.processed as f64
-                )
-            },
+            failure_rate: failure_rate(&total),
             avg: duration(total.total_ms.checked_div(total.processed).unwrap_or(0)),
             max: duration(total.max_ms),
             sort_key: total.processed,

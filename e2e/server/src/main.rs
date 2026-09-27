@@ -26,7 +26,9 @@ fn args() -> anyhow::Result<Args> {
     };
     let mut given = std::env::args().skip(1);
     while let Some(flag) = given.next() {
-        let value = given.next().with_context(|| format!("{flag} needs a value"))?;
+        let value = given
+            .next()
+            .with_context(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--port" => args.port = value.parse().context("--port")?,
             "--base" => args.base = value,
@@ -46,7 +48,11 @@ fn args() -> anyhow::Result<Args> {
 fn seed(queue: &Queue) -> anyhow::Result<()> {
     queue.heartbeat(WORKER, Duration::from_secs(60))?;
     for (name, target, error) in [
-        ("charge_card", "default", "card declined: insufficient funds"),
+        (
+            "charge_card",
+            "default",
+            "card declined: insufficient funds",
+        ),
         ("sync_account", "mailers", "upstream timed out"),
     ] {
         queue.push(name, target, vec![json!(42)])?;
@@ -63,7 +69,12 @@ fn seed(queue: &Queue) -> anyhow::Result<()> {
     queue.push("resize", "default", vec![])?;
     let later = SystemTime::now() + Duration::from_secs(3600);
     for target in ["mailers", "mailers", "default"] {
-        queue.schedule("send_reminder", target, vec![json!("ada@example.com")], later)?;
+        queue.schedule(
+            "send_reminder",
+            target,
+            vec![json!("ada@example.com")],
+            later,
+        )?;
     }
     Ok(())
 }

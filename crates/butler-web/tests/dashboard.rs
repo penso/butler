@@ -1087,9 +1087,14 @@ async fn queue_and_job_pages_keep_the_base_path() {
     .await;
     assert_eq!(location.as_deref(), Some("/admin/jobs/queues/default"));
 
+    // Back to the dashboard: axum serves a nested router's root at the bare
+    // prefix only, not "/admin/jobs/".
+    assert!(html.contains(r#"<a href="/admin/jobs" class="text-sm"#));
+
     let (status, html) = get(&app, "/admin/jobs/metrics/charge_card").await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains(r#"data-base="/admin/jobs""#));
+    assert!(html.contains(r#"<a href="/admin/jobs" class="text-sm"#));
     assert!(html.contains(r#"href="/admin/jobs/queues/default""#));
 }
 

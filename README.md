@@ -1637,6 +1637,12 @@ load, or with `RedisQueue::max_idle_connections`.
 
 The job's return value goes into the job hash's `data`, next to its arguments.
 
+**Redis Cluster is not supported.** Most scripts derive key names from data
+they read (a popped job's queue, its concurrency key), which Cluster requires
+scripts not to do, and a few declare no key at all. Use a single primary, with
+replicas and failover as your deployment provides. What support would take,
+and the options, are in [docs/redis-cluster.md](docs/redis-cluster.md).
+
 Job delivery uses lists, not `PUBLISH`/`SUBSCRIBE`. Pub/sub broadcasts to every
 subscriber and drops messages sent while nobody is connected, so it is used
 only for wake-ups. Lists retain job ids and move each claim to one worker's
@@ -1811,6 +1817,8 @@ longer processing, so counts settle once every worker runs this version.
   apply to each worker, not across a fleet; `[worker.global_queue_limits]`
   caps concurrent jobs of a queue across all workers. None of them is a rate
   limit (jobs per second).
+- **No Redis Cluster.** The Redis backend needs a single primary; see
+  [docs/redis-cluster.md](docs/redis-cluster.md).
 - **Job names are the contract.** Renaming a function strands jobs already
   queued under the old name. Use `#[job(name = "...")]` for names that need to
   stay stable.

@@ -1,20 +1,36 @@
-use std::{fmt, marker::PhantomData};
+use std::{
+    fmt,
+    marker::PhantomData,
+    time::{Duration, SystemTime},
+};
 
 use serde_json::Value;
 
 use crate::{
-    Error, JobDef, JobHandle, Queue, Result, backend::NewJob, executor::unblock,
-    job::is_valid_queue_name,
+    Error, JobDef, JobHandle, Queue, Result,
+    backend::NewJob,
+    executor::unblock,
+    job::{after, is_valid_queue_name},
 };
 
 /// A job ready to enqueue, with its arguments already serialized: what
 /// `send_email::prepare(...)` returns. Enqueue it alone with
 /// [`enqueue`](PreparedJob::enqueue), or many at once with [`enqueue_all`],
 /// like ActiveJob's `perform_all_later`.
+///
+/// To run it later, like ActiveJob's `set(wait:)` and `set(wait_until:)`:
+///
+/// ```ignore
+/// send_reminder::prepare(user_id)?
+///     .run_in(Duration::from_secs(300))
+///     .enqueue()
+///     .await?;
+/// ```
 pub struct PreparedJob<T = Value> {
     def: &'static JobDef,
     queue: String,
     args: Vec<Value>,
+    run_at: Option<SystemTime>,
     output: PhantomData<fn() -> T>,
 }
 
@@ -25,6 +41,7 @@ impl<T> PreparedJob<T> {
             def,
             queue: def.queue.to_owned(),
             args,
+            run_at: None,
             output: PhantomData,
         }
     }
@@ -39,6 +56,27 @@ impl<T> PreparedJob<T> {
 
     pub fn args(&self) -> &[Value] {
         &self.args
+    }
+
+    /// When it is scheduled to run, if it was.
+    pub fn scheduled_at(&self) -> Option<SystemTime> {
+        self.run_at
+    }
+
+    /// Runs it no sooner than `delay` from now, like ActiveJob's
+    /// `set(wait: ...)`. Until then it is [`Scheduled`](crate::JobState::Scheduled),
+    /// and can be cancelled. Inside
+    /// [`perform_enqueued_jobs`](crate::testing::perform_enqueued_jobs), it
+    /// runs at once.
+    pub fn run_in(self, delay: Duration) -> Self {
+        self.run_at(after(delay))
+    }
+
+    /// Runs it no sooner than `at`, like ActiveJob's `set(wait_until: ...)`.
+    /// A time already past enqueues it at once.
+    pub fn run_at(mut self, at: SystemTime) -> Self {
+        self.run_at = Some(at);
+        self
     }
 
     /// Enqueues on `queue` instead of the one set with `#[job(queue = ...)]`,
@@ -63,13 +101,14 @@ impl<T> PreparedJob<T> {
             def: self.def,
             queue: self.queue,
             args: self.args,
+            run_at: self.run_at,
             output: PhantomData,
         }
     }
 
-    /// Enqueues this one job.
+    /// Enqueues this one job, or schedules it if it has a run time.
     pub async fn enqueue(self) -> Result<JobHandle<T>> {
-        crate::__private::enqueue_on(self.def, &self.queue, self.args).await
+        crate::__private::enqueue_on(self.def, &self.queue, self.args, self.run_at).await
     }
 }
 
@@ -79,6 +118,7 @@ impl<T> fmt::Debug for PreparedJob<T> {
             .field("name", &self.def.name)
             .field("queue", &self.queue)
             .field("args", &self.args)
+            .field("run_at", &self.run_at)
             .finish()
     }
 }
@@ -88,9 +128,10 @@ impl<T> fmt::Debug for PreparedJob<T> {
 ///
 /// Backends that can do it in one step do: Redis sends one pipelined
 /// transaction, SQLite writes one transaction, memory takes its lock once. The
-/// file backend writes one file per job, as usual. Inside
+/// file backend writes one file per job, as usual. Jobs with a run time are
+/// scheduled in the same step. Inside
 /// [`perform_enqueued_jobs`](crate::testing::perform_enqueued_jobs), each job
-/// runs inline, in order.
+/// runs inline, in order, scheduled or not.
 ///
 /// ```ignore
 /// let emails = users
@@ -120,6 +161,7 @@ pub async fn enqueue_all<T>(
             name: job.def.name.to_owned(),
             queue: job.queue,
             args: job.args,
+            run_at: job.run_at,
         })
         .collect();
     let pushing = queue.clone();

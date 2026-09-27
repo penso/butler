@@ -20,6 +20,8 @@ heartbeat_ttl_secs    = 30
 max_retries           = 1
 poll_interval_ms      = 50
 recover_interval_secs = 10
+# Before each retry: "exponential" (the default), "polynomial", or "fixed:30s".
+backoff = "exponential"
 # Jobs with a Progress: the most often their progress is saved.
 checkpoint_interval_ms = 1000
 # Weighted: "critical" comes first 3 times out of 4. A plain list like

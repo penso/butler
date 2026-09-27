@@ -25,7 +25,7 @@ async fn process_user(user_id: u64) -> Result<u64, std::io::Error> {
     Ok(user_id * 10)
 }
 
-#[butler::job]
+#[butler::job(retries = 5, backoff = "fixed:1h")]
 async fn always_fails(user_id: u64) -> Result<(), String> {
     Err(format!("user {user_id} is locked"))
 }
@@ -88,7 +88,11 @@ async fn a_failing_job_is_dead_after_one_attempt() {
     );
     let [performed] = jobs.performed().try_into().unwrap();
     assert_eq!(performed.state(), JobState::Dead);
-    assert_eq!(performed.record().attempts, 1, "no retries inline");
+    assert_eq!(
+        performed.record().attempts,
+        1,
+        "no retries inline, even with retries = 5"
+    );
 }
 
 #[tokio::test]

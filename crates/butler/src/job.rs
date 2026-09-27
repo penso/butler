@@ -1,7 +1,7 @@
 use std::{
     marker::PhantomData,
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -30,6 +30,12 @@ pub struct JobRecord {
     /// last checkpoint.
     #[serde(default)]
     pub progress: Option<Value>,
+    /// When a scheduled job may run, in milliseconds since the Unix epoch:
+    /// set by [`PreparedJob::run_at`](crate::PreparedJob::run_at) and for a
+    /// retry that waits. Kept once the job is promoted, as a record of when
+    /// it was due. Absent from records written before scheduling existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_at_ms: Option<u64>,
 }
 
 impl JobRecord {
@@ -47,14 +53,49 @@ impl JobRecord {
             last_error: None,
             result: None,
             progress: None,
+            run_at_ms: None,
         }
     }
+
+    /// When the job may run, if it was scheduled.
+    pub fn run_at(&self) -> Option<SystemTime> {
+        self.run_at_ms.map(from_millis)
+    }
+}
+
+/// Milliseconds since the Unix epoch: how backends store run times.
+pub(crate) fn millis(at: SystemTime) -> u64 {
+    let ms = at
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(ms).unwrap_or(u64::MAX)
+}
+
+/// The time `ms` milliseconds after the Unix epoch. Stored run times are at
+/// most a century ahead (see [`after`]), which every platform can represent.
+pub(crate) fn from_millis(ms: u64) -> SystemTime {
+    UNIX_EPOCH
+        .checked_add(Duration::from_millis(ms))
+        .unwrap_or_else(|| after(Duration::MAX))
+}
+
+/// Delays are capped here, so adding one to the current time can't overflow
+/// what the platform's clock represents.
+const MAX_DELAY: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
+/// `delay` from now, capped at a century.
+pub(crate) fn after(delay: Duration) -> SystemTime {
+    let now = SystemTime::now();
+    now.checked_add(delay.min(MAX_DELAY)).unwrap_or(now)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobState {
     Pending,
+    /// Waiting for its run time, after which it moves to its queue.
+    Scheduled,
     Processing,
     Done,
     Dead,
@@ -64,8 +105,9 @@ pub enum JobState {
 }
 
 impl JobState {
-    pub const ALL: [JobState; 5] = [
+    pub const ALL: [JobState; 6] = [
         JobState::Pending,
+        JobState::Scheduled,
         JobState::Processing,
         JobState::Done,
         JobState::Dead,
@@ -75,6 +117,7 @@ impl JobState {
     pub fn as_str(self) -> &'static str {
         match self {
             JobState::Pending => "pending",
+            JobState::Scheduled => "scheduled",
             JobState::Processing => "processing",
             JobState::Done => "done",
             JobState::Dead => "dead",
@@ -121,6 +164,8 @@ pub mod state {
     states! {
         /// Waiting on its queue.
         Pending,
+        /// Waiting for its run time, before going on its queue.
+        Scheduled,
         /// Claimed by a worker, which must complete or fail it.
         Processing,
         /// Finished successfully, with its output stored.
@@ -154,6 +199,13 @@ use state::State;
 /// # fn f(job: butler::Job<butler::state::Processing>) {
 /// // A job that is still running has no output yet.
 /// let _ = job.output::<u32>();
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn f(queue: &butler::Queue, job: butler::Job<butler::state::Scheduled>) {
+/// // A scheduled job waits for its run time: it can't be completed either.
+/// queue.complete("worker", job, serde_json::Value::Null);
 /// # }
 /// ```
 ///
@@ -222,6 +274,20 @@ impl Job<state::Pending> {
     }
 }
 
+impl Job<state::Scheduled> {
+    /// When it moves onto its queue, to be claimed.
+    pub fn run_at(&self) -> SystemTime {
+        // A scheduled record always carries its run time; the epoch (due at
+        // once) is only a fallback for a record that lost it.
+        self.record.run_at().unwrap_or(UNIX_EPOCH)
+    }
+
+    /// Why the previous attempt failed, if this is a retry waiting its turn.
+    pub fn last_error(&self) -> Option<&str> {
+        self.record.last_error.as_deref()
+    }
+}
+
 impl Job<state::Done> {
     /// What the job returned. Jobs finished before results existed read as
     /// JSON `null`.
@@ -257,6 +323,7 @@ impl<S: State> std::fmt::Debug for Job<S> {
 #[derive(Debug, Clone)]
 pub enum AnyJob {
     Pending(Job<state::Pending>),
+    Scheduled(Job<state::Scheduled>),
     Processing(Job<state::Processing>),
     Done(Job<state::Done>),
     Dead(Job<state::Dead>),
@@ -267,6 +334,7 @@ impl AnyJob {
     pub(crate) fn new(state: JobState, record: JobRecord) -> Self {
         match state {
             JobState::Pending => Self::Pending(Job::from_record(record)),
+            JobState::Scheduled => Self::Scheduled(Job::from_record(record)),
             JobState::Processing => Self::Processing(Job::from_record(record)),
             JobState::Done => Self::Done(Job::from_record(record)),
             JobState::Dead => Self::Dead(Job::from_record(record)),
@@ -277,6 +345,7 @@ impl AnyJob {
     pub fn state(&self) -> JobState {
         match self {
             Self::Pending(_) => JobState::Pending,
+            Self::Scheduled(_) => JobState::Scheduled,
             Self::Processing(_) => JobState::Processing,
             Self::Done(_) => JobState::Done,
             Self::Dead(_) => JobState::Dead,
@@ -287,6 +356,7 @@ impl AnyJob {
     pub fn record(&self) -> &JobRecord {
         match self {
             Self::Pending(job) => job.record(),
+            Self::Scheduled(job) => job.record(),
             Self::Processing(job) => job.record(),
             Self::Done(job) => job.record(),
             Self::Dead(job) => job.record(),
@@ -298,6 +368,7 @@ impl AnyJob {
         let state = self.state();
         let record = match self {
             Self::Pending(job) => job.into_record(),
+            Self::Scheduled(job) => job.into_record(),
             Self::Processing(job) => job.into_record(),
             Self::Done(job) => job.into_record(),
             Self::Dead(job) => job.into_record(),
@@ -310,9 +381,11 @@ impl AnyJob {
 /// What [`Queue::fail`](crate::Queue::fail) turned a failed job into.
 #[derive(Debug, Clone)]
 pub enum Failed {
-    /// Back on its queue for another attempt.
+    /// Back on its queue for another attempt, at once.
     Retry(Job<state::Pending>),
-    /// Out of retries.
+    /// Waiting for its next attempt, at [`Job::run_at`].
+    Scheduled(Job<state::Scheduled>),
+    /// Out of retries, or its error said never to retry.
     Dead(Job<state::Dead>),
 }
 
@@ -320,6 +393,7 @@ impl Failed {
     pub fn state(&self) -> JobState {
         match self {
             Self::Retry(_) => JobState::Pending,
+            Self::Scheduled(_) => JobState::Scheduled,
             Self::Dead(_) => JobState::Dead,
         }
     }

@@ -1,6 +1,6 @@
 //! What a dashboard reads: counts, job listings, history, and the actions it
-//! takes on failed jobs. Backends implement these on
-//! [`Backend`](crate::Backend); `butler-web` renders them.
+//! takes on failed jobs. Backends implement these with
+//! [`Monitor`](crate::Monitor); `butler-web` renders them.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,6 +13,9 @@ use crate::JobState;
 pub struct Stats {
     /// One entry per queue that has ever had a job, sorted by name.
     pub queues: Vec<QueueStats>,
+    /// Jobs waiting for their run time, retries included.
+    #[serde(default)]
+    pub scheduled: u64,
     pub processing: u64,
     pub dead: u64,
     /// Finished jobs the backend still keeps (Redis: the most recent ones).
@@ -47,7 +50,7 @@ pub struct WorkerStats {
     pub expires_in_ms: i64,
 }
 
-/// Which jobs [`Backend::list`](crate::Backend::list) returns.
+/// Which jobs [`Monitor::list`](crate::Monitor::list) returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListFilter {
     pub state: JobState,

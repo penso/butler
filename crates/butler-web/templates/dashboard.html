@@ -8,7 +8,7 @@
   </div>
 </div>
 
-<section class="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-6">
+<section class="grid grid-cols-2 gap-3 md:grid-cols-4 lg:grid-cols-7">
   <div class="stat">
     <span class="card-title">Processed</span>
     <span class="stat-value" data-stat="processed_total">{{ processed }}</span>
@@ -29,6 +29,11 @@
     <span class="stat-value text-[var(--info)]" data-stat="pending">{{ pending }}</span>
     <span class="text-xs text-[var(--muted)]">waiting in queues</span>
   </div>
+  <a class="stat transition-colors hover:border-[var(--info)]" href="{{ base }}/jobs?state=scheduled">
+    <span class="card-title">Scheduled</span>
+    <span class="stat-value" data-stat="scheduled">{{ scheduled }}</span>
+    <span class="text-xs text-[var(--muted)]">waiting for their time &rarr;</span>
+  </a>
   <a class="stat transition-colors hover:border-[var(--error)]" href="{{ base }}/jobs?state=dead">
     <span class="card-title">Dead</span>
     <span class="stat-value" data-stat="dead">{{ dead }}</span>

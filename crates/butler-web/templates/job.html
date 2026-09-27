@@ -14,6 +14,9 @@
     {% if can_retry %}
     <form method="post" action="{{ base }}/jobs/{{ id }}/retry"><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn btn-accent">Retry</button></form>
     {% endif %}
+    {% if can_run_now %}
+    <form method="post" action="{{ base }}/jobs/{{ id }}/run-now"><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn btn-accent">Run now</button></form>
+    {% endif %}
     {% if can_cancel %}
     <form method="post" action="{{ base }}/jobs/{{ id }}/cancel"><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn">Cancel</button></form>
     {% endif %}
@@ -23,11 +26,14 @@
   </div>
 </div>
 
-<section class="grid grid-cols-2 gap-3 md:grid-cols-4">
+<section class="grid grid-cols-2 gap-3 {% if run_at.is_some() %}md:grid-cols-5{% else %}md:grid-cols-4{% endif %}">
   <div class="stat"><span class="card-title">Queue</span><span class="mono">{{ queue }}</span></div>
   <div class="stat"><span class="card-title">State</span><span>{{ label }}</span></div>
   <div class="stat"><span class="card-title">Failed attempts</span><span class="tabular-nums">{{ attempts }}</span></div>
   <div class="stat"><span class="card-title">Enqueued</span><span data-ms="{{ enqueued_ms }}">{{ enqueued_ago }}</span></div>
+  {% if let Some((run_at_ms, runs_in)) = run_at %}
+  <div class="stat"><span class="card-title">{% if attempts > 0 %}Next attempt{% else %}Runs{% endif %}</span><span class="text-[var(--info)]" data-until-ms="{{ run_at_ms }}">{{ runs_in }}</span></div>
+  {% endif %}
 </section>
 
 {% if let Some(error) = last_error %}

@@ -2,7 +2,7 @@
 //! machine can share, with no server to run.
 //!
 //! ```text
-//! butler_jobs     id, queue, state, worker, seq, data (job JSON), finished_seq
+//! butler_jobs     id, queue, state, worker, seq, data (job JSON), finished_seq, run_at
 //! butler_workers  worker, expires_at_ms (the heartbeat)
 //! ```
 //!
@@ -10,6 +10,12 @@
 //! a queue to `processing` under this worker. SQLite runs it under its write
 //! lock, so only one worker gets each job. `seq` orders the queue: pushes and
 //! retries go to the back, recovered jobs to the front.
+//!
+//! A scheduled job is a `scheduled` row with its run time in `run_at`
+//! (milliseconds since the epoch). Promotion turns due rows into `pending`
+//! ones at the back of their queue, in run-time order; claims only take
+//! `pending` rows, so a scheduled job can't run early. Databases created
+//! before scheduling existed get the `run_at` column when opened.
 //!
 //! Waking waiters, without a server to publish through:
 //!
@@ -35,12 +41,13 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::Value;
 
-use super::{Backend, NewJob};
+use super::{Monitor, NewJob, Promoted, Store, Watch};
 use crate::{
     Error, JobId, JobRecord, JobState, Result, Signal,
+    job::{from_millis, millis},
     monitor::{
         JobMetric, ListFilter, METRICS_RETENTION_MINUTES, MetricBucket, QueueStats, Stats,
         WorkerStats,
@@ -65,7 +72,9 @@ CREATE TABLE IF NOT EXISTS butler_jobs (
     data   TEXT NOT NULL,
     -- Set when the job is done, dead or cancelled, in finishing order, so a
     -- watcher can ask which jobs finished since it last looked.
-    finished_seq INTEGER
+    finished_seq INTEGER,
+    -- When a scheduled job may run, in ms since the epoch.
+    run_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS butler_jobs_claim ON butler_jobs (state, queue, seq);
 CREATE INDEX IF NOT EXISTS butler_jobs_finished ON butler_jobs (finished_seq);
@@ -91,6 +100,14 @@ CREATE TABLE IF NOT EXISTS butler_counters (
     value INTEGER NOT NULL
 );
 ";
+
+/// Needs the `run_at` column, which older databases only have once
+/// [`migrate`] added it.
+const SCHEDULED_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS butler_jobs_scheduled ON butler_jobs (state, run_at);";
+
+/// Takes the next sequence number: the back of every queue.
+const NEXT_SEQ: &str = "(SELECT COALESCE(MAX(seq), 0) + 1 FROM butler_jobs)";
 
 pub struct SqliteQueue {
     path: PathBuf,
@@ -119,6 +136,7 @@ impl SqliteQueue {
         let path = path.as_ref().to_path_buf();
         let conn = connect(&path)?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self {
             path,
             conn: Mutex::new(conn),
@@ -175,6 +193,21 @@ impl SqliteQueue {
         }
         Ok(None)
     }
+}
+
+/// Brings a database created by an older version up to this schema. Runs
+/// under the write lock, so processes opening the same file at once apply
+/// each change once.
+fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let has_run_at = tx
+        .prepare("SELECT 1 FROM pragma_table_info('butler_jobs') WHERE name = 'run_at'")?
+        .exists([])?;
+    if !has_run_at {
+        tx.execute_batch("ALTER TABLE butler_jobs ADD COLUMN run_at INTEGER")?;
+    }
+    tx.execute_batch(SCHEDULED_INDEX)?;
+    tx.commit()
 }
 
 fn connect(path: &Path) -> rusqlite::Result<Connection> {
@@ -246,6 +279,12 @@ fn count(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 
+/// A run time as stored in `run_at`.
+fn run_at_column(job: &JobRecord) -> Option<i64> {
+    job.run_at_ms
+        .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX))
+}
+
 fn now_ms() -> i64 {
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -254,7 +293,7 @@ fn now_ms() -> i64 {
     i64::try_from(ms).unwrap_or(i64::MAX)
 }
 
-impl Backend for SqliteQueue {
+impl Store for SqliteQueue {
     fn push(&self, name: &str, queue: &str, args: Vec<Value>) -> Result<JobId> {
         let job = JobRecord::new(name, queue, args);
         let data = serde_json::to_string(&job)?;
@@ -276,28 +315,107 @@ impl Backend for SqliteQueue {
         let records = jobs
             .into_iter()
             .map(|new| {
-                let job = JobRecord::new(&new.name, &new.queue, new.args);
+                let mut job = JobRecord::new(&new.name, &new.queue, new.args);
+                job.run_at_ms = new.run_at.map(millis);
                 let data = serde_json::to_string(&job)?;
-                Ok((job.id, new.queue, data))
+                Ok((job, new.queue, data))
             })
             .collect::<Result<Vec<_>>>()?;
         let ids = self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
             {
-                let mut insert = tx.prepare(
-                    "INSERT INTO butler_jobs (id, queue, state, seq, data)
-                     VALUES (?1, ?2, 'pending',
-                             (SELECT COALESCE(MAX(seq), 0) + 1 FROM butler_jobs), ?3)",
-                )?;
-                for (id, queue, data) in &records {
-                    insert.execute(params![id, queue, data])?;
+                let mut insert = tx.prepare(&format!(
+                    "INSERT INTO butler_jobs (id, queue, state, seq, data, run_at)
+                     VALUES (?1, ?2, ?3, {NEXT_SEQ}, ?4, ?5)"
+                ))?;
+                for (job, queue, data) in &records {
+                    let state = match job.run_at_ms {
+                        Some(_) => JobState::Scheduled,
+                        None => JobState::Pending,
+                    };
+                    insert.execute(params![
+                        job.id,
+                        queue,
+                        state.as_str(),
+                        data,
+                        run_at_column(job)
+                    ])?;
                 }
             }
             tx.commit()?;
-            Ok(records.into_iter().map(|(id, _, _)| id).collect())
+            Ok(records.into_iter().map(|(job, _, _)| job.id).collect())
         })?;
         self.signals.pushed.notify();
         Ok(ids)
+    }
+
+    fn schedule(
+        &self,
+        name: &str,
+        queue: &str,
+        args: Vec<Value>,
+        run_at: SystemTime,
+    ) -> Result<JobId> {
+        let mut job = JobRecord::new(name, queue, args);
+        job.run_at_ms = Some(millis(run_at));
+        let data = serde_json::to_string(&job)?;
+        self.with_conn(|conn| {
+            conn.execute(
+                &format!(
+                    "INSERT INTO butler_jobs (id, queue, state, seq, data, run_at)
+                     VALUES (?1, ?2, 'scheduled', {NEXT_SEQ}, ?3, ?4)"
+                ),
+                params![job.id, queue, data, run_at_column(&job)],
+            )
+        })?;
+        Ok(job.id)
+    }
+
+    fn promote(&self, now: SystemTime) -> Result<Promoted> {
+        let now = i64::try_from(millis(now)).unwrap_or(i64::MAX);
+        let next_run_at = |conn: &Connection| {
+            conn.query_row(
+                "SELECT MIN(run_at) FROM butler_jobs WHERE state = 'scheduled'",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+        };
+        // A read first: the write lock is only taken when something is due.
+        let next = self.with_conn(next_run_at)?;
+        let (moved, next) = match next {
+            Some(at) if at <= now => self.with_conn(|conn| {
+                let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+                let due: Vec<String> = tx
+                    .prepare(
+                        "SELECT id FROM butler_jobs WHERE state = 'scheduled' AND run_at <= ?1
+                         ORDER BY run_at, seq",
+                    )?
+                    .query_map(params![now], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let mut moved = 0;
+                {
+                    // One at a time, so each gets its own place in line.
+                    let mut enqueue = tx.prepare(&format!(
+                        "UPDATE butler_jobs SET state = 'pending', seq = {NEXT_SEQ}
+                         WHERE id = ?1 AND state = 'scheduled'"
+                    ))?;
+                    for id in &due {
+                        moved += enqueue.execute(params![id])?;
+                    }
+                }
+                let next = next_run_at(&tx)?;
+                tx.commit()?;
+                Ok((moved, next))
+            })?,
+            next => (0, next),
+        };
+        if moved > 0 {
+            self.signals.pushed.notify();
+        }
+        Ok(Promoted {
+            moved,
+            next: next.map(|at| from_millis(count(at))),
+        })
     }
 
     fn claim(&self, worker: &str, queues: &[&str], wait: Duration) -> Result<Option<JobRecord>> {
@@ -347,6 +465,12 @@ impl Backend for SqliteQueue {
                  WHERE id = ?1",
                 params![job.id, data],
             ),
+            JobState::Scheduled => conn.execute(
+                "UPDATE butler_jobs
+                 SET state = 'scheduled', worker = NULL, data = ?2, run_at = ?3
+                 WHERE id = ?1",
+                params![job.id, data, run_at_column(job)],
+            ),
             _ => conn.execute(
                 "UPDATE butler_jobs
                  SET state = ?3, worker = NULL, data = ?2,
@@ -357,6 +481,7 @@ impl Backend for SqliteQueue {
         })?;
         match next {
             JobState::Pending => self.signals.pushed.notify(),
+            JobState::Scheduled => {}
             _ => self.signals.finished.notify(&job.id),
         }
         Ok(())
@@ -399,7 +524,7 @@ impl Backend for SqliteQueue {
                 "UPDATE butler_jobs
                  SET state = 'cancelled',
                      finished_seq = (SELECT COALESCE(MAX(finished_seq), 0) + 1 FROM butler_jobs)
-                 WHERE id = ?1 AND state = 'pending'",
+                 WHERE id = ?1 AND state IN ('pending', 'scheduled')",
                 params![id],
             )
         })?;
@@ -457,6 +582,12 @@ impl Backend for SqliteQueue {
         Ok(recovered)
     }
 
+    fn describe(&self) -> String {
+        format!("sqlite:{}", self.path.display())
+    }
+}
+
+impl Monitor for SqliteQueue {
     fn stats(&self) -> Result<Stats> {
         self.with_conn(|conn| {
             let mut stats = Stats::default();
@@ -475,6 +606,7 @@ impl Backend for SqliteQueue {
                 let pending = queues.entry(queue).or_default();
                 match JobState::parse(&state) {
                     Some(JobState::Pending) => *pending += count,
+                    Some(JobState::Scheduled) => stats.scheduled += count,
                     Some(JobState::Processing) => stats.processing += count,
                     Some(JobState::Done) => stats.done += count,
                     Some(JobState::Dead) => stats.dead += count,
@@ -538,10 +670,10 @@ impl Backend for SqliteQueue {
     }
 
     fn list(&self, filter: &ListFilter) -> Result<Vec<JobRecord>> {
-        let order = if filter.state.is_finished() {
-            "finished_seq DESC"
-        } else {
-            "seq ASC"
+        let order = match filter.state {
+            state if state.is_finished() => "finished_seq DESC",
+            JobState::Scheduled => "run_at ASC, seq ASC",
+            _ => "seq ASC",
         };
         let sql = format!(
             "SELECT data FROM butler_jobs
@@ -589,6 +721,22 @@ impl Backend for SqliteQueue {
                      seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM butler_jobs)
                  WHERE id = ?1 AND state = 'dead'",
                 params![id, data],
+            )
+        })?;
+        if changed > 0 {
+            self.signals.pushed.notify();
+        }
+        Ok(changed > 0)
+    }
+
+    fn run_now(&self, id: &str) -> Result<bool> {
+        let changed = self.with_conn(|conn| {
+            conn.execute(
+                &format!(
+                    "UPDATE butler_jobs SET state = 'pending', seq = {NEXT_SEQ}
+                     WHERE id = ?1 AND state = 'scheduled'"
+                ),
+                params![id],
             )
         })?;
         if changed > 0 {
@@ -676,13 +824,63 @@ impl Backend for SqliteQueue {
                 .collect()
         })
     }
+}
 
+impl Watch for SqliteQueue {
     fn watch_finished(&self, id: &str) -> Option<Arc<Signal>> {
         self.watch_other_processes();
         Some(self.signals.finished.watch(id))
     }
+}
 
-    fn describe(&self) -> String {
-        format!("sqlite:{}", self.path.display())
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// `butler_jobs` as versions before scheduled jobs created it.
+    const OLD_JOBS_TABLE: &str = "
+    CREATE TABLE butler_jobs (
+        id     TEXT PRIMARY KEY,
+        queue  TEXT NOT NULL,
+        state  TEXT NOT NULL,
+        worker TEXT,
+        seq    INTEGER NOT NULL,
+        data   TEXT NOT NULL,
+        finished_seq INTEGER
+    );";
+
+    #[test]
+    fn an_older_database_gains_scheduling_and_keeps_its_jobs() {
+        let path =
+            std::env::temp_dir().join(format!("butler-sqlite-migrate-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(OLD_JOBS_TABLE).unwrap();
+            // A record as older versions wrote it: no run time.
+            let data = r#"{"id":"1-1-0","name":"old","queue":"default","args":[1],
+                "attempts":0,"enqueued_at_ms":1,"last_error":null}"#;
+            conn.execute(
+                "INSERT INTO butler_jobs (id, queue, state, seq, data)
+                 VALUES ('1-1-0', 'default', 'pending', 1, ?1)",
+                params![data],
+            )
+            .unwrap();
+        }
+        let queue = SqliteQueue::open(&path).unwrap();
+        // Opening it again finds the column there and changes nothing.
+        drop(SqliteQueue::open(&path).unwrap());
+
+        let job = queue.claim("w", &["default"], Duration::ZERO).unwrap();
+        let job = job.unwrap();
+        assert_eq!((job.name.as_str(), job.run_at_ms), ("old", None));
+
+        let at = SystemTime::now() + Duration::from_secs(60);
+        let id = queue.schedule("new", "default", vec![], at).unwrap();
+        assert_eq!(queue.get(&id).unwrap().unwrap().0, JobState::Scheduled);
+        assert_eq!(queue.promote(at).unwrap().moved, 1);
+        let _ = std::fs::remove_file(&path);
     }
 }

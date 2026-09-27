@@ -5,14 +5,16 @@
 //! queue directly, never through `butler::configure`, so they run in parallel.
 
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::atomic::{AtomicU32, Ordering},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use butler::{
-    Failed, FileQueue, JobState, MemoryQueue, NewJob, Queue,
+    AnyJob, Backoff, Failed, FileQueue, JITTER, JobState, MemoryQueue, NewJob, Queue, Retry,
+    RetryPolicy,
     monitor::{JobMetric, ListFilter},
 };
 use serde_json::json;
@@ -57,6 +59,12 @@ fn backends(test: &str) -> Vec<(Queue, Claim)> {
 
 const NOW: Duration = Duration::ZERO;
 const DEFAULT: &[&str] = &["default"];
+const HOUR: Duration = Duration::from_secs(3600);
+
+/// Backends store run times to the millisecond.
+fn millis(at: SystemTime) -> u128 {
+    at.duration_since(UNIX_EPOCH).unwrap().as_millis()
+}
 
 #[test]
 fn claims_in_fifo_order_and_only_once() {
@@ -307,21 +315,9 @@ fn push_many_keeps_order_and_every_job_is_claimable() {
     for (queue, _) in backends("push-many") {
         let ids = queue
             .push_many(vec![
-                NewJob {
-                    name: "a".into(),
-                    queue: "default".into(),
-                    args: vec![json!(1)],
-                },
-                NewJob {
-                    name: "b".into(),
-                    queue: "low".into(),
-                    args: vec![json!(2)],
-                },
-                NewJob {
-                    name: "c".into(),
-                    queue: "default".into(),
-                    args: vec![json!(3)],
-                },
+                NewJob::new("a", "default", vec![json!(1)]),
+                NewJob::new("b", "low", vec![json!(2)]),
+                NewJob::new("c", "default", vec![json!(3)]),
             ])
             .unwrap();
         assert_eq!(ids.len(), 3, "{}", queue.describe());
@@ -490,5 +486,414 @@ fn metrics_keep_per_minute_history_and_lifetime_totals() {
             (3, 1),
             "{name}"
         );
+    }
+}
+
+#[test]
+fn a_scheduled_job_is_not_claimable_before_its_time() {
+    for (queue, _) in backends("scheduled-wait") {
+        let name = queue.describe();
+        let at = SystemTime::now() + HOUR;
+        let id = queue
+            .schedule("later", "default", vec![json!(1)], at)
+            .unwrap();
+        assert_eq!(queue.state(&id), Some(JobState::Scheduled), "{name}");
+        let Some(AnyJob::Scheduled(job)) = queue.get(&id).unwrap() else {
+            panic!("{name}: a scheduled job reads back as scheduled");
+        };
+        assert_eq!(millis(job.run_at()), millis(at), "{name}");
+        assert_eq!(job.args(), [json!(1)]);
+
+        assert!(queue.claim("w", DEFAULT, NOW).unwrap().is_none(), "{name}");
+        let early = queue.promote(SystemTime::now()).unwrap();
+        assert_eq!(early.moved, 0, "{name}");
+        assert_eq!(early.next.map(millis), Some(millis(at)), "{name}");
+        assert_eq!(queue.state(&id), Some(JobState::Scheduled), "{name}");
+    }
+}
+
+#[test]
+fn a_scheduled_job_is_claimable_once_its_time_has_come() {
+    for (queue, _) in backends("scheduled-due") {
+        let name = queue.describe();
+        let at = SystemTime::now() + HOUR;
+        let id = queue.schedule("later", "default", vec![], at).unwrap();
+
+        // Promoting as of its run time moves it onto its queue.
+        let promoted = queue.promote(at).unwrap();
+        assert_eq!((promoted.moved, promoted.next), (1, None), "{name}");
+        assert_eq!(queue.state(&id), Some(JobState::Pending), "{name}");
+        assert_eq!(queue.promote(at).unwrap().moved, 0, "{name}: moved once");
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        assert_eq!(job.id(), id, "{name}");
+    }
+}
+
+#[test]
+fn a_waiting_claim_wakes_when_a_scheduled_job_comes_due() {
+    for (queue, claim) in backends("scheduled-wake") {
+        let name = queue.describe();
+        let delay = Duration::from_millis(200);
+        let id = queue
+            .schedule("soon", "default", vec![], SystemTime::now() + delay)
+            .unwrap();
+        let started = Instant::now();
+        match claim {
+            // One claim: it wakes at the run time, not at the end of its wait.
+            Claim::Blocks => {
+                let job = queue
+                    .claim("w", DEFAULT, Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                let waited = started.elapsed();
+                assert_eq!(job.id(), id, "{name}");
+                assert!(
+                    waited >= delay - Duration::from_millis(5),
+                    "{name}: {waited:?}"
+                );
+                assert!(waited < Duration::from_secs(2), "{name}: {waited:?}");
+            }
+            // The worker polls this one: due jobs appear on a later claim.
+            Claim::ReturnsAtOnce => {
+                assert!(
+                    queue
+                        .claim("w", DEFAULT, Duration::from_secs(5))
+                        .unwrap()
+                        .is_none()
+                );
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let job = loop {
+                    if let Some(job) = queue.claim("w", DEFAULT, NOW).unwrap() {
+                        break job;
+                    }
+                    assert!(Instant::now() < deadline, "{name}: never became claimable");
+                    thread::sleep(Duration::from_millis(10));
+                };
+                assert_eq!(job.id(), id, "{name}");
+                assert!(
+                    started.elapsed() >= delay - Duration::from_millis(5),
+                    "{name}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cancel_works_while_scheduled() {
+    for (queue, _) in backends("scheduled-cancel") {
+        let name = queue.describe();
+        let at = SystemTime::now() + HOUR;
+        let id = queue.schedule("x", "default", vec![], at).unwrap();
+        assert!(queue.cancel(&id).unwrap(), "{name}");
+        assert_eq!(queue.state(&id), Some(JobState::Cancelled), "{name}");
+        assert!(!queue.cancel(&id).unwrap(), "{name}: cancelled once");
+
+        let promoted = queue.promote(at).unwrap();
+        assert_eq!((promoted.moved, promoted.next), (0, None), "{name}");
+        assert!(queue.claim("w", DEFAULT, NOW).unwrap().is_none(), "{name}");
+        assert!(!queue.run_now(&id).unwrap(), "{name}");
+        assert_eq!(queue.state(&id), Some(JobState::Cancelled), "{name}");
+    }
+}
+
+#[test]
+fn a_waiting_claim_notices_new_and_earlier_schedules() {
+    for existing in [false, true] {
+        for (queue, claim) in backends("schedule-during-claim") {
+            if claim == Claim::ReturnsAtOnce {
+                continue;
+            }
+            let name = queue.describe();
+            if existing {
+                queue
+                    .schedule("later", "default", vec![], SystemTime::now() + HOUR)
+                    .unwrap();
+            }
+            let (send, receive) = std::sync::mpsc::channel();
+            let waiter = thread::spawn({
+                let queue = queue.clone();
+                move || {
+                    send.send(()).unwrap();
+                    queue.claim("w", DEFAULT, Duration::from_secs(5)).unwrap()
+                }
+            });
+            receive.recv_timeout(Duration::from_secs(2)).unwrap();
+            // Give the claim time to enter its backend wait, as in the
+            // pending-job wakeup contract test above.
+            thread::sleep(Duration::from_millis(100));
+            let at = SystemTime::now() + Duration::from_millis(100);
+            let started = Instant::now();
+            let id = queue.schedule("sooner", "default", vec![], at).unwrap();
+            let job = waiter
+                .join()
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name}: missed new schedule"));
+            assert_eq!(job.id(), id, "{name}");
+            assert!(
+                millis(SystemTime::now()) >= millis(at),
+                "{name}: claimed early"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{name}: waited for stale deadline"
+            );
+        }
+    }
+}
+
+#[test]
+fn cancel_and_promotion_never_both_take_a_scheduled_job() {
+    for (queue, claim) in backends("scheduled-race") {
+        let name = queue.describe();
+        let due = SystemTime::now() + Duration::from_millis(50);
+        let ids: Vec<String> = (0..40)
+            .map(|i| {
+                queue
+                    .schedule("race", "default", vec![json!(i)], due)
+                    .unwrap()
+            })
+            .collect();
+        // Cancels every job, starting around the time they come due, while
+        // this thread promotes and claims them.
+        let canceller = thread::spawn({
+            let (queue, ids) = (queue.clone(), ids.clone());
+            move || {
+                thread::sleep(Duration::from_millis(45));
+                ids.into_iter()
+                    .filter(|id| queue.cancel(id).unwrap())
+                    .collect::<HashSet<_>>()
+            }
+        });
+        let mut claimed = HashSet::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let wait = match claim {
+                Claim::Blocks => Duration::from_millis(10),
+                Claim::ReturnsAtOnce => NOW,
+            };
+            if let Some(job) = queue.claim("w", DEFAULT, wait).unwrap() {
+                assert!(claimed.insert(job.id().to_owned()), "{name}: claimed twice");
+                continue;
+            }
+            let settled = ids.iter().all(|id| {
+                matches!(
+                    queue.state(id),
+                    Some(JobState::Cancelled | JobState::Processing)
+                )
+            });
+            if canceller.is_finished() && settled {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{name}: jobs never settled");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let cancelled = canceller.join().unwrap();
+        assert!(
+            cancelled.is_disjoint(&claimed),
+            "{name}: cancelled and claimed"
+        );
+        assert_eq!(
+            cancelled.len() + claimed.len(),
+            ids.len(),
+            "{name}: lost jobs"
+        );
+        for id in &cancelled {
+            assert_eq!(queue.state(id), Some(JobState::Cancelled), "{name}");
+        }
+    }
+}
+
+#[test]
+fn scheduled_jobs_are_promoted_onto_their_own_queue() {
+    for (queue, _) in backends("scheduled-own-queue") {
+        let name = queue.describe();
+        let at = SystemTime::now() + HOUR;
+        let id = queue.schedule("mail", "mailers", vec![], at).unwrap();
+        assert_eq!(queue.promote(at).unwrap().moved, 1, "{name}");
+        assert!(queue.claim("w", DEFAULT, NOW).unwrap().is_none(), "{name}");
+        let job = queue.claim("w", &["mailers"], NOW).unwrap().unwrap();
+        assert_eq!((job.id(), job.queue()), (id.as_str(), "mailers"), "{name}");
+    }
+}
+
+#[test]
+fn promotion_moves_only_due_jobs_and_reports_the_next_run_time() {
+    for (queue, _) in backends("scheduled-next") {
+        let name = queue.describe();
+        let base = SystemTime::now() + HOUR;
+        let first = queue.schedule("a", "default", vec![], base).unwrap();
+        let second = queue
+            .schedule("b", "low", vec![], base + Duration::from_secs(1))
+            .unwrap();
+        let far = base + 24 * HOUR;
+        let last = queue.schedule("c", "default", vec![], far).unwrap();
+
+        let promoted = queue.promote(base + Duration::from_secs(2)).unwrap();
+        assert_eq!(promoted.moved, 2, "{name}");
+        assert_eq!(promoted.next.map(millis), Some(millis(far)), "{name}");
+        assert_eq!(queue.state(&first), Some(JobState::Pending), "{name}");
+        assert_eq!(queue.state(&second), Some(JobState::Pending), "{name}");
+        assert_eq!(queue.state(&last), Some(JobState::Scheduled), "{name}");
+    }
+}
+
+#[test]
+fn push_many_can_schedule_jobs() {
+    for (queue, _) in backends("scheduled-many") {
+        let name = queue.describe();
+        let at = SystemTime::now() + HOUR;
+        let ids = queue
+            .push_many(vec![
+                NewJob::new("now", "default", vec![]),
+                NewJob::new("later", "low", vec![]).run_at(at),
+            ])
+            .unwrap();
+        assert_eq!(queue.state(&ids[0]), Some(JobState::Pending), "{name}");
+        assert_eq!(queue.state(&ids[1]), Some(JobState::Scheduled), "{name}");
+        assert!(queue.claim("w", &["low"], NOW).unwrap().is_none(), "{name}");
+        assert_eq!(queue.promote(at).unwrap().moved, 1, "{name}");
+        let job = queue.claim("w", &["low"], NOW).unwrap().unwrap();
+        assert_eq!(job.id(), ids[1], "{name}");
+    }
+}
+
+#[test]
+fn a_run_time_already_past_enqueues_at_once() {
+    for (queue, _) in backends("scheduled-past") {
+        let name = queue.describe();
+        let past = SystemTime::now() - HOUR;
+        let id = queue.schedule("late", "default", vec![], past).unwrap();
+        assert_eq!(queue.state(&id), Some(JobState::Pending), "{name}");
+        let ids = queue
+            .push_many(vec![NewJob::new("late", "default", vec![]).run_at(past)])
+            .unwrap();
+        assert_eq!(queue.state(&ids[0]), Some(JobState::Pending), "{name}");
+    }
+}
+
+#[test]
+fn scheduled_jobs_are_counted_listed_and_can_run_now() {
+    for (queue, _) in backends("scheduled-monitor") {
+        let name = queue.describe();
+        let at = SystemTime::now() + HOUR;
+        let later = queue.schedule("later", "mailers", vec![], at).unwrap();
+        let sooner = queue
+            .schedule("sooner", "default", vec![], at - Duration::from_secs(60))
+            .unwrap();
+        let pending = queue.push("now", "default", vec![]).unwrap();
+
+        let stats = queue.stats().unwrap();
+        assert_eq!((stats.scheduled, stats.pending()), (2, 1), "{name}");
+
+        // Soonest first.
+        let listed: Vec<String> = queue
+            .list(&ListFilter::new(JobState::Scheduled))
+            .unwrap()
+            .iter()
+            .map(|job| job.record().id.clone())
+            .collect();
+        assert_eq!(listed, [sooner.as_str(), later.as_str()], "{name}");
+        let mut on_mailers = ListFilter::new(JobState::Scheduled);
+        on_mailers.queue = Some("mailers".into());
+        assert_eq!(queue.list(&on_mailers).unwrap().len(), 1, "{name}");
+
+        // Run now: onto its own queue, before its time.
+        assert!(!queue.run_now(&pending).unwrap(), "{name}: not scheduled");
+        assert!(queue.run_now(&later).unwrap(), "{name}");
+        assert!(!queue.run_now(&later).unwrap(), "{name}: moved once");
+        assert_eq!(queue.state(&later), Some(JobState::Pending), "{name}");
+        let job = queue.claim("w", &["mailers"], NOW).unwrap().unwrap();
+        assert_eq!(job.id(), later, "{name}");
+        assert_eq!(queue.stats().unwrap().scheduled, 1, "{name}");
+    }
+}
+
+#[test]
+fn a_failed_attempt_waits_for_its_retry_on_its_own_queue() {
+    for (queue, _) in backends("retry-later") {
+        let name = queue.describe();
+        let mailers: &[&str] = &["mailers"];
+        let id = queue.push("mail", "mailers", vec![json!(1)]).unwrap();
+        let job = queue.claim("w", mailers, NOW).unwrap().unwrap();
+        let before = SystemTime::now();
+        let policy = RetryPolicy::new(3, Backoff::Fixed(HOUR));
+        let Failed::Scheduled(waiting) = queue
+            .fail_with("w", job, "timeout".into(), Retry::Default, policy)
+            .unwrap()
+        else {
+            panic!("{name}: a retry with a backoff waits");
+        };
+        // The next attempt's time, backoff plus jitter, is recorded.
+        let run_at = waiting.run_at();
+        assert!(millis(run_at) >= millis(before + HOUR), "{name}");
+        assert!(
+            run_at <= SystemTime::now() + HOUR.mul_f64(1.0 + JITTER),
+            "{name}"
+        );
+        let Some(AnyJob::Scheduled(stored)) = queue.get(&id).unwrap() else {
+            panic!("{name}: stored as scheduled");
+        };
+        assert_eq!(millis(stored.run_at()), millis(run_at), "{name}");
+        assert_eq!(stored.last_error(), Some("timeout"), "{name}");
+        assert!(queue.claim("w", mailers, NOW).unwrap().is_none(), "{name}");
+
+        // A failed worker leaves only the scheduled retry, not a processing
+        // copy that recovery could make runnable before the backoff expires.
+        assert_eq!(queue.recover().unwrap(), 0, "{name}");
+        assert_eq!(queue.state(&id), Some(JobState::Scheduled), "{name}");
+
+        assert_eq!(queue.promote(run_at).unwrap().moved, 1, "{name}");
+        assert!(queue.claim("w", DEFAULT, NOW).unwrap().is_none(), "{name}");
+        let again = queue.claim("w", mailers, NOW).unwrap().unwrap();
+        assert_eq!((again.id(), again.attempts()), (id.as_str(), 1), "{name}");
+    }
+}
+
+#[test]
+fn an_error_can_refuse_retries_or_pick_the_delay() {
+    for (queue, _) in backends("retry-classified") {
+        let name = queue.describe();
+        let policy = RetryPolicy::new(5, Backoff::Fixed(HOUR));
+
+        let never = queue.push("a", "default", vec![]).unwrap();
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        let failed = queue
+            .fail_with("w", job, "gone".into(), Retry::Never, policy)
+            .unwrap();
+        assert_eq!(
+            failed.state(),
+            JobState::Dead,
+            "{name}: retries left, but never"
+        );
+        assert_eq!(queue.state(&never), Some(JobState::Dead), "{name}");
+
+        queue.push("b", "default", vec![]).unwrap();
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        let before = SystemTime::now();
+        let delay = Duration::from_secs(90);
+        let Failed::Scheduled(waiting) = queue
+            .fail_with("w", job, "slow down".into(), Retry::After(delay), policy)
+            .unwrap()
+        else {
+            panic!("{name}: retry after a delay");
+        };
+        // Exactly the delay asked for: no backoff, no jitter.
+        assert!(millis(waiting.run_at()) >= millis(before + delay), "{name}");
+        assert!(waiting.run_at() <= SystemTime::now() + delay, "{name}");
+
+        // At once when there's no delay; dead once out of retries anyway.
+        queue.push("c", "default", vec![]).unwrap();
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        let failed = queue
+            .fail_with("w", job, "x".into(), Retry::After(Duration::ZERO), policy)
+            .unwrap();
+        assert_eq!(failed.state(), JobState::Pending, "{name}");
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        let out_of_retries = RetryPolicy::new(1, Backoff::Fixed(HOUR));
+        let failed = queue
+            .fail_with("w", job, "x".into(), Retry::After(delay), out_of_retries)
+            .unwrap();
+        assert_eq!(failed.state(), JobState::Dead, "{name}");
     }
 }

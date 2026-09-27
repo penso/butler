@@ -96,6 +96,9 @@
   .badge-pending {
     @apply bg-[var(--info-soft)] text-[var(--info)];
   }
+  .badge-scheduled {
+    @apply border border-[var(--info)]/40 text-[var(--info)];
+  }
   .badge-processing {
     @apply bg-[var(--warn-soft)] text-[var(--warn)];
   }

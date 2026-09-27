@@ -4,7 +4,7 @@
 //! actions change jobs, cross-site posts are refused, and the live stream and
 //! JSON endpoints answer.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use axum::{
     Router,
@@ -23,6 +23,7 @@ struct Fixture {
     dead: String,
     pending: String,
     done: String,
+    scheduled: String,
 }
 
 fn fixture(base: &str) -> Fixture {
@@ -35,6 +36,14 @@ fn fixture(base: &str) -> Fixture {
         .push("charge_card", "default", vec![json!(42)])
         .unwrap();
     let pending = queue.push("resize", "default", vec![]).unwrap();
+    let scheduled = queue
+        .schedule(
+            "send_reminder",
+            "mailers",
+            vec![json!("ada@example.com")],
+            SystemTime::now() + Duration::from_secs(3600),
+        )
+        .unwrap();
     let job = queue
         .claim("w1", &["mailers"], Duration::ZERO)
         .unwrap()
@@ -63,6 +72,7 @@ fn fixture(base: &str) -> Fixture {
         dead,
         pending,
         done,
+        scheduled,
     }
 }
 
@@ -287,4 +297,117 @@ async fn json_endpoints_assets_and_the_live_stream() {
     .expect("a live snapshot");
     assert_eq!(snapshot["dead"], json!(1));
     assert_eq!(snapshot["queues"], json!([["default", 1], ["mailers", 0]]));
+}
+
+#[tokio::test]
+async fn scheduled_jobs_have_their_own_tab_and_actions() {
+    let f = fixture("");
+    let (status, html) = get(&f.app, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(r#"data-stat="scheduled">1<"#),
+        "scheduled count"
+    );
+
+    let (status, html) = get(&f.app, "/jobs?state=scheduled").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("send_reminder"));
+    assert!(
+        html.contains("in 59m") || html.contains("in 1h"),
+        "when it runs"
+    );
+    assert!(html.contains(&format!("/jobs/{}/run-now", f.scheduled)));
+    assert!(html.contains(&format!("/jobs/{}/cancel", f.scheduled)));
+
+    let (status, html) = get(&f.app, &format!("/jobs/{}", f.scheduled)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("badge-scheduled"));
+    assert!(
+        html.contains("data-until-ms="),
+        "its run time, kept current"
+    );
+    assert!(html.contains(&format!("/jobs/{}/run-now", f.scheduled)));
+
+    // Cross-site: refused, and the job stays scheduled.
+    let run_now = format!("/jobs/{}/run-now", f.scheduled);
+    let (status, _) = post(&f.app, &run_now, "cross-site", "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(f.queue.state(&f.scheduled), Some(JobState::Scheduled));
+
+    let back = "return_to=%2Fjobs%3Fstate%3Dscheduled";
+    let (status, location) = post(&f.app, &run_now, "same-origin", back).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location.as_deref(), Some("/jobs?state=scheduled"));
+    assert_eq!(f.queue.state(&f.scheduled), Some(JobState::Pending));
+
+    // Cancel works while scheduled.
+    let later = f
+        .queue
+        .schedule(
+            "send_reminder",
+            "mailers",
+            vec![],
+            SystemTime::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+    let (status, _) = post(
+        &f.app,
+        &format!("/jobs/{later}/cancel"),
+        "same-origin",
+        back,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(f.queue.state(&later), Some(JobState::Cancelled));
+}
+
+#[tokio::test]
+async fn scheduled_actions_keep_the_base_path() {
+    let f = fixture("/admin/jobs");
+    let app = Router::new().nest("/admin/jobs", f.app.clone());
+    let (status, html) = get(&app, "/admin/jobs/jobs?state=scheduled").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(&format!(
+        r#"action="/admin/jobs/jobs/{}/run-now""#,
+        f.scheduled
+    )));
+    let (_, location) = post(
+        &app,
+        &format!("/admin/jobs/jobs/{}/run-now", f.scheduled),
+        "same-origin",
+        "return_to=%2Fadmin%2Fjobs%2Fjobs%3Fstate%3Dscheduled",
+    )
+    .await;
+    assert_eq!(
+        location.as_deref(),
+        Some("/admin/jobs/jobs?state=scheduled")
+    );
+    assert_eq!(f.queue.state(&f.scheduled), Some(JobState::Pending));
+}
+
+#[tokio::test]
+async fn a_retry_waiting_its_turn_shows_its_error_and_next_attempt() {
+    let f = fixture("");
+    // The fixture's pending job fails, with ten minutes before its retry.
+    let job = f
+        .queue
+        .claim("w1", &["default"], Duration::ZERO)
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.id(), f.pending);
+    let policy = butler::RetryPolicy::new(3, butler::Backoff::Fixed(Duration::from_secs(600)));
+    f.queue
+        .fail("w1", job, "503 from the CRM".into(), policy)
+        .unwrap();
+    assert_eq!(f.queue.state(&f.pending), Some(JobState::Scheduled));
+
+    let (_, html) = get(&f.app, "/jobs?state=scheduled").await;
+    assert!(html.contains("503 from the CRM"), "the error, in the list");
+    let (_, html) = get(&f.app, &format!("/jobs/{}", f.pending)).await;
+    assert!(html.contains("Next attempt"));
+    assert!(
+        html.contains("in 10m") || html.contains("in 11m"),
+        "when it runs"
+    );
+    assert!(html.contains("503 from the CRM"));
 }

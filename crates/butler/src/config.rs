@@ -15,6 +15,7 @@
 //! [worker]
 //! concurrency = 4
 //! max_retries = 3
+//! backoff = "exponential"      # or "polynomial", "fixed:30s"; before each retry
 //! poll_interval_ms = 100
 //! heartbeat_ttl_secs = 30      # crashed workers' jobs are requeued after this
 //! recover_interval_secs = 10
@@ -38,7 +39,7 @@ use std::{
 use serde::Deserialize;
 
 use crate::{
-    Error, FileQueue, Queue, QueuePriority, Result,
+    Backoff, Error, FileQueue, Queue, QueuePriority, Result,
     job::{DEFAULT_QUEUE, is_valid_queue_name},
 };
 
@@ -126,7 +127,13 @@ pub struct WorkerConfig {
     /// Claim loops running side by side in `run_async`; more start jobs
     /// faster. Defaults to the number of CPUs.
     pub claimers: usize,
+    /// How many times a failed job is retried, unless it sets its own with
+    /// `#[job(retries = N)]`.
     pub max_retries: u32,
+    /// How long a failed job waits before each retry, unless it sets its own
+    /// with `#[job(backoff = "...")]`: `"exponential"` (the default),
+    /// `"polynomial"`, or `"fixed:30s"`.
+    pub backoff: Backoff,
     pub poll_interval_ms: u64,
     /// A worker counts as alive this long after each heartbeat; it refreshes
     /// every third of it. After a crash, its jobs are requeued once this lapses.
@@ -168,6 +175,7 @@ impl Default for WorkerConfig {
             concurrency: cpus(),
             claimers: cpus(),
             max_retries: 3,
+            backoff: Backoff::default(),
             poll_interval_ms: 100,
             heartbeat_ttl_secs: 30,
             recover_interval_secs: 10,
@@ -317,11 +325,13 @@ mod tests {
         assert_eq!(config.worker.max_retries, 3);
     }
 
+    /// Loads `toml` from a file of its own: tests run in parallel.
     fn load(toml: &str) -> Result<Config> {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "butler-config-queues-{}-{}.toml",
+            "butler-config-queues-{}-{seq}.toml",
             std::process::id(),
-            toml.len()
         ));
         std::fs::write(&path, toml).unwrap();
         let config = Config::load_from(&path, true);
@@ -367,6 +377,19 @@ mod tests {
         assert!(matches!(bad_name, Error::InvalidQueue { ref name, .. } if name == "../etc"));
         let zero = load("[worker]\nqueues = [[\"low\", 0]]\n").unwrap_err();
         assert!(matches!(zero, Error::InvalidQueue { ref name, .. } if name == "low"));
+    }
+
+    #[test]
+    fn backoff_loads_and_rejects_unknown_forms() {
+        assert_eq!(load("").unwrap().worker.backoff, Backoff::Exponential);
+        let fixed = load("[worker]\nbackoff = \"fixed:30s\"\n").unwrap();
+        assert_eq!(
+            fixed.worker.backoff,
+            Backoff::Fixed(Duration::from_secs(30))
+        );
+        let polynomial = load("[worker]\nbackoff = \"polynomial\"\n").unwrap();
+        assert_eq!(polynomial.worker.backoff, Backoff::Polynomial);
+        assert!(load("[worker]\nbackoff = \"sometimes\"\n").is_err());
     }
 
     #[test]

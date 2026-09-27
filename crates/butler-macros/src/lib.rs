@@ -17,10 +17,14 @@
 //! - a registration entry so any `Worker` in the same binary can dispatch it by name.
 //!
 //! Attributes: `#[job(name = "billing.charge")]` sets the name workers look the
-//! job up by (default: the function name), and `#[job(queue = "mailers")]` the
-//! queue it is enqueued on (default: `"default"`).
+//! job up by (default: the function name), `#[job(queue = "mailers")]` the
+//! queue it is enqueued on (default: `"default"`), and
+//! `#[job(retries = 10, backoff = "exponential")]` how often and how late it is
+//! retried (default: the worker's settings; backoff is `"exponential"`,
+//! `"polynomial"` or `"fixed:30s"`). If the job's error type implements
+//! `butler::Retryable`, each error decides whether and when to retry.
 //! - `send_email::prepare(...)`, which builds the job without enqueueing it,
-//!   for `butler::enqueue_all` or `.on_queue(..)`.
+//!   for `butler::enqueue_all`, `.on_queue(..)`, or `.run_in(..)` to schedule it.
 //! - `send_email::JOB`, a handle for `Worker::register`. Jobs defined in another
 //!   crate need it: the linker drops that crate's automatic registration unless
 //!   the binary references something from it.
@@ -35,18 +39,42 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    FnArg, ItemFn, LitStr, Pat, ReturnType, Type, parse_macro_input, parse_quote, spanned::Spanned,
+    FnArg, ItemFn, LitInt, LitStr, Pat, ReturnType, Type, parse_macro_input, parse_quote,
+    spanned::Spanned,
 };
+
+/// What `#[job(...)]` sets.
+#[derive(Default)]
+struct Attrs {
+    name: Option<LitStr>,
+    queue: Option<LitStr>,
+    retries: Option<LitInt>,
+    backoff: Option<proc_macro2::TokenStream>,
+}
 
 #[proc_macro_attribute]
 pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
 
-    let mut job_name: Option<LitStr> = None;
-    let mut queue: Option<LitStr> = None;
+    let mut attrs = Attrs::default();
     let parser = syn::meta::parser(|meta| {
         if meta.path.is_ident("name") {
-            job_name = Some(meta.value()?.parse()?);
+            attrs.name = Some(meta.value()?.parse()?);
+            Ok(())
+        } else if meta.path.is_ident("retries") {
+            let value: LitInt = meta.value()?.parse()?;
+            value.base10_parse::<u32>()?;
+            attrs.retries = Some(value);
+            Ok(())
+        } else if meta.path.is_ident("backoff") {
+            let value: LitStr = meta.value()?.parse()?;
+            attrs.backoff = Some(backoff(&value.value()).ok_or_else(|| {
+                syn::Error::new(
+                    value.span(),
+                    "backoff is \"exponential\", \"polynomial\", or \"fixed:<n><unit>\" \
+                     with a unit of ms, s, m, h or d, like \"fixed:30s\"",
+                )
+            })?);
             Ok(())
         } else if meta.path.is_ident("queue") {
             let value: LitStr = meta.value()?.parse()?;
@@ -56,16 +84,17 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
                     "queue names are 1 to 64 of A-Z a-z 0-9 _ - . (not starting with a dot)",
                 ));
             }
-            queue = Some(value);
+            attrs.queue = Some(value);
             Ok(())
         } else {
-            Err(meta
-                .error("unsupported job attribute, expected `name = \"...\"` or `queue = \"...\"`"))
+            Err(meta.error(
+                "unsupported job attribute, expected `name`, `queue`, `retries` or `backoff`",
+            ))
         }
     });
     parse_macro_input!(attr with parser);
 
-    match expand(func, job_name, queue) {
+    match expand(func, attrs) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
@@ -87,11 +116,36 @@ fn is_valid_queue_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }
 
-fn expand(
-    func: ItemFn,
-    job_name: Option<LitStr>,
-    queue: Option<LitStr>,
-) -> syn::Result<proc_macro2::TokenStream> {
+/// Same forms as `butler::Backoff`'s `FromStr`, checked at compile time, as
+/// the `butler::Backoff` expression to put in the job's `JobDef`.
+fn backoff(value: &str) -> Option<proc_macro2::TokenStream> {
+    match value {
+        "exponential" => return Some(quote!(::butler::Backoff::Exponential)),
+        "polynomial" => return Some(quote!(::butler::Backoff::Polynomial)),
+        _ => {}
+    }
+    let delay = value.strip_prefix("fixed:")?;
+    let split = delay.find(|c: char| !c.is_ascii_digit())?;
+    let (number, unit) = delay.split_at(split);
+    let scale: u64 = match unit {
+        "ms" => 1,
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return None,
+    };
+    let ms = number.parse::<u64>().ok()?.checked_mul(scale)?;
+    Some(quote!(::butler::Backoff::Fixed(::core::time::Duration::from_millis(#ms))))
+}
+
+fn expand(func: ItemFn, attrs: Attrs) -> syn::Result<proc_macro2::TokenStream> {
+    let Attrs {
+        name: job_name,
+        queue,
+        retries,
+        backoff,
+    } = attrs;
     let sig = &func.sig;
     let is_async = sig.asyncness.is_some();
     if !sig.generics.params.is_empty() {
@@ -154,6 +208,14 @@ fn expand(
         Some(queue) => quote!(#queue),
         None => quote!(::butler::DEFAULT_QUEUE),
     };
+    let retries = match retries {
+        Some(retries) => quote!(::core::option::Option::Some(#retries)),
+        None => quote!(::core::option::Option::None),
+    };
+    let backoff = match backoff {
+        Some(backoff) => quote!(::core::option::Option::Some(#backoff)),
+        None => quote!(::core::option::Option::None),
+    };
     let perform = format_ident!("__butler_perform_{}", name);
     let dispatch = format_ident!("__butler_dispatch_{}", name);
     let inputs = &sig.inputs;
@@ -209,7 +271,15 @@ fn expand(
                     let #idents: #types = ::butler::__private::arg(&mut args, #job_name, #indices)?;
                 )*
                 #progress_init
-                ::butler::__private::output(#run)
+                // The error's own `Retryable` classification, if its type has one.
+                #[allow(unused_imports)]
+                use ::butler::__private::{ClassifyRetry as _, DefaultRetry as _};
+                ::butler::__private::output(
+                    #run,
+                    |error: &<#returns as ::butler::IntoJobResult>::Error| {
+                        (&::butler::__private::Classify(error)).retry_policy()
+                    },
+                )
             })
         }
 
@@ -221,10 +291,16 @@ fn expand(
 
             /// Pass to `Worker::register` when the job lives in another crate.
             pub const JOB: ::butler::JobDef =
-                ::butler::JobDef { name: #job_name, queue: #queue, perform: super::#dispatch };
+                ::butler::JobDef {
+                    name: #job_name,
+                    queue: #queue,
+                    retries: #retries,
+                    backoff: #backoff,
+                    perform: super::#dispatch,
+                };
 
             /// Builds this job without enqueueing it, for `butler::enqueue_all`
-            /// (or `.on_queue(..)`, then `.enqueue()`).
+            /// (or `.on_queue(..)` or `.run_in(..)`, then `.enqueue()`).
             pub fn prepare(#(#idents: impl ::butler::JobArg<#types>),*)
                 -> ::core::result::Result<
                     ::butler::PreparedJob<<#returns as ::butler::IntoJobResult>::Output>,

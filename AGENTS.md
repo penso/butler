@@ -19,13 +19,14 @@ after crashes. Reliability and correct job lifecycle semantics come first.
 
 | Location | Responsibility |
 | --- | --- |
-| `crates/butler/src/backend/` | `Backend` trait and the Redis, SQLite, file and in-memory queues |
+| `crates/butler/src/backend/` | `Backend` traits (`Store`, `Monitor`, `Watch`) and the Redis, SQLite, file and in-memory queues |
 | `crates/butler/src/job.rs` | Serialized job records, identifiers, states, and typed transitions |
 | `crates/butler/src/handle.rs` | `JobHandle<T>`: state, cancel, wait, and the job's result |
 | `crates/butler/src/arg.rs`, `prepared.rs` | Borrow-friendly job arguments, prepared jobs, and bulk enqueueing |
 | `crates/butler/src/progress.rs`, `testing.rs` | Continuations and inline job testing |
 | `crates/butler/src/worker.rs` | Claiming, running, retrying: `run` (threads), `run_async` (tokio), `drain` |
 | `crates/butler/src/queues.rs`, `limits.rs`, `signal.rs` | Queue priority, concurrency limits, and wake-ups |
+| `crates/butler/src/retry.rs` | Retry policies: `Backoff`, `Retry`, `Retryable` |
 | `crates/butler/src/monitor.rs` | Dashboard statistics, filters, and metric history |
 | `crates/butler/src/config.rs` | `butler.toml` and `BUTLER_*` environment loading |
 | `crates/butler/src/lib.rs` | Public API, the global queue, the `#[job]` enqueue helpers |

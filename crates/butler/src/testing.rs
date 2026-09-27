@@ -41,7 +41,7 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-    AnyJob, Backend, Failed, Job, JobDef, JobHandle, JobRecord, MemoryQueue, Queue, Result,
+    AnyJob, Failed, Job, JobDef, JobHandle, JobRecord, MemoryQueue, Queue, Result, Store,
     error::Chain,
     progress::{Checkpoints, Invocation},
 };
@@ -159,9 +159,11 @@ impl InlineJobs {
                     first_run = false;
                     continue;
                 }
-                // One attempt: tests shouldn't wait on retries.
+                // One attempt, whatever the job's retry settings: tests
+                // shouldn't wait on retries.
                 Err(err) => match queue.fail(INLINE, running, Chain(&err).to_string(), 0)? {
                     Failed::Dead(job) => AnyJob::Dead(job),
+                    Failed::Scheduled(job) => AnyJob::Scheduled(job),
                     Failed::Retry(job) => AnyJob::Pending(job),
                 },
             };

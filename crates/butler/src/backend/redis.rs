@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! <prefix>:queue:<queue>         LIST  job ids; LPUSH to enqueue, taken from the right (FIFO)
+//! <prefix>:scheduled             ZSET  ids waiting for their run time (score: ms since the epoch)
 //! <prefix>:processing:<worker>   LIST  ids that worker claimed
 //! <prefix>:worker:<worker>       STRING  heartbeat; expires unless the worker refreshes it
 //! <prefix>:workers               SET   worker ids that may hold jobs
@@ -27,6 +28,12 @@
 //! Cancelling is `LREM queue:<q>`, also atomic: either a worker's claim or the
 //! cancel gets the id, never both.
 //!
+//! A scheduled job's id waits in the `scheduled` sorted set. Promotion is one
+//! script that moves every due id onto the back of its own queue, so a job
+//! moves exactly once however many workers promote. Cancelling a scheduled
+//! job is a `ZREM`, checked before the queue: an id only ever moves from the
+//! set to a queue, so between the two checks it can't slip past both.
+//!
 //! We use lists instead of `PUBLISH`/`SUBSCRIBE` because pub/sub delivers each
 //! message to every subscriber, and messages sent while no worker is connected
 //! are lost.
@@ -35,15 +42,16 @@ use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, OnceLock, PoisonError, Weak},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use redis::{Client, Connection, RedisResult};
 use serde_json::Value;
 
-use super::{Backend, NewJob};
+use super::{Monitor, NewJob, Promoted, Store, Watch};
 use crate::{
     Error, JobId, JobRecord, JobState, Result, Signal,
+    job::{from_millis, millis},
     monitor::{
         JobMetric, ListFilter, METRICS_RETENTION_MINUTES, MetricBucket, QueueStats, Stats,
         WorkerStats, current_minute,
@@ -100,6 +108,49 @@ redis.call('RPUSH', ARGV[1] .. 'queue:' .. queue, id)
 redis.call('HSET', job, 'state', 'pending')
 redis.call('PUBLISH', ARGV[1] .. 'wake', queue)
 return id
+";
+
+/// Moves up to ARGV[3] ids due by ARGV[1] (ms) from the scheduled set
+/// (KEYS[1]) onto the back of their own queues, as pending, soonest first.
+/// ARGV[2] is the key prefix. Returns how many ids it took from the set, how
+/// many of those moved (an id without job data is dropped), and the next run
+/// time left, if any.
+const PROMOTE_DUE: &str = r"
+local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[3]))
+local moved, woken = 0, {}
+for _, id in ipairs(ids) do
+  redis.call('ZREM', KEYS[1], id)
+  local job = ARGV[2] .. 'job:' .. id
+  local queue = redis.call('HGET', job, 'queue')
+  if queue then
+    redis.call('LPUSH', ARGV[2] .. 'queue:' .. queue, id)
+    redis.call('HSET', job, 'state', 'pending')
+    moved = moved + 1
+    if not woken[queue] then
+      woken[queue] = true
+      redis.call('PUBLISH', ARGV[2] .. 'wake', queue)
+    end
+  end
+end
+local next = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+return {#ids, moved, next[2] or false}
+";
+
+/// How many due ids one promotion script call moves, so a large backlog
+/// doesn't hold Redis for long.
+const PROMOTE_BATCH: usize = 1_000;
+
+/// Moves scheduled id ARGV[2] out of the scheduled set (KEYS[1]) onto the
+/// back of its own queue, ahead of its run time. ARGV[1] is the key prefix.
+/// Returns 1, or 0 if it wasn't scheduled.
+const RUN_NOW: &str = r"
+if redis.call('ZREM', KEYS[1], ARGV[2]) == 0 then return 0 end
+local job = ARGV[1] .. 'job:' .. ARGV[2]
+local queue = redis.call('HGET', job, 'queue') or 'default'
+redis.call('LPUSH', ARGV[1] .. 'queue:' .. queue, ARGV[2])
+redis.call('HSET', job, 'state', 'pending')
+redis.call('PUBLISH', ARGV[1] .. 'wake', queue)
+return 1
 ";
 
 pub struct RedisQueue {
@@ -334,7 +385,7 @@ impl RedisQueue {
     }
 }
 
-impl Backend for RedisQueue {
+impl Store for RedisQueue {
     fn push(&self, name: &str, queue: &str, args: Vec<Value>) -> Result<JobId> {
         let job = JobRecord::new(name, queue, args);
         let data = serde_json::to_string(&job)?;
@@ -372,36 +423,117 @@ impl Backend for RedisQueue {
         let mut pipe = redis::pipe();
         pipe.atomic();
         let mut ids = Vec::with_capacity(jobs.len());
-        let mut queues: Vec<String> = Vec::new();
+        // Queues that got a pending job, which wakes claims, and whether it did.
+        let mut queues: Vec<(String, bool)> = Vec::new();
         for new in jobs {
-            let job = JobRecord::new(&new.name, &new.queue, new.args);
+            let mut job = JobRecord::new(&new.name, &new.queue, new.args);
+            job.run_at_ms = new.run_at.map(millis);
+            let state = match job.run_at_ms {
+                Some(_) => JobState::Scheduled,
+                None => JobState::Pending,
+            };
             pipe.cmd("HSET")
                 .arg(self.job_key(&job.id))
                 .arg("state")
-                .arg(JobState::Pending.as_str())
+                .arg(state.as_str())
                 .arg("queue")
                 .arg(&new.queue)
                 .arg("data")
                 .arg(serde_json::to_string(&job)?)
-                .ignore()
-                .cmd("LPUSH")
-                .arg(self.queue_key(&new.queue))
-                .arg(&job.id)
                 .ignore();
-            if !queues.contains(&new.queue) {
-                queues.push(new.queue);
+            match job.run_at_ms {
+                Some(run_at) => pipe
+                    .cmd("ZADD")
+                    .arg(self.key("scheduled"))
+                    .arg(run_at)
+                    .arg(&job.id)
+                    .ignore(),
+                None => pipe
+                    .cmd("LPUSH")
+                    .arg(self.queue_key(&new.queue))
+                    .arg(&job.id)
+                    .ignore(),
+            };
+            let pending = job.run_at_ms.is_none();
+            match queues.iter_mut().find(|(queue, _)| *queue == new.queue) {
+                Some((_, wakes)) => *wakes |= pending,
+                None => queues.push((new.queue, pending)),
             }
             ids.push(job.id);
         }
-        for queue in &queues {
+        for (queue, wakes) in &queues {
             pipe.cmd("SADD").arg(self.key("queues")).arg(queue).ignore();
-            pipe.cmd("PUBLISH")
-                .arg(self.key("wake"))
-                .arg(queue)
-                .ignore();
+            if *wakes {
+                pipe.cmd("PUBLISH")
+                    .arg(self.key("wake"))
+                    .arg(queue)
+                    .ignore();
+            }
         }
         self.with_conn(|con| pipe.exec(con))?;
         Ok(ids)
+    }
+
+    fn schedule(
+        &self,
+        name: &str,
+        queue: &str,
+        args: Vec<Value>,
+        run_at: SystemTime,
+    ) -> Result<JobId> {
+        let mut job = JobRecord::new(name, queue, args);
+        let run_at = millis(run_at);
+        job.run_at_ms = Some(run_at);
+        let data = serde_json::to_string(&job)?;
+        // No wake-up: there is nothing to claim until it is promoted.
+        self.with_conn(|con| {
+            redis::pipe()
+                .atomic()
+                .cmd("HSET")
+                .arg(self.job_key(&job.id))
+                .arg("state")
+                .arg(JobState::Scheduled.as_str())
+                .arg("queue")
+                .arg(queue)
+                .arg("data")
+                .arg(&data)
+                .ignore()
+                .cmd("ZADD")
+                .arg(self.key("scheduled"))
+                .arg(run_at)
+                .arg(&job.id)
+                .ignore()
+                .cmd("SADD")
+                .arg(self.key("queues"))
+                .arg(queue)
+                .ignore()
+                .exec(con)
+        })?;
+        Ok(job.id)
+    }
+
+    fn promote(&self, now: SystemTime) -> Result<Promoted> {
+        let mut promoted = Promoted::default();
+        loop {
+            let (taken, moved, next): (usize, usize, Option<String>) = self.with_conn(|con| {
+                redis::cmd("EVAL")
+                    .arg(PROMOTE_DUE)
+                    .arg(1)
+                    .arg(self.key("scheduled"))
+                    .arg(millis(now))
+                    .arg(format!("{}:", self.prefix))
+                    .arg(PROMOTE_BATCH)
+                    .query(con)
+            })?;
+            promoted.moved += moved;
+            // Scores come back as text; run times are whole milliseconds.
+            promoted.next = next
+                .and_then(|score| score.parse::<f64>().ok())
+                .map(|ms| from_millis(ms as u64));
+            if taken < PROMOTE_BATCH {
+                return Ok(promoted);
+            }
+        }
     }
 
     fn claim(&self, worker: &str, queues: &[&str], wait: Duration) -> Result<Option<JobRecord>> {
@@ -468,41 +600,50 @@ impl Backend for RedisQueue {
     fn fail(&self, worker: &str, job: &JobRecord, next: JobState) -> Result<()> {
         let state = next;
         let data = serde_json::to_string(job)?;
-        let target = if state == JobState::Dead {
-            self.key("dead")
-        } else {
-            self.queue_key(&job.queue)
-        };
-        self.with_conn(|con| {
-            redis::pipe()
-                .atomic()
-                .cmd("LREM")
-                .arg(self.processing_key(worker))
-                .arg(1)
+        let mut pipe = redis::pipe();
+        pipe.atomic()
+            .cmd("LREM")
+            .arg(self.processing_key(worker))
+            .arg(1)
+            .arg(&job.id)
+            .ignore()
+            .cmd("HSET")
+            .arg(self.job_key(&job.id))
+            .arg("state")
+            .arg(state.as_str())
+            .arg("data")
+            .arg(&data)
+            .ignore();
+        match state {
+            // A retry that waits: nothing to wake until it is promoted.
+            JobState::Scheduled => pipe
+                .cmd("ZADD")
+                .arg(self.key("scheduled"))
+                .arg(job.run_at_ms.unwrap_or_default())
                 .arg(&job.id)
-                .ignore()
-                .cmd("HSET")
-                .arg(self.job_key(&job.id))
-                .arg("state")
-                .arg(state.as_str())
-                .arg("data")
-                .arg(&data)
-                .ignore()
+                .ignore(),
+            // A dead job wakes result waiters.
+            JobState::Dead => pipe
                 .cmd("LPUSH")
-                .arg(&target)
+                .arg(self.key("dead"))
                 .arg(&job.id)
                 .ignore()
-                // A retry wakes idle claims; a dead job wakes result waiters.
                 .cmd("PUBLISH")
-                .arg(self.key(if state == JobState::Dead {
-                    "done"
-                } else {
-                    "wake"
-                }))
+                .arg(self.key("done"))
+                .arg(&job.id)
+                .ignore(),
+            // A retry wakes idle claims.
+            _ => pipe
+                .cmd("LPUSH")
+                .arg(self.queue_key(&job.queue))
                 .arg(&job.id)
                 .ignore()
-                .exec(con)
-        })
+                .cmd("PUBLISH")
+                .arg(self.key("wake"))
+                .arg(&job.id)
+                .ignore(),
+        };
+        self.with_conn(|con| pipe.exec(con))
     }
 
     fn get(&self, id: &str) -> Result<Option<(JobState, JobRecord)>> {
@@ -550,17 +691,30 @@ impl Backend for RedisQueue {
         let Some(queue) = queue else {
             return Ok(false);
         };
-        let removed: usize = self.with_conn(|con| {
-            redis::cmd("LREM")
-                .arg(self.queue_key(&queue))
-                .arg(1)
+        // The scheduled set first: promotion only moves ids from it to a
+        // queue, so checking in this order can't miss one moving in between.
+        let unscheduled: usize = self.with_conn(|con| {
+            redis::cmd("ZREM")
+                .arg(self.key("scheduled"))
                 .arg(id)
                 .query(con)
         })?;
+        let removed: usize = if unscheduled > 0 {
+            unscheduled
+        } else {
+            self.with_conn(|con| {
+                redis::cmd("LREM")
+                    .arg(self.queue_key(&queue))
+                    .arg(1)
+                    .arg(id)
+                    .query(con)
+            })?
+        };
         if removed == 0 {
             return Ok(false);
         }
-        // The id is out of the pending list, so no worker can claim it now.
+        // The id is out of the pending list and the scheduled set, so no
+        // worker can claim it now.
         self.with_conn(|con| {
             redis::pipe()
                 .atomic()
@@ -649,6 +803,12 @@ impl Backend for RedisQueue {
         Ok(recovered)
     }
 
+    fn describe(&self) -> String {
+        self.display.clone()
+    }
+}
+
+impl Monitor for RedisQueue {
     fn stats(&self) -> Result<Stats> {
         let queues: Vec<String> =
             self.with_conn(|con| redis::cmd("SMEMBERS").arg(self.key("queues")).query(con))?;
@@ -667,6 +827,7 @@ impl Backend for RedisQueue {
         pipe.cmd("LLEN").arg(self.key("recent:cancelled"));
         pipe.cmd("GET").arg(self.key("counter:processed"));
         pipe.cmd("GET").arg(self.key("counter:failed"));
+        pipe.cmd("ZCARD").arg(self.key("scheduled"));
         let values: Vec<Option<i64>> = self.with_conn(|con| pipe.query(con))?;
         let mut values = values.into_iter().map(|value| value.unwrap_or(0));
         let mut next = || values.next().unwrap_or(0);
@@ -698,17 +859,20 @@ impl Backend for RedisQueue {
         stats.cancelled = count(next());
         stats.processed_total = count(next());
         stats.failed_total = count(next());
+        stats.scheduled = count(next());
         Ok(stats)
     }
 
     fn list(&self, filter: &ListFilter) -> Result<Vec<JobRecord>> {
-        let list_key = match filter.state {
-            JobState::Dead => Some(self.key("dead")),
-            JobState::Done => Some(self.key("recent:done")),
-            JobState::Cancelled => Some(self.key("recent:cancelled")),
+        // `LRANGE` and `ZRANGE` both read members in order, by index.
+        let ordered = match filter.state {
+            JobState::Dead => Some(("LRANGE", self.key("dead"))),
+            JobState::Done => Some(("LRANGE", self.key("recent:done"))),
+            JobState::Cancelled => Some(("LRANGE", self.key("recent:cancelled"))),
+            JobState::Scheduled => Some(("ZRANGE", self.key("scheduled"))),
             JobState::Pending | JobState::Processing => None,
         };
-        let Some(list_key) = list_key else {
+        let Some((range, list_key)) = ordered else {
             // Pending and processing: gather ids (oldest first) from every list.
             let lists: Vec<String> = if filter.state == JobState::Pending {
                 match &filter.queue {
@@ -754,8 +918,9 @@ impl Backend for RedisQueue {
                 .take(filter.limit)
                 .collect());
         };
-        // Finished jobs: the lists hold the most recent first. With a queue
-        // filter, read windows until the page is full or the list ends.
+        // Finished jobs: the lists hold the most recent first; scheduled ones
+        // are by run time. With a queue filter, read windows until the page
+        // is full or the list ends.
         let window = (filter.limit.max(1) * 4) as isize;
         let mut skipped = 0;
         let mut page = Vec::new();
@@ -766,7 +931,7 @@ impl Backend for RedisQueue {
         };
         loop {
             let ids: Vec<String> = self.with_conn(|con| {
-                redis::cmd("LRANGE")
+                redis::cmd(range)
                     .arg(&list_key)
                     .arg(start)
                     .arg(start + window - 1)
@@ -835,6 +1000,19 @@ impl Backend for RedisQueue {
                 .exec(con)
         })?;
         Ok(true)
+    }
+
+    fn run_now(&self, id: &str) -> Result<bool> {
+        let moved: u8 = self.with_conn(|con| {
+            redis::cmd("EVAL")
+                .arg(RUN_NOW)
+                .arg(1)
+                .arg(self.key("scheduled"))
+                .arg(format!("{}:", self.prefix))
+                .arg(id)
+                .query(con)
+        })?;
+        Ok(moved > 0)
     }
 
     fn discard(&self, id: &str) -> Result<bool> {
@@ -936,14 +1114,12 @@ impl Backend for RedisQueue {
         }
         Ok(buckets)
     }
+}
 
+impl Watch for RedisQueue {
     fn watch_finished(&self, id: &str) -> Option<Arc<Signal>> {
         self.listen_for_signals();
         Some(self.signals.finished.watch(id))
-    }
-
-    fn describe(&self) -> String {
-        self.display.clone()
     }
 }
 

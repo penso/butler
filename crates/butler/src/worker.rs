@@ -11,7 +11,8 @@ use std::{
 
 use crate::{
     __private::BoxFuture,
-    Config, Failed, Job, JobDef, JobError, Queue, QueuePriority, Result, WorkerConfig, block_on,
+    Backoff, Config, Failed, Job, JobDef, JobError, Queue, QueuePriority, Result, RetryPolicy,
+    WorkerConfig, block_on,
     error::Chain,
     executor::panic_message,
     limits::{Permit, QueueLimits},
@@ -52,6 +53,11 @@ const LIMITED_RECHECK: Duration = Duration::from_millis(10);
 /// is due. The checks themselves are throttled; this only bounds the latency.
 const KEEPER_TICK: Duration = Duration::from_millis(250);
 
+/// How often the keeper promotes scheduled jobs that came due. Idle claims
+/// promote on their own, at the due time; this covers workers too busy to be
+/// idle, so a due job on a queue they serve first doesn't wait for a lull.
+const PROMOTE_INTERVAL: Duration = KEEPER_TICK;
+
 /// Pulls jobs from a [`Queue`] and runs them. It can run every `#[job]`
 /// function compiled into the current binary.
 ///
@@ -62,13 +68,15 @@ const KEEPER_TICK: Duration = Duration::from_millis(250);
 #[derive(Clone)]
 pub struct Worker {
     queue: Queue,
-    handlers: Arc<HashMap<&'static str, Handler>>,
+    /// Every job this worker can run, by name.
+    jobs: Arc<HashMap<&'static str, JobDef>>,
     id: Arc<str>,
     queues: QueuePriority,
     limits: QueueLimits,
     claimers: usize,
     concurrency: usize,
     max_retries: u32,
+    backoff: Backoff,
     poll_interval: Duration,
     heartbeat_ttl: Duration,
     recover_interval: Duration,
@@ -79,11 +87,13 @@ pub struct Worker {
     checkpoint_interval: Duration,
 }
 
-/// When this worker last refreshed its heartbeat and last recovered jobs.
+/// When this worker last refreshed its heartbeat, recovered jobs, and
+/// promoted scheduled jobs.
 #[derive(Default)]
 struct Upkeep {
     beat: Option<Instant>,
     recovered: Option<Instant>,
+    promoted: Option<Instant>,
 }
 
 impl Worker {
@@ -98,21 +108,22 @@ impl Worker {
     /// build-time mistake, and a worker running either one would be wrong.
     pub fn new(queue: impl Into<Queue>) -> Self {
         let defaults = WorkerConfig::default();
-        let mut handlers = HashMap::new();
+        let mut jobs = HashMap::new();
         for def in inventory::iter::<JobDef> {
-            if handlers.insert(def.name, def.perform).is_some() {
+            if jobs.insert(def.name, *def).is_some() {
                 panic!("butler: two jobs are registered as `{}`", def.name);
             }
         }
         Self {
             queue: queue.into(),
-            handlers: Arc::new(handlers),
+            jobs: Arc::new(jobs),
             id: new_worker_id().into(),
             queues: defaults.priority(),
             limits: QueueLimits::default(),
             claimers: defaults.claimers,
             concurrency: defaults.concurrency,
             max_retries: defaults.max_retries,
+            backoff: defaults.backoff,
             poll_interval: defaults.poll_interval(),
             heartbeat_ttl: defaults.heartbeat_ttl(),
             recover_interval: defaults.recover_interval(),
@@ -132,6 +143,7 @@ impl Worker {
             .concurrency(config.concurrency)
             .claimers(config.claimers)
             .max_retries(config.max_retries)
+            .backoff(config.backoff)
             .poll_interval(config.poll_interval())
             .heartbeat_ttl(config.heartbeat_ttl())
             .checkpoint_interval(config.checkpoint_interval())
@@ -151,7 +163,7 @@ impl Worker {
     /// that builds the worker binary. For jobs in a library crate, call
     /// `.register(my_lib::my_job::JOB)`, or the linker may drop them.
     pub fn register(mut self, job: JobDef) -> Self {
-        Arc::make_mut(&mut self.handlers).insert(job.name, job.perform);
+        Arc::make_mut(&mut self.jobs).insert(job.name, job);
         self
     }
 
@@ -198,9 +210,28 @@ impl Worker {
         self
     }
 
+    /// How many times a failed job is retried, unless it sets its own with
+    /// `#[job(retries = N)]`. It runs at most `n + 1` times.
     pub fn max_retries(mut self, n: u32) -> Self {
         self.max_retries = n;
         self
+    }
+
+    /// How long a failed job waits before each retry, unless it sets its own
+    /// with `#[job(backoff = "...")]`. Defaults to [`Backoff::Exponential`];
+    /// [`Backoff::NONE`] retries at once.
+    pub fn backoff(mut self, backoff: Backoff) -> Self {
+        self.backoff = backoff;
+        self
+    }
+
+    /// The retry policy for job `name`: its own settings, or this worker's.
+    fn retry_policy(&self, name: &str) -> RetryPolicy {
+        let def = self.jobs.get(name);
+        RetryPolicy::new(
+            def.and_then(|def| def.retries).unwrap_or(self.max_retries),
+            def.and_then(|def| def.backoff).unwrap_or(self.backoff),
+        )
     }
 
     /// The longest an idle claim waits before checking the queues again. Redis
@@ -235,7 +266,7 @@ impl Worker {
     }
 
     pub fn job_names(&self) -> Vec<&'static str> {
-        let mut names: Vec<_> = self.handlers.keys().copied().collect();
+        let mut names: Vec<_> = self.jobs.keys().copied().collect();
         names.sort_unstable();
         names
     }
@@ -310,7 +341,8 @@ impl Worker {
     /// Runs jobs on the current thread until the queue is empty, and returns
     /// how many ran. This includes retries, so a job that always fails
     /// runs `max_retries + 1` times. Similar to `Sidekiq::Worker.drain_all`.
-    /// Recovers jobs from stopped workers first.
+    /// Recovers jobs from stopped workers first. Scheduled jobs run if they
+    /// are due; ones due later stay scheduled.
     pub fn drain(&self) -> Result<usize> {
         self.upkeep(true)?;
         let mut n = 0;
@@ -385,12 +417,13 @@ impl Worker {
         Ok(Claimed::Job(Box::new(job), permit))
     }
 
-    /// Refreshes the heartbeat and recovers stopped workers' jobs, each only
-    /// when due unless `force`. Timestamps move only after a success, so a
-    /// failed heartbeat is retried on the next call.
+    /// Refreshes the heartbeat, recovers stopped workers' jobs, and promotes
+    /// scheduled jobs that came due, each only when due unless `force`.
+    /// Timestamps move only after a success, so a failed heartbeat is retried
+    /// on the next call.
     fn upkeep(&self, force: bool) -> Result<()> {
         let now = Instant::now();
-        let (beat, recover) = {
+        let (beat, recover, promote) = {
             let last = self.upkeep.lock().unwrap_or_else(PoisonError::into_inner);
             let due = |at: Option<Instant>, every: Duration| {
                 force || at.is_none_or(|at| now.duration_since(at) >= every)
@@ -398,6 +431,7 @@ impl Worker {
             (
                 due(last.beat, self.heartbeat_ttl / 3),
                 due(last.recovered, self.recover_interval),
+                due(last.promoted, PROMOTE_INTERVAL),
             )
         };
         if beat {
@@ -420,6 +454,19 @@ impl Worker {
                 );
             }
         }
+        if promote {
+            let promoted = self.queue.promote(SystemTime::now())?;
+            self.upkeep
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .promoted = Some(now);
+            if promoted.moved > 0 {
+                tracing::debug!(
+                    moved = promoted.moved,
+                    "moved due scheduled jobs onto their queues"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -433,7 +480,7 @@ impl Worker {
 
     fn log_upkeep(&self, force: bool) {
         if let Err(err) = self.upkeep(force) {
-            tracing::error!(worker = %self.id, error = %Chain(&err), "heartbeat or recovery failed");
+            tracing::error!(worker = %self.id, error = %Chain(&err), "heartbeat, recovery or promotion failed");
         }
     }
 
@@ -444,9 +491,9 @@ impl Worker {
     }
 
     fn handler(&self, job: &Job<Processing>) -> Result<Handler, JobError> {
-        self.handlers
+        self.jobs
             .get(job.name())
-            .copied()
+            .map(|def| def.perform)
             .ok_or_else(|| JobError::UnknownJob {
                 name: job.name().to_owned(),
             })
@@ -480,9 +527,10 @@ impl Worker {
     }
 
     /// Stores the outcome: `done` with the job's output, back on its queue if
-    /// a checkpoint interrupted it, otherwise a retry or `dead`. A failed or
-    /// interrupted job keeps its latest progress, so the next run resumes
-    /// from there. The error's full cause chain becomes the job's `last_error`.
+    /// a checkpoint interrupted it, otherwise a retry (after the job's
+    /// backoff, or when its error asks) or `dead`. A failed or interrupted job
+    /// keeps its latest progress, so the next run resumes from there. The
+    /// error's full cause chain becomes the job's `last_error`.
     fn finish(
         &self,
         job: Job<Processing>,
@@ -518,12 +566,28 @@ impl Worker {
         }
         let error = Chain(&err).to_string();
         self.record(&metric(true));
-        match self.queue.fail(&self.id, job, error, self.max_retries)? {
+        let policy = self.retry_policy(&job_name);
+        match self
+            .queue
+            .fail_with(&self.id, job, error, err.retry(), policy)?
+        {
             Failed::Dead(job) => tracing::error!(
                 job = job.name(),
                 id = job.id(),
                 error = %Chain(&err),
                 "job failed and is dead"
+            ),
+            Failed::Scheduled(job) => tracing::warn!(
+                job = job.name(),
+                id = job.id(),
+                attempts = job.attempts(),
+                retry_in_ms = job
+                    .run_at()
+                    .duration_since(SystemTime::now())
+                    .unwrap_or_default()
+                    .as_millis(),
+                error = %Chain(&err),
+                "job failed and will retry later"
             ),
             Failed::Retry(job) => tracing::warn!(
                 job = job.name(),
@@ -649,7 +713,7 @@ impl Worker {
     }
 
     fn log_upkeep_error(&self, err: &crate::Error) {
-        tracing::error!(worker = %self.id, error = %Chain(err), "heartbeat or recovery failed");
+        tracing::error!(worker = %self.id, error = %Chain(err), "heartbeat, recovery or promotion failed");
     }
 
     async fn execute_async(&self, job: Job<Processing>) {

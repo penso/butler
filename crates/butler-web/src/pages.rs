@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AppState, WebError,
     events::{Snapshot, read_stats},
-    views::{self, JobRow, JobSummary, STATES, ago, duration, script_json, state_label, thousands},
+    views::{
+        self, JobRow, JobSummary, STATES, ago, duration, script_json, state_label, thousands, until,
+    },
 };
 
 const PAGE_SIZE: usize = 50;
@@ -45,6 +47,7 @@ struct DashboardPage {
     failed: String,
     running: String,
     pending: String,
+    scheduled: String,
     dead: String,
     workers: String,
     queues: Vec<QueueRow>,
@@ -67,6 +70,7 @@ pub(crate) async fn dashboard(
         failed: thousands(stats.failed_total),
         running: thousands(stats.processing),
         pending: thousands(stats.pending()),
+        scheduled: thousands(stats.scheduled),
         dead: thousands(stats.dead),
         workers: thousands(snapshot.workers_alive as u64),
         queues: stats
@@ -167,6 +171,11 @@ struct JobsPage {
     can_retry: bool,
     can_discard: bool,
     can_cancel: bool,
+    can_run_now: bool,
+    /// Scheduled jobs show when they run.
+    show_run_at: bool,
+    /// Dead jobs, and retries waiting their turn, show their last error.
+    show_error: bool,
 }
 
 #[derive(Deserialize)]
@@ -197,6 +206,7 @@ pub(crate) async fn jobs(
 
     let count = |job_state: JobState| match job_state {
         JobState::Pending => stats.pending(),
+        JobState::Scheduled => stats.scheduled,
         JobState::Processing => stats.processing,
         JobState::Done => stats.done,
         JobState::Dead => stats.dead,
@@ -240,7 +250,10 @@ pub(crate) async fn jobs(
         return_to: url(page),
         can_retry: job_state == JobState::Dead,
         can_discard: job_state.is_finished(),
-        can_cancel: job_state == JobState::Pending,
+        can_cancel: matches!(job_state, JobState::Pending | JobState::Scheduled),
+        can_run_now: job_state == JobState::Scheduled,
+        show_run_at: job_state == JobState::Scheduled,
+        show_error: matches!(job_state, JobState::Dead | JobState::Scheduled),
     };
     Ok(Html(page_view.render()?))
 }
@@ -258,6 +271,8 @@ struct JobPage {
     attempts: u32,
     enqueued_ms: u64,
     enqueued_ago: String,
+    /// For a scheduled job: when it runs, in ms and as "in 5m".
+    run_at: Option<(u64, String)>,
     args: String,
     last_error: Option<String>,
     result: Option<String>,
@@ -266,6 +281,7 @@ struct JobPage {
     can_retry: bool,
     can_discard: bool,
     can_cancel: bool,
+    can_run_now: bool,
 }
 
 fn pretty(value: &impl Serialize) -> String {
@@ -293,6 +309,10 @@ pub(crate) async fn job(
         attempts: record.attempts,
         enqueued_ms: record.enqueued_at_ms,
         enqueued_ago: ago(record.enqueued_at_ms),
+        run_at: record
+            .run_at_ms
+            .filter(|_| job_state == JobState::Scheduled)
+            .map(|ms| (ms, until(ms))),
         args: pretty(&record.args),
         last_error: record.last_error.clone(),
         result: record.result.as_ref().map(pretty),
@@ -300,7 +320,8 @@ pub(crate) async fn job(
         return_to: format!("{}/jobs/{}", state.base, record.id),
         can_retry: job_state == JobState::Dead,
         can_discard: job_state.is_finished(),
-        can_cancel: job_state == JobState::Pending,
+        can_cancel: matches!(job_state, JobState::Pending | JobState::Scheduled),
+        can_run_now: job_state == JobState::Scheduled,
     };
     Ok(Html(page.render()?))
 }

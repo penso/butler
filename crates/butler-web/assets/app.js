@@ -264,6 +264,9 @@
       document.querySelectorAll('[data-queue-pending="' + CSS.escape(entry[0]) + '"]').forEach(function (el) {
         el.textContent = formatCount(entry[1]);
       });
+      document.querySelectorAll('[data-queue-running="' + CSS.escape(entry[0]) + '"]').forEach(function (el) {
+        el.textContent = formatCount(entry[2] || 0);
+      });
     });
   }
 

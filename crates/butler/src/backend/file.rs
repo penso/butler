@@ -994,9 +994,9 @@ impl Monitor for FileQueue {
             stats.queues.push(QueueStats {
                 name: queue,
                 pending,
+                running: 0,
             });
         }
-        stats.queues.sort_by(|a, b| a.name.cmp(&b.name));
         stats.scheduled = self.job_files(&self.dir(JobState::Scheduled))?.len() as u64;
         stats.dead = self.job_files(&self.dir(JobState::Dead))?.len() as u64;
         stats.done = self.job_files(&self.dir(JobState::Done))?.len() as u64;
@@ -1025,8 +1025,31 @@ impl Monitor for FileQueue {
             );
         }
         for worker in self.subdirs(JobState::Processing)? {
-            let running = self.job_files(&self.processing(&worker))?.len() as u64;
+            let held = self.job_files(&self.processing(&worker))?;
+            let running = held.len() as u64;
             stats.processing += running;
+            // Per queue, from the jobs themselves: processing file names
+            // don't carry the queue. A worker holds few at a time.
+            for path in held {
+                let job: JobRecord = match fs::read(&path) {
+                    Ok(bytes) => serde_json::from_slice(&bytes)?,
+                    // Finished while we were counting.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                match stats
+                    .queues
+                    .iter_mut()
+                    .find(|queue| queue.name == job.queue)
+                {
+                    Some(queue) => queue.running += 1,
+                    None => stats.queues.push(QueueStats {
+                        name: job.queue,
+                        pending: 0,
+                        running: 1,
+                    }),
+                }
+            }
             workers
                 .entry(worker.clone())
                 .or_insert_with(|| WorkerStats {
@@ -1036,6 +1059,7 @@ impl Monitor for FileQueue {
                 })
                 .running = running;
         }
+        stats.queues.sort_by(|a, b| a.name.cmp(&b.name));
         stats.workers = workers.into_values().collect();
         Ok(stats)
     }

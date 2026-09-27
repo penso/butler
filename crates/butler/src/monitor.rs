@@ -37,7 +37,11 @@ impl Stats {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueStats {
     pub name: String,
+    /// Jobs waiting to be claimed, parked ones included.
     pub pending: u64,
+    /// Jobs of the queue that workers are running.
+    #[serde(default)]
+    pub running: u64,
 }
 
 /// A worker known to the backend: alive while its heartbeat hasn't expired.

@@ -8,8 +8,8 @@
 //! <prefix>:worker:<worker>       STRING  heartbeat; expires unless the worker refreshes it
 //! <prefix>:workers               SET   worker ids that may hold jobs
 //! <prefix>:dead                  LIST  ids that exhausted their retries, newest first
-//! <prefix>:job:<id>              HASH  { state, queue, data (job JSON), ckey, climit, ukey, umode,
-//!                                       finished_at (ms, once dead) }
+//! <prefix>:job:<id>              HASH  { state, queue, data (job JSON), worker, ckey, climit, ukey,
+//!                                       umode, finished_at (ms, once dead) }
 //! <prefix>:running:<key>         SET   ids running with that concurrency key (by its hash)
 //! <prefix>:blocked:<key>         LIST  ids skipped because their concurrency key was full
 //! <prefix>:blocked               HASH  per queue, how many of its ids wait in blocked lists
@@ -17,6 +17,7 @@
 //! <prefix>:unique:<key>          STRING  the id of the job holding that unique key (by its hash)
 //! <prefix>:paused                SET   queues workers don't claim from
 //! <prefix>:slots:<queue>         SET   ids running in one of the queue's global-limit slots
+//! <prefix>:active:<queue>        SET   ids of the queue running on any worker
 //! <prefix>:recurring             SET   keys of the recurring schedules workers registered
 //! <prefix>:recurring:<key>       HASH  { data (schedule JSON), created_at, seen_at, last_tick, last_job }
 //! <prefix>:recurring:tick:<key>:<ms>  STRING  the job enqueued for that tick; expires after a day
@@ -25,7 +26,12 @@
 //! A claim is one script per queue the worker serves, in its priority order:
 //! it pops the job's id from `queue:<q>`, pushes it on `processing:<worker>`
 //! and marks it processing, all at once, so only one worker gets each job,
-//! and the job never exists only in a worker's memory.
+//! and the job never exists only in a worker's memory. It also writes the
+//! worker's id into the job hash's `worker` field, which completing, failing
+//! and recovering the job remove: a checkpoint saves progress only while that
+//! field names the saving worker, one hash read however many jobs the worker
+//! holds. Jobs claimed by an older version have no `worker` field; their
+//! checkpoints search the processing list with `LPOS`, as that version did.
 //!
 //! Waiting is push-based. Every push, retry and recovery also `PUBLISH`es to
 //! `<prefix>:wake`; a listener thread per worker process turns those messages
@@ -60,6 +66,12 @@
 //! is cleared at claim (`until_started`), or when the job is done, dead or
 //! cancelled.
 //!
+//! Every claim adds the id to `active:<q>`, and completing, failing and
+//! recovering the job remove it, in the same step, so the dashboard counts
+//! running jobs per queue with one `SCARD` each. An older version's workers
+//! don't maintain the set; `recover` prunes ids whose jobs no longer run
+//! when the sets hold more ids than the processing lists.
+//!
 //! Under a global queue limit, the claim script first checks
 //! `SCARD slots:<q>`: at the limit it claims nothing, otherwise it adds the
 //! claimed id to the set. Completing or failing a job `SREM`s it, and so does
@@ -92,7 +104,7 @@ use redis::{Client, Connection, RedisResult};
 
 use super::{Cleaned, GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
 use crate::{
-    Error, JobId, JobRecord, JobState, RecurringRecord, Result, Retention, Signal,
+    Error, JobId, JobRecord, JobState, RecurringRecord, RedisConfig, Result, Retention, Signal,
     job::{from_millis, millis},
     monitor::{
         JobMetric, ListFilter, METRICS_RETENTION_MINUTES, MetricBucket, QueueStats, Stats,
@@ -157,13 +169,22 @@ if limit == 0 then more = 0 end
 return {deleted, more}
 ";
 
-/// Stores a job's data (KEYS[2]) only while the job's id is still in the
-/// worker's processing list (KEYS[1]).
+/// Stores a job's data (KEYS[2]) only while worker ARGV[3] holds it. The
+/// claim writes the holder into the job's `worker` field and completing,
+/// failing or recovering the job removes it, so the check is one hash read.
+/// A processing job without the field was claimed by a version that didn't
+/// write it: then the worker's processing list (KEYS[1]) is searched, as
+/// those versions did. ARGV[1] is the job's id, ARGV[2] its data.
 const CHECKPOINT_IF_HELD: &str = r"
-if redis.call('LPOS', KEYS[1], ARGV[1]) then
-  redis.call('HSET', KEYS[2], 'data', ARGV[2])
+local f = redis.call('HMGET', KEYS[2], 'state', 'worker')
+if f[1] ~= 'processing' then return 0 end
+if f[2] then
+  if f[2] ~= ARGV[3] then return 0 end
+elseif not redis.call('LPOS', KEYS[1], ARGV[1]) then
+  return 0
 end
-return 0
+redis.call('HSET', KEYS[2], 'data', ARGV[2])
+return 1
 ";
 
 /// Frees what job `id` holds as it leaves processing (Lua, used by the
@@ -210,17 +231,36 @@ local job = ARGV[1] .. 'job:' .. id
 local queue = redis.call('HGET', job, 'queue') or 'default'
 redis.call('RPUSH', ARGV[1] .. 'queue:' .. queue, id)
 redis.call('HSET', job, 'state', 'pending')
+redis.call('HDEL', job, 'worker')
 release(ARGV[1], id, false)
 redis.call('SREM', ARGV[1] .. 'slots:' .. queue, id)
+redis.call('SREM', ARGV[1] .. 'active:' .. queue, id)
 redis.call('PUBLISH', ARGV[1] .. 'wake', queue)
 return id
 ";
 
+/// Removes from a queue's set of running ids (KEYS[1]) each id of ARGV[2..]
+/// whose job isn't processing, checked per id so a job claimed meanwhile
+/// stays. ARGV[1] is the key prefix. Returns how many it removed.
+const PRUNE_ACTIVE: &str = r"
+local removed = 0
+for i = 2, #ARGV do
+  if redis.call('HGET', ARGV[1] .. 'job:' .. ARGV[i], 'state') ~= 'processing' then
+    removed = removed + redis.call('SREM', KEYS[1], ARGV[i])
+  end
+end
+return removed
+";
+
+/// How many ids one [`PRUNE_ACTIVE`] call checks.
+const PRUNE_BATCH: usize = 1_000;
+
 /// Claims the oldest job of a queue (KEYS[1]) that may start into a
-/// processing list (KEYS[2]), marked processing. ARGV[1] is the key prefix,
-/// ARGV[2] the queue's name. With a global limit ARGV[3] (`''` for none),
-/// claims nothing while the queue's slot set (KEYS[3]) holds that many ids,
-/// and adds the claimed id to it. Parks jobs whose concurrency key is full
+/// processing list (KEYS[2]), marked processing and held by worker ARGV[4].
+/// ARGV[1] is the key prefix, ARGV[2] the queue's name. With a global limit
+/// ARGV[3] (`''` for none), claims nothing while the queue's slot set
+/// (KEYS[3]) holds that many ids, and adds the claimed id to it. Adds it to
+/// the queue's set of running ids (KEYS[4]) too. Parks jobs whose concurrency key is full
 /// on that key's blocked list, and drops ids without job data. Returns
 /// `{1, id, data}`, `{0, '', ''}` when nothing may start, or `{2, '', ''}`
 /// after skipping many jobs, to be called again.
@@ -241,9 +281,10 @@ for _ = 1, 100 do
     redis.call('SADD', p .. 'blocked_keys', f[2])
   else
     redis.call('LPUSH', KEYS[2], id)
-    redis.call('HSET', job, 'state', 'processing')
+    redis.call('HSET', job, 'state', 'processing', 'worker', ARGV[4])
     if f[2] then redis.call('SADD', p .. 'running:' .. f[2], id) end
     if limit then redis.call('SADD', KEYS[3], id) end
+    redis.call('SADD', KEYS[4], id)
     if f[5] == 'until_started' and redis.call('GET', p .. 'unique:' .. f[4]) == id then
       redis.call('DEL', p .. 'unique:' .. f[4])
     end
@@ -379,9 +420,11 @@ return 1
 
 pub struct RedisQueue {
     client: Client,
-    /// Idle connections. A blocking claim holds one for up to its wait, so
-    /// calls check out their own instead of sharing a single connection.
+    /// Idle connections. Concurrent calls check out their own instead of
+    /// sharing a single connection; at most `max_idle` are kept afterwards,
+    /// so a burst of calls doesn't leave its connections open for good.
     idle: Mutex<Vec<Connection>>,
+    max_idle: usize,
     prefix: String,
     display: String,
     /// Notified from pub/sub messages; see [`Signals`].
@@ -464,6 +507,7 @@ impl RedisQueue {
         Ok(Self {
             client,
             idle: Mutex::new(vec![conn]),
+            max_idle: RedisConfig::DEFAULT_MAX_IDLE_CONNECTIONS,
             prefix: prefix.to_string(),
             display: format!("redis:{} (prefix {prefix})", redact(url)),
             signals: Arc::default(),
@@ -485,6 +529,22 @@ impl RedisQueue {
         self.retention.finished.duration().map_or(0, |keep| {
             keep.as_secs() + u64::from(keep.subsec_nanos() > 0)
         })
+    }
+
+    /// Keeps at most `max` idle connections for reuse ([`RedisConfig::DEFAULT_MAX_IDLE_CONNECTIONS`] by default). A
+    /// call that finds none idle opens one, and closes it afterwards if
+    /// `max` are already idle; `0` closes every connection after its call.
+    /// It doesn't limit how many calls run at once: size it to the calls a
+    /// process makes concurrently, about its worker's `concurrency` plus
+    /// `claimers`, to avoid reconnecting under steady load.
+    #[must_use]
+    pub fn max_idle_connections(mut self, max: usize) -> Self {
+        self.max_idle = max;
+        self.idle
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .truncate(max);
+        self
     }
 
     fn key(&self, name: &str) -> String {
@@ -538,6 +598,11 @@ impl RedisQueue {
         format!("{}:slots:{queue}", self.prefix)
     }
 
+    /// The ids of `queue` that workers are running.
+    fn active_key(&self, queue: &str) -> String {
+        format!("{}:active:{queue}", self.prefix)
+    }
+
     fn processing_key(&self, worker: &str) -> String {
         format!("{}:processing:{worker}", self.prefix)
     }
@@ -547,8 +612,9 @@ impl RedisQueue {
     }
 
     /// Runs `f` on an idle connection, or a new one. The connection goes back
-    /// to the pool afterwards unless it failed at the I/O level. The lock is
-    /// only held to take or return a connection, never during a command.
+    /// to the pool afterwards unless it failed at the I/O level or the pool
+    /// is full. The lock is only held to take or return a connection, never
+    /// during a command.
     fn with_conn<T>(&self, f: impl FnOnce(&mut Connection) -> RedisResult<T>) -> Result<T> {
         let idle = self
             .idle
@@ -563,10 +629,10 @@ impl RedisQueue {
         let broken = matches!(&result, Err(e)
             if e.is_io_error() || e.is_connection_dropped() || e.is_unrecoverable_error());
         if !broken {
-            self.idle
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(conn);
+            let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+            if idle.len() < self.max_idle {
+                idle.push(conn);
+            }
         }
         Ok(result?)
     }
@@ -587,10 +653,11 @@ impl RedisQueue {
                 let (status, _id, data): (u8, String, String) = self.with_conn(|con| {
                     redis::cmd("EVAL")
                         .arg(CLAIM)
-                        .arg(3)
+                        .arg(4)
                         .arg(self.queue_key(queue))
                         .arg(&processing)
                         .arg(self.slots_key(queue))
+                        .arg(self.active_key(queue))
                         .arg(format!("{}:", self.prefix))
                         .arg(*queue)
                         .arg(
@@ -598,6 +665,7 @@ impl RedisQueue {
                                 .map(|max| max.to_string())
                                 .unwrap_or_default(),
                         )
+                        .arg(worker)
                         .query(con)
                 })?;
                 match status {
@@ -609,6 +677,55 @@ impl RedisQueue {
             }
         }
         Ok(None)
+    }
+
+    /// Removes ids of jobs that stopped running from the queues' `active:`
+    /// sets. This version keeps them exact; an older one's workers don't
+    /// remove ids when they recover, complete or fail a job this version
+    /// claimed. Only when the sets hold more ids than the processing lists
+    /// together does it read the sets, so it costs two small reads otherwise.
+    fn prune_active(&self) -> Result<()> {
+        let queues: Vec<String> =
+            self.with_conn(|con| redis::cmd("SMEMBERS").arg(self.key("queues")).query(con))?;
+        let workers: Vec<String> =
+            self.with_conn(|con| redis::cmd("SMEMBERS").arg(self.key("workers")).query(con))?;
+        if queues.is_empty() {
+            return Ok(());
+        }
+        // One transaction, so a claim or a finish can't land between reads.
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        for queue in &queues {
+            pipe.cmd("SCARD").arg(self.active_key(queue));
+        }
+        for worker in &workers {
+            pipe.cmd("LLEN").arg(self.processing_key(worker));
+        }
+        let sizes: Vec<u64> = self.with_conn(|con| pipe.query(con))?;
+        let (active, held) = sizes.split_at(queues.len());
+        if active.iter().sum::<u64>() <= held.iter().sum::<u64>() {
+            return Ok(());
+        }
+        for queue in &queues {
+            let key = self.active_key(queue);
+            let ids: Vec<String> =
+                self.with_conn(|con| redis::cmd("SMEMBERS").arg(&key).query(con))?;
+            for chunk in ids.chunks(PRUNE_BATCH) {
+                let removed: u64 = self.with_conn(|con| {
+                    redis::cmd("EVAL")
+                        .arg(PRUNE_ACTIVE)
+                        .arg(1)
+                        .arg(&key)
+                        .arg(format!("{}:", self.prefix))
+                        .arg(chunk)
+                        .query(con)
+                })?;
+                if removed > 0 {
+                    tracing::debug!(queue, removed, "dropped finished jobs from running counts");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Starts, once per queue, the thread that turns pub/sub messages into
@@ -870,12 +987,20 @@ impl Store for RedisQueue {
             .arg(self.slots_key(&job.queue))
             .arg(&job.id)
             .ignore()
+            .cmd("SREM")
+            .arg(self.active_key(&job.queue))
+            .arg(&job.id)
+            .ignore()
             .cmd("HSET")
             .arg(self.job_key(&job.id))
             .arg("state")
             .arg(JobState::Done.as_str())
             .arg("data")
             .arg(&data)
+            .ignore()
+            .cmd("HDEL")
+            .arg(self.job_key(&job.id))
+            .arg("worker")
             .ignore();
         let ttl = self.finished_ttl_secs();
         if ttl > 0 {
@@ -921,12 +1046,20 @@ impl Store for RedisQueue {
             .arg(self.slots_key(&job.queue))
             .arg(&job.id)
             .ignore()
+            .cmd("SREM")
+            .arg(self.active_key(&job.queue))
+            .arg(&job.id)
+            .ignore()
             .cmd("HSET")
             .arg(self.job_key(&job.id))
             .arg("state")
             .arg(state.as_str())
             .arg("data")
             .arg(&data)
+            .ignore()
+            .cmd("HDEL")
+            .arg(self.job_key(&job.id))
+            .arg("worker")
             .ignore()
             .cmd("EVAL")
             .arg(with_release(RELEASE))
@@ -992,7 +1125,8 @@ impl Store for RedisQueue {
 
     /// Saves only if `worker` still holds the job, checked and written in one
     /// script: after a recovery, a slow former owner can't overwrite the
-    /// progress of the job's new run.
+    /// progress of the job's new run. The check reads the job's hash, so its
+    /// cost doesn't grow with the number of jobs the worker holds.
     fn checkpoint(&self, worker: &str, job: &JobRecord) -> Result<()> {
         let data = serde_json::to_string(job)?;
         self.with_conn(|con| {
@@ -1003,6 +1137,7 @@ impl Store for RedisQueue {
                 .arg(self.job_key(&job.id))
                 .arg(&job.id)
                 .arg(&data)
+                .arg(worker)
                 .exec(con)
         })
     }
@@ -1078,6 +1213,7 @@ impl Store for RedisQueue {
                     .exec(con)
             })?;
         }
+        self.prune_active()?;
         Ok(recovered)
     }
 
@@ -1188,6 +1324,7 @@ impl Monitor for RedisQueue {
             pipe.cmd("LLEN").arg(self.queue_key(queue));
             // Jobs parked because their concurrency key was full.
             pipe.cmd("HGET").arg(self.key("blocked")).arg(queue);
+            pipe.cmd("SCARD").arg(self.active_key(queue));
         }
         for worker in &workers {
             pipe.cmd("LLEN").arg(self.processing_key(worker));
@@ -1209,6 +1346,7 @@ impl Monitor for RedisQueue {
             .map(|name| QueueStats {
                 name,
                 pending: count(next()) + count(next()),
+                running: count(next()),
             })
             .collect();
         queue_stats.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1636,6 +1774,64 @@ fn redact(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::sync::{Arc, Barrier, PoisonError};
+
+    use super::RedisQueue;
+
+    fn idle(queue: &RedisQueue) -> usize {
+        queue
+            .idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Needs a Redis server, like the integration tests; skipped without one.
+    #[test]
+    fn keeps_at_most_max_idle_connections() {
+        let url = std::env::var("BUTLER_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379/".into());
+        let prefix = format!("butler-pool-{}", std::process::id());
+        let queue = match RedisQueue::connect(&url, &prefix) {
+            Ok(queue) => Arc::new(queue.max_idle_connections(3)),
+            Err(e) => {
+                eprintln!("skipping redis: {e}");
+                return;
+            }
+        };
+        // Eight calls at once, each on its own connection.
+        let calls = 8;
+        let barrier = Arc::new(Barrier::new(calls));
+        let threads: Vec<_> = (0..calls)
+            .map(|_| {
+                let (queue, barrier) = (Arc::clone(&queue), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    queue
+                        .with_conn(|con| {
+                            barrier.wait();
+                            redis::cmd("PING").query::<String>(con)
+                        })
+                        .unwrap()
+                })
+            })
+            .collect();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap(), "PONG");
+        }
+        assert_eq!(idle(&queue), 3);
+
+        let queue = RedisQueue::connect(&url, &prefix)
+            .unwrap()
+            .max_idle_connections(0);
+        assert_eq!(idle(&queue), 0, "the connect-time connection is dropped");
+        queue
+            .with_conn(|con| redis::cmd("PING").query::<String>(con))
+            .unwrap();
+        assert_eq!(idle(&queue), 0);
+    }
+
     #[test]
     fn redacts_credentials() {
         assert_eq!(

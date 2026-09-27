@@ -960,7 +960,8 @@ const COUNTS: &str = "SELECT queue, state, n FROM butler_job_counts WHERE n > 0"
 /// (rows of queue, state, count): [`COUNTS`], or in tests a scan of the jobs.
 fn stats_with(conn: &Connection, by_state: &str) -> rusqlite::Result<Stats> {
     let mut stats = Stats::default();
-    let mut queues: BTreeMap<String, u64> = BTreeMap::new();
+    // Per queue: pending, running.
+    let mut queues: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let mut by_state = conn.prepare(by_state)?;
     let rows = by_state.query_map([], |row| {
         Ok((
@@ -971,11 +972,14 @@ fn stats_with(conn: &Connection, by_state: &str) -> rusqlite::Result<Stats> {
     })?;
     for row in rows {
         let (queue, state, count) = row?;
-        let pending = queues.entry(queue).or_default();
+        let counts = queues.entry(queue).or_default();
         match JobState::parse(&state) {
-            Some(JobState::Pending) => *pending += count,
+            Some(JobState::Pending) => counts.0 += count,
             Some(JobState::Scheduled) => stats.scheduled += count,
-            Some(JobState::Processing) => stats.processing += count,
+            Some(JobState::Processing) => {
+                stats.processing += count;
+                counts.1 += count;
+            }
             Some(JobState::Done) => stats.done += count,
             Some(JobState::Dead) => stats.dead += count,
             Some(JobState::Cancelled) => stats.cancelled += count,
@@ -984,7 +988,11 @@ fn stats_with(conn: &Connection, by_state: &str) -> rusqlite::Result<Stats> {
     }
     stats.queues = queues
         .into_iter()
-        .map(|(name, pending)| QueueStats { name, pending })
+        .map(|(name, (pending, running))| QueueStats {
+            name,
+            pending,
+            running,
+        })
         .collect();
 
     let mut counters = conn.prepare("SELECT name, value FROM butler_counters")?;

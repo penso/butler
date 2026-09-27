@@ -13,6 +13,7 @@
 //! [queue.redis]
 //! url = "redis://127.0.0.1:6379/"
 //! prefix = "butler"
+//! max_idle_connections = 32   # idle connections kept for reuse, per process
 //!
 //! [worker]
 //! concurrency = 4
@@ -206,6 +207,15 @@ pub struct RedisConfig {
     pub url: String,
     /// Namespace for all keys, so several apps can share one Redis.
     pub prefix: String,
+    /// How many idle connections each process keeps for reuse. Not a limit
+    /// on connections in use: see
+    /// [`RedisQueue::max_idle_connections`](crate::RedisQueue::max_idle_connections).
+    pub max_idle_connections: usize,
+}
+
+impl RedisConfig {
+    /// The default of [`max_idle_connections`](Self::max_idle_connections).
+    pub const DEFAULT_MAX_IDLE_CONNECTIONS: usize = 32;
 }
 
 impl Default for RedisConfig {
@@ -213,6 +223,7 @@ impl Default for RedisConfig {
         Self {
             url: "redis://127.0.0.1:6379/".into(),
             prefix: "butler".into(),
+            max_idle_connections: Self::DEFAULT_MAX_IDLE_CONNECTIONS,
         }
     }
 }
@@ -414,6 +425,7 @@ impl Config {
             BackendKind::Redis => {
                 let redis = &self.queue.redis;
                 Ok(crate::RedisQueue::connect(&redis.url, &redis.prefix)?
+                    .max_idle_connections(redis.max_idle_connections)
                     .retention(retention)
                     .into())
             }
@@ -443,6 +455,10 @@ mod tests {
         assert_eq!(config.queue.backend, BackendKind::Redis);
         assert_eq!(config.queue.redis.url, "redis://example:6380/");
         assert_eq!(config.queue.redis.prefix, "butler");
+        assert_eq!(
+            config.queue.redis.max_idle_connections,
+            RedisConfig::DEFAULT_MAX_IDLE_CONNECTIONS
+        );
         assert_eq!(config.queue.file.dir, PathBuf::from(".butler"));
         assert_eq!(config.worker.concurrency, 8);
         assert_eq!(config.worker.max_retries, 3);
@@ -630,6 +646,13 @@ mod tests {
             matches!(duplicate, Error::DuplicateRecurring { .. }),
             "{duplicate:?}"
         );
+    }
+
+    #[test]
+    fn redis_idle_connections_load_from_the_file() {
+        let config = load("[queue.redis]\nmax_idle_connections = 4\n").unwrap();
+        assert_eq!(config.queue.redis.max_idle_connections, 4);
+        assert!(load("[queue.redis]\nmax_idle_connections = -1\n").is_err());
     }
 
     #[test]

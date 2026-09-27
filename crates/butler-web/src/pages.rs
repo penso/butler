@@ -35,6 +35,7 @@ async fn blocking<T: Send + 'static>(
 pub(crate) struct QueueRow {
     pub name: String,
     pub pending: String,
+    pub running: String,
     /// Workers don't claim its jobs until it is resumed.
     pub paused: bool,
 }
@@ -67,10 +68,10 @@ pub(crate) async fn dashboard(
     let paused = blocking(&state.queue, Queue::paused_queues).await?;
     let snapshot = Snapshot::from_stats(&stats);
     // Every queue with jobs, and the paused ones even without.
-    let mut queues: BTreeMap<&str, u64> = stats
+    let mut queues: BTreeMap<&str, (u64, u64)> = stats
         .queues
         .iter()
-        .map(|queue| (queue.name.as_str(), queue.pending))
+        .map(|queue| (queue.name.as_str(), (queue.pending, queue.running)))
         .collect();
     for queue in &paused {
         queues.entry(queue).or_default();
@@ -88,9 +89,10 @@ pub(crate) async fn dashboard(
         workers: thousands(snapshot.workers_alive as u64),
         queues: queues
             .into_iter()
-            .map(|(name, pending)| QueueRow {
+            .map(|(name, (pending, running))| QueueRow {
                 name: name.to_owned(),
                 pending: thousands(pending),
+                running: thousands(running),
                 paused: paused.iter().any(|queue| queue == name),
             })
             .collect(),

@@ -224,7 +224,8 @@ each. See [Concurrency and cores](#concurrency-and-cores) for tuning.
 ## Web dashboard
 
 `butler-web` shows live counts streamed over server-sent events, throughput and
-duration charts, queues, workers, and job details. Retry or discard failed
+duration charts, queues with their pending and running jobs, workers, and job
+details. Retry or discard failed
 jobs, cancel pending work, run scheduled jobs now, pause and resume queues,
 see each recurring schedule's next and last run, and inspect arguments,
 results, errors, and saved progress from one place.
@@ -1356,6 +1357,7 @@ path = "butler.db"           # shared by every process that opens it
 [queue.redis]
 url = "redis://127.0.0.1:6379/"
 prefix = "butler"            # key namespace
+max_idle_connections = 32    # idle connections each process keeps for reuse
 
 [worker]
 concurrency = 4              # jobs running at once
@@ -1501,7 +1503,7 @@ clones share the scan cursor; a completed sweep starts over on the next call.
 | `butler:dead` | LIST | ids that exhausted their retries, newest first; cleaned up after `keep_dead` |
 | `butler:wake` | pub/sub channel | a message per push, retry and recovery; wakes idle workers |
 | `butler:done` | pub/sub channel | a message per job done, dead or cancelled; wakes `wait_result` |
-| `butler:job:<id>` | HASH | `state`, `queue`, and `data` (job JSON), plus `ckey`/`climit` and `ukey`/`umode` for keyed and unique jobs, and `finished_at` once dead; done and cancelled jobs expire after `keep_finished` |
+| `butler:job:<id>` | HASH | `state`, `queue`, and `data` (job JSON); `worker`, the holder, while it runs; plus `ckey`/`climit` and `ukey`/`umode` for keyed and unique jobs, and `finished_at` once dead; done and cancelled jobs expire after `keep_finished` |
 | `butler:running:<key>` | SET | ids running with a concurrency key (by the key's hash) |
 | `butler:blocked:<key>` | LIST | ids skipped because their concurrency key was full |
 | `butler:blocked` | HASH | per queue, how many of its ids wait in blocked lists |
@@ -1509,6 +1511,7 @@ clones share the scan cursor; a completed sweep starts over on the next call.
 | `butler:unique:<key>` | STRING | the id of the job holding a unique key (by the key's hash) |
 | `butler:paused` | SET | paused queues, which workers leave out of their claims |
 | `butler:slots:<queue>` | SET | ids running in one of the queue's global-limit slots |
+| `butler:active:<queue>` | SET | ids of the queue that workers are running, for per-queue running counts |
 | `butler:recurring` | SET | keys of the recurring schedules workers registered |
 | `butler:recurring:<key>` | HASH | `data` (schedule JSON), `created_at`, `seen_at`, `last_tick`, `last_job` |
 | `butler:recurring:tick:<key>:<ms>` | STRING | the job enqueued for that tick; expires after 24h |
@@ -1522,6 +1525,15 @@ that key completes, fails or is recovered, the oldest parked job goes back
 to the claim end of its queue, in the same step. Parked jobs stay pending:
 they are counted, listed and cancellable. A unique job is pushed by a script
 that checks `unique:<key>` and the job it names first.
+
+The claim also writes the worker's id into the job hash's `worker` field,
+which completing, failing and recovering the job remove. A checkpoint is a
+script that saves the job's progress only while that field names the saving
+worker: one hash read, however many jobs the worker holds, so a worker whose
+heartbeat lapsed can't overwrite the progress of the job's next run. The
+claim adds the id to `active:<queue>` too, and completing, failing and
+recovering the job remove it in the same step, so `stats()` counts each
+queue's running jobs with one `SCARD`.
 
 **Idle workers are woken by pub/sub, not polling.** Every push, retry and
 recovery also `PUBLISH`es to `butler:wake`. Each worker process keeps one
@@ -1543,7 +1555,12 @@ script too: `SET recurring:tick:<key>:<ms> NX`, and the job's push only if
 that succeeded. Under a global queue limit, the claim script first checks
 `SCARD slots:<queue>`, claims nothing at the limit, and adds the claimed id
 to the set; completing, failing and recovering a job `SREM` it. Calls use a
-small connection pool, so concurrent claims don't wait on each other.
+connection pool, so concurrent claims don't wait on each other. It keeps up
+to `max_idle_connections` (32 by default) idle connections per process for
+reuse; beyond that, a call that needs one opens it and closes it afterwards,
+so a burst doesn't leave connections open for good. Set it to about a
+worker's `concurrency` plus `claimers` to avoid reconnecting under steady
+load, or with `RedisQueue::max_idle_connections`.
 
 The job's return value goes into the job hash's `data`, next to its arguments.
 
@@ -1689,6 +1706,26 @@ backend. Workers without `[[recurring]]` entries never touch them. Only
 workers running this version enqueue recurring jobs; while older workers run
 next to them, they simply don't take part. A dashboard of an older version
 lacks the Recurring page but works otherwise.
+
+**Upgrading to hash-checked Redis checkpoints.** Nothing to migrate: jobs
+claimed by an older version have no `worker` field, and their checkpoints
+search the worker's processing list with `LPOS`, as before, until they finish.
+While versions are mixed, an older process that recovers a newer worker's job
+leaves its `worker` field behind. If an older worker then claims the job too,
+and the first worker is in fact still running (its heartbeat lapsed, it didn't
+crash), the first worker's checkpoints can overwrite the new run's progress
+until the new run saves over them. Claims by this version rewrite the field,
+so the window closes once every worker runs it.
+
+**Upgrading to per-queue running counts.** `QueueStats` gains `running`, and
+the dashboard's Queues table a Running column. SQLite, file and memory
+derive it from what they already store. Redis adds `active:<queue>` sets,
+which only this version maintains: jobs claimed before the upgrade aren't
+counted until they finish, and jobs an older process claims or recovers
+while versions are mixed can leave the count too low or too high. Each
+`recover` (every `recover_interval_secs`) compares the sets with the
+processing lists and, when the sets hold more, drops ids whose jobs are no
+longer processing, so counts settle once every worker runs this version.
 
 ## Limitations
 

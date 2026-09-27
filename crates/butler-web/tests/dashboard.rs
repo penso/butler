@@ -275,6 +275,21 @@ async fn json_endpoints_assets_and_the_live_stream() {
         assert!(!body.is_empty(), "{asset}");
     }
 
+    // A job running on mailers, which has none pending.
+    f.queue
+        .push("send_email", "mailers", vec![json!("bob@example.com")])
+        .unwrap();
+    f.queue
+        .claim("w1", &["mailers"], Duration::ZERO)
+        .unwrap()
+        .unwrap();
+    let (_, html) = get(&f.app, "/").await;
+    assert!(
+        html.contains(r#"data-queue-running="mailers">1<"#),
+        "{html}"
+    );
+    assert!(html.contains(r#"data-queue-running="default">0<"#));
+
     let response = f
         .app
         .clone()
@@ -305,7 +320,10 @@ async fn json_endpoints_assets_and_the_live_stream() {
     .await
     .expect("a live snapshot");
     assert_eq!(snapshot["dead"], json!(1));
-    assert_eq!(snapshot["queues"], json!([["default", 1], ["mailers", 0]]));
+    assert_eq!(
+        snapshot["queues"],
+        json!([["default", 1, 0], ["mailers", 0, 1]])
+    );
 }
 
 #[tokio::test]

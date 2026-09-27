@@ -134,9 +134,74 @@ where
 /// A job that a worker can run: its name, the queue it goes on, its retry
 /// settings, and the function that decodes the arguments and runs the body.
 /// `#[job] fn foo` generates it as `foo::JOB`.
+///
+/// Its name is stored with every queued job, so renaming the function would
+/// strand the jobs already waiting. Pin the name, and list earlier ones as
+/// aliases when it has to change:
+///
+/// ```
+/// #[butler::job(name = "billing.charge_v2", aliases = ["charge", "billing.charge"])]
+/// async fn charge(cents: i64) {}
+/// # fn main() {}
+/// ```
+///
+/// An empty name or alias doesn't compile,
+///
+/// ```compile_fail
+/// #[butler::job(name = "")]
+/// async fn charge(cents: i64) {}
+/// # fn main() {}
+/// ```
+///
+/// ```compile_fail
+/// #[butler::job(aliases = [""])]
+/// async fn charge(cents: i64) {}
+/// # fn main() {}
+/// ```
+///
+/// nor does an alias that repeats the job's name or another alias,
+///
+/// ```compile_fail
+/// #[butler::job(name = "billing.charge", aliases = ["billing.charge"])]
+/// async fn charge(cents: i64) {}
+/// # fn main() {}
+/// ```
+///
+/// ```compile_fail
+/// #[butler::job(aliases = ["charge_v1"])]
+/// async fn charge(cents: i64) {}
+/// #[butler::job(aliases = ["old", "old"])]
+/// async fn refund(cents: i64) {}
+/// # fn main() {}
+/// ```
+///
+/// ```compile_fail
+/// // The default name is the function's.
+/// #[butler::job(aliases = ["charge"])]
+/// async fn charge(cents: i64) {}
+/// # fn main() {}
+/// ```
+///
+/// or one that isn't a string literal:
+///
+/// ```compile_fail
+/// const OLD: &str = "charge_v1";
+/// #[butler::job(aliases = [OLD])]
+/// async fn charge(cents: i64) {}
+/// # fn main() {}
+/// ```
+///
+/// Two jobs of one worker answering to the same name, as a name or an alias,
+/// are refused when the worker is built ([`Worker::new`] and
+/// [`Worker::register`] panic).
 #[derive(Clone, Copy)]
 pub struct JobDef {
+    /// What the job is stored and looked up as: `#[job(name = "...")]`, or
+    /// the function's name. Jobs are enqueued under this name.
     pub name: &'static str,
+    /// Names it had before, set with `#[job(aliases = ["old_name"])]`: jobs
+    /// already queued under them still run it. See [`JobDef::check_names`].
+    pub aliases: &'static [&'static str],
     /// Set with `#[job(queue = "...")]`; [`DEFAULT_QUEUE`] otherwise.
     pub queue: &'static str,
     /// Set with `#[job(retries = N)]`; the worker's `max_retries` otherwise.
@@ -152,6 +217,38 @@ pub struct JobDef {
     pub unique: Option<Unique>,
     #[doc(hidden)]
     pub perform: fn(progress::Invocation) -> __private::BoxFuture,
+}
+
+impl JobDef {
+    /// Every name a worker runs this job under: its name, then its aliases.
+    pub fn names(&self) -> impl Iterator<Item = &'static str> {
+        std::iter::once(self.name).chain(self.aliases.iter().copied())
+    }
+
+    /// Checks the job's own names: none is empty, and no alias repeats its
+    /// name or another alias. `#[job]` applies the same rule at compile time;
+    /// a [`Worker`] also checks that no two jobs share a name or alias.
+    pub fn check_names(&self) -> Result<()> {
+        for (i, name) in self.names().enumerate() {
+            let reason = if name.is_empty() {
+                "job names and aliases can't be empty"
+            } else if self.names().take(i).any(|earlier| earlier == name) {
+                if i > 0 && name == self.name {
+                    "an alias repeats the job's name"
+                } else {
+                    "an alias is listed twice"
+                }
+            } else {
+                continue;
+            };
+            return Err(Error::InvalidJobName {
+                job: self.name.to_owned(),
+                name: name.to_owned(),
+                reason,
+            });
+        }
+        Ok(())
+    }
 }
 
 static QUEUE: RwLock<Option<Queue>> = RwLock::new(None);

@@ -18,8 +18,14 @@
 //! - a registration entry so any `Worker` in the same binary can dispatch it by name.
 //!
 //! Attributes: `#[job(name = "billing.charge")]` sets the name workers look the
-//! job up by (default: the function name), `#[job(queue = "mailers")]` the
-//! queue it is enqueued on (default: `"default"`), and
+//! job up by (default: the function name). That name is stored with every
+//! queued job, so give jobs a stable `name` before their functions get renamed;
+//! `#[job(aliases = ["old_name"])]` keeps running jobs queued under earlier
+//! names after a rename. Names and aliases can't be empty or repeat one another
+//! (checked here; the worker also rejects two jobs sharing one).
+//!
+//! `#[job(queue = "mailers")]` sets the queue it is enqueued on (default:
+//! `"default"`), and
 //! `#[job(retries = 10, backoff = "exponential")]` how often and how late it is
 //! retried (default: the worker's settings; backoff is `"exponential"`,
 //! `"polynomial"` or `"fixed:30s"`). If the job's error type implements
@@ -60,6 +66,8 @@ use syn::{
 #[derive(Default)]
 struct Attrs {
     name: Option<LitStr>,
+    /// Earlier names that still run this job.
+    aliases: Vec<LitStr>,
     queue: Option<LitStr>,
     retries: Option<LitInt>,
     backoff: Option<proc_macro2::TokenStream>,
@@ -77,7 +85,28 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut attrs = Attrs::default();
     let parser = syn::meta::parser(|meta| {
         if meta.path.is_ident("name") {
-            attrs.name = Some(meta.value()?.parse()?);
+            let value: LitStr = meta.value()?.parse()?;
+            if value.value().is_empty() {
+                return Err(syn::Error::new(value.span(), "job names can't be empty"));
+            }
+            attrs.name = Some(value);
+            Ok(())
+        } else if meta.path.is_ident("aliases") {
+            let list: syn::ExprArray = meta.value()?.parse()?;
+            for element in list.elems {
+                match element {
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(alias),
+                        ..
+                    }) => attrs.aliases.push(alias),
+                    other => {
+                        return Err(syn::Error::new(
+                            other.span(),
+                            "aliases are string literals, like aliases = [\"old_name\"]",
+                        ));
+                    }
+                }
+            }
             Ok(())
         } else if meta.path.is_ident("retries") {
             let value: LitInt = meta.value()?.parse()?;
@@ -133,8 +162,8 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
             Ok(())
         } else {
             Err(meta.error(
-                "unsupported job attribute, expected `name`, `queue`, `retries`, `backoff`, \
-                 `max_resumptions`, `concurrency_key`, `limit` or `unique`",
+                "unsupported job attribute, expected `name`, `aliases`, `queue`, `retries`, \
+                 `backoff`, `max_resumptions`, `concurrency_key`, `limit` or `unique`",
             ))
         }
     });
@@ -151,6 +180,25 @@ fn is_progress(ty: &Type) -> bool {
     matches!(ty, Type::Path(path)
         if path.qself.is_none()
             && path.path.segments.last().is_some_and(|segment| segment.ident == "Progress"))
+}
+
+/// Same rule as `butler::JobDef::check_names`, checked at compile time: no
+/// alias is empty, repeats the job's name, or repeats another alias.
+fn check_aliases(name: &str, aliases: &[LitStr]) -> syn::Result<()> {
+    for (i, alias) in aliases.iter().enumerate() {
+        let value = alias.value();
+        let reason = if value.is_empty() {
+            "job names and aliases can't be empty"
+        } else if value == name {
+            "an alias repeats the job's name"
+        } else if aliases[..i].iter().any(|earlier| earlier.value() == value) {
+            "an alias is listed twice"
+        } else {
+            continue;
+        };
+        return Err(syn::Error::new(alias.span(), reason));
+    }
+    Ok(())
 }
 
 /// Same rule as `butler::is_valid_queue_name`, checked at compile time.
@@ -243,6 +291,7 @@ fn backoff(value: &str) -> Option<proc_macro2::TokenStream> {
 fn expand(func: ItemFn, attrs: Attrs) -> syn::Result<proc_macro2::TokenStream> {
     let Attrs {
         name: job_name,
+        aliases,
         queue,
         retries,
         backoff,
@@ -322,6 +371,7 @@ fn expand(func: ItemFn, attrs: Attrs) -> syn::Result<proc_macro2::TokenStream> {
     let attrs = &func.attrs;
     let name = &sig.ident;
     let job_name = job_name.unwrap_or_else(|| LitStr::new(&name.to_string(), name.span()));
+    check_aliases(&job_name.value(), &aliases)?;
     let queue = match queue {
         Some(queue) => quote!(#queue),
         None => quote!(::butler::DEFAULT_QUEUE),
@@ -427,6 +477,7 @@ fn expand(func: ItemFn, attrs: Attrs) -> syn::Result<proc_macro2::TokenStream> {
             pub const JOB: ::butler::JobDef =
                 ::butler::JobDef {
                     name: #job_name,
+                    aliases: &[#(#aliases),*],
                     queue: #queue,
                     retries: #retries,
                     backoff: #backoff,

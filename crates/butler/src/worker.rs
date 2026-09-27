@@ -156,14 +156,15 @@ impl Worker {
 
     /// # Panics
     ///
-    /// If two `#[job]` functions in this binary share a name. That is a
-    /// build-time mistake, and a worker running either one would be wrong.
+    /// If two `#[job]` functions in this binary share a name or an alias
+    /// (`#[job(aliases = [...])]`). That is a build-time mistake, and a worker
+    /// running either one would be wrong.
     pub fn new(queue: impl Into<Queue>) -> Self {
         let defaults = WorkerConfig::default();
         let mut jobs = HashMap::new();
         for def in inventory::iter::<JobDef> {
-            if jobs.insert(def.name, *def).is_some() {
-                panic!("butler: two jobs are registered as `{}`", def.name);
+            if let Err(err) = add_job(&mut jobs, *def, false) {
+                panic!("butler: {err}");
             }
         }
         Self {
@@ -230,8 +231,17 @@ impl Worker {
     /// Adds a job explicitly. Automatic registration covers jobs in the crate
     /// that builds the worker binary. For jobs in a library crate, call
     /// `.register(my_lib::my_job::JOB)`, or the linker may drop them.
+    /// Registering a job this worker already has replaces it, aliases
+    /// included.
+    ///
+    /// # Panics
+    ///
+    /// If `job`'s names are invalid ([`JobDef::check_names`]), or one of its
+    /// name and aliases is another job's name or alias.
     pub fn register(mut self, job: JobDef) -> Self {
-        Arc::make_mut(&mut self.jobs).insert(job.name, job);
+        if let Err(err) = add_job(Arc::make_mut(&mut self.jobs), job, true) {
+            panic!("butler: {err}");
+        }
         self
     }
 
@@ -520,8 +530,14 @@ impl Worker {
         self
     }
 
+    /// The jobs this worker runs, by name (not their aliases), sorted.
     pub fn job_names(&self) -> Vec<&'static str> {
-        let mut names: Vec<_> = self.jobs.keys().copied().collect();
+        let mut names: Vec<_> = self
+            .jobs
+            .iter()
+            .filter(|(name, def)| **name == def.name)
+            .map(|(name, _)| *name)
+            .collect();
         names.sort_unstable();
         names
     }
@@ -1303,6 +1319,28 @@ impl Drop for Ended {
         // The receiver is gone only if `run_until` gave up on this thread.
         let _ = self.0.send(());
     }
+}
+
+/// Adds `def` to `jobs` under its name and each alias, which all look up the
+/// same `JobDef`. A name or alias already taken by another job is an error,
+/// and so is the same job twice unless `replace` (explicit registration, which
+/// may repeat what inventory found). Nothing changes on error.
+fn add_job(jobs: &mut HashMap<&'static str, JobDef>, def: JobDef, replace: bool) -> Result<()> {
+    def.check_names()?;
+    for name in def.names() {
+        if let Some(existing) = jobs.get(name)
+            && (existing.name != def.name || !replace)
+        {
+            return Err(Error::JobNameTaken {
+                name: name.to_owned(),
+                job: def.name.to_owned(),
+                other: existing.name.to_owned(),
+            });
+        }
+    }
+    jobs.retain(|_, existing| existing.name != def.name);
+    jobs.extend(def.names().map(|name| (name, def)));
+    Ok(())
 }
 
 /// Unique per worker, across threads and processes on one machine and, with

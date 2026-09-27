@@ -896,9 +896,10 @@ are remembered on their own). Retention is at least a minute, so a
 Redis gives done and cancelled jobs a TTL of `keep_finished` when they
 finish, so changing it applies to jobs finishing afterwards. SQLite indexes
 finish times, and keeps its most recently finished job as the numbering
-point for cross-process wake-ups. Databases and dead Redis jobs from before
-this setting existed count their finished jobs from the first time a new
-version sees them. In code, pass a `butler::Retention` to the backend's
+point for cross-process wake-ups. Existing SQLite jobs count from the database
+upgrade. Dead Redis jobs without finish times share the time cleanup first
+encounters a legacy job, so the entire backlog gets one grace period.
+In code, pass a `butler::Retention` to the backend's
 `retention` method: `SqliteQueue::open(path)?.retention(retention)`.
 
 ### Running a worker
@@ -1450,9 +1451,12 @@ exists, so exactly one worker creates it and enqueues the job. The job file is
 written under `tmp/` first and renamed into its queue after the link; a crash
 between the two loses that one tick.
 
-A finished job's file is written when it finishes (touched, for a cancelled
-one), so cleaning up deletes files in `done/`, `cancelled/` and `dead/` whose
-modification time is older than their retention.
+A finished job's file is written when it finishes (touched before the rename,
+for a cancelled one), so cleaning up deletes files in `done/`, `cancelled/`
+and `dead/` whose modification time is older than their retention. Each call
+examines at most 1,000 directory entries and resumes its scan on the next
+call, including when a batch finds no expired jobs. Queue clones share the
+scan cursor; a completed sweep starts over on the next call.
 
 ### Redis
 

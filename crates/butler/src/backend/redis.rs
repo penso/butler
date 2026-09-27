@@ -74,8 +74,8 @@
 //! expires them itself. Dead jobs record when they died; cleaning up pops
 //! the oldest ids off the end of `dead` while they are older than `dead`,
 //! and deletes their jobs, in one script per batch. Dead jobs from before
-//! retention have no `finished_at`: cleaning up sets it to the time it
-//! first sees them.
+//! retention have no `finished_at`: they share the time cleanup first
+//! encountered a legacy job, so a backlog waits only one retention period.
 //!
 //! We use lists instead of `PUBLISH`/`SUBSCRIBE` because pub/sub delivers each
 //! message to every subscriber, and messages sent while no worker is connected
@@ -128,19 +128,21 @@ const FIELD_SEP: char = '\u{1f}';
 /// Deletes up to ARGV[3] dead jobs that died before ARGV[2] (ms), oldest
 /// first, from the end of the dead list (KEYS[1]). ARGV[1] is the key prefix,
 /// ARGV[4] the current time (ms): a dead job without `finished_at` (from
-/// before retention) gets it, and counts from then. Ids whose job is gone
+/// before retention) gets the shared migration time. Ids whose job is gone
 /// are dropped. Returns how many jobs it deleted.
 const CLEAN_DEAD: &str = r"
 local p, cutoff, limit = ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3])
 local deleted = 0
-while deleted < limit do
+for _ = 1, limit do
   local id = redis.call('LINDEX', KEYS[1], -1)
   if not id then break end
   local job = p .. 'job:' .. id
   local f = redis.call('HMGET', job, 'state', 'finished_at')
   if f[1] == 'dead' and not f[2] then
-    redis.call('HSET', job, 'finished_at', ARGV[4])
-    break
+    local migration = p .. 'dead:legacy_finished_at'
+    redis.call('SET', migration, ARGV[4], 'NX')
+    f[2] = redis.call('GET', migration)
+    redis.call('HSET', job, 'finished_at', f[2])
   end
   if f[1] == 'dead' and tonumber(f[2]) >= cutoff then break end
   redis.call('RPOP', KEYS[1])

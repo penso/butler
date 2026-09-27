@@ -172,7 +172,9 @@ pub trait Store: Send + Sync + 'static {
     /// touched, and neither is anything a live job relies on: unique keys,
     /// concurrency and limit slots are held by jobs that haven't finished,
     /// and recurring ticks are kept on their own. Workers call it
-    /// periodically. A backend may expire finished jobs on its own instead
+    /// periodically. A call may stop at its scan budget before filling the
+    /// deletion limit; a short batch does not guarantee the backlog is empty.
+    /// A backend may expire finished jobs on its own instead
     /// (Redis expires done and cancelled jobs), and may keep its most
     /// recently finished job. Default: deletes nothing.
     fn clean_finished(&self, _now: SystemTime, _limit: usize) -> Result<usize> {

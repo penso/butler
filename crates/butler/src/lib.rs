@@ -297,10 +297,10 @@ pub mod __private {
         let mut new = crate::NewJob::for_job(job, queue_name, args);
         new.run_at = run_at;
         crate::enqueue::apply(&mut new)?;
-        // Inside `testing::perform_enqueued_jobs`: run it now, no queue, even
-        // if it was scheduled for later.
-        if let Some(inline) = crate::testing::current() {
-            return inline.run(job, new).await;
+        // Inside a testing scope: run it now (even if it was scheduled for
+        // later) or record it, with no queue either way.
+        if let Some(scope) = crate::testing::current() {
+            return scope.enqueue(job, new).await;
         }
         let queue = crate::queue()?;
         let pushing = queue.clone();

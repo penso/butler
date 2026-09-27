@@ -81,6 +81,11 @@ impl<T> JobCall<T> {
     pub fn name(&self) -> &'static str {
         self.def.name
     }
+
+    /// The job and its serialized arguments, for test assertions.
+    pub(crate) fn into_parts(self) -> (&'static JobDef, serde_json::Result<Vec<Value>>) {
+        (self.def, self.args)
+    }
 }
 
 impl<T: DeserializeOwned + Send + 'static> JobCall<T> {

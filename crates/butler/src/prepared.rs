@@ -142,7 +142,9 @@ impl<T> fmt::Debug for PreparedJob<T> {
 /// file backend writes one file per job, as usual. Jobs with a run time are
 /// scheduled in the same step. Inside
 /// [`perform_enqueued_jobs`](crate::testing::perform_enqueued_jobs), each job
-/// runs inline, in order, scheduled or not.
+/// runs inline, in order, scheduled or not; inside
+/// [`RecordedJobs::record`](crate::testing::RecordedJobs::record), each is
+/// recorded, in order.
 ///
 /// ```ignore
 /// let emails = users
@@ -169,10 +171,10 @@ pub async fn enqueue_all<T>(
             Ok((job.def, new))
         })
         .collect::<Result<Vec<_>>>()?;
-    if let Some(inline) = crate::testing::current() {
+    if let Some(scope) = crate::testing::current() {
         let mut handles = Vec::with_capacity(jobs.len());
         for (def, new) in jobs {
-            handles.push(inline.run(def, new).await?);
+            handles.push(scope.enqueue(def, new).await?);
         }
         return Ok(handles);
     }

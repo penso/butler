@@ -37,3 +37,13 @@ queues = [["critical", 3], ["default", 1]]
 # three workers with exports = 5 run 5 export jobs at once between them.
 # [worker.global_queue_limits]
 # exports = 5
+
+# Jobs the workers enqueue on a cron schedule, once per tick between them.
+# Five fields, as in crontab: minute hour day-of-month month day-of-week.
+[[recurring]]
+args = ["every minute"]
+cron = "* * * * *"
+job  = "demo.summary"
+# Optional: queue = "..." (default: the job's own), timezone = "Europe/Paris"
+# (default: "UTC"), key = "..." (default: derived from the other fields; set
+# one to keep a schedule's history when changing them).

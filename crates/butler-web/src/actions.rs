@@ -1,5 +1,6 @@
 //! What the dashboard changes: retry and discard failed jobs, cancel pending
-//! and scheduled ones, run scheduled ones now. Every action is a POST and
+//! and scheduled ones, run scheduled ones now, and forget recurring schedules
+//! no worker runs anymore. Every action is a POST and
 //! redirects back to the page it came from.
 
 use std::sync::Arc;
@@ -82,6 +83,28 @@ pub(crate) async fn run_now(
     Form(form): Form<Back>,
 ) -> Result<Redirect, WebError> {
     act(&state, move |queue| queue.run_now(&id)).await?;
+    Ok(back(&state, form.return_to.as_deref()))
+}
+
+pub(crate) async fn remove_recurring(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    Form(form): Form<Back>,
+) -> Result<Redirect, WebError> {
+    if !butler::recurring::is_valid_key(&key) {
+        return Err(butler::Error::InvalidRecurringKey { key }.into());
+    }
+    let removed = act(&state, {
+        let key = key.clone();
+        move |queue| queue.remove_recurring(&key)
+    })
+    .await?;
+    if removed {
+        tracing::info!(
+            schedule = key,
+            "removed a recurring schedule from the dashboard"
+        );
+    }
     Ok(back(&state, form.return_to.as_deref()))
 }
 

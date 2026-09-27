@@ -39,6 +39,7 @@ pub mod monitor;
 mod prepared;
 mod progress;
 mod queues;
+pub mod recurring;
 mod retry;
 mod signal;
 pub mod testing;
@@ -59,8 +60,8 @@ pub use backend::{SQLITE_WATCH_TICK, SqliteQueue};
 pub use butler_macros::job;
 pub use call::{Enqueueing, JobCall};
 pub use config::{
-    BackendKind, Config, FileConfig, QueueConfig, QueueEntry, RedisConfig, SqliteConfig,
-    WorkerConfig,
+    BackendKind, Config, FileConfig, QueueConfig, QueueEntry, RecurringConfig, RedisConfig,
+    SqliteConfig, WorkerConfig,
 };
 pub use enqueue::{EnqueueLayer, configure_enqueue};
 pub use error::{BoxError, Error, Failure, JobError, Result};
@@ -73,6 +74,7 @@ pub use middleware::{DeadJob, JobContext, Layer, Next, RunFuture};
 pub use prepared::{PreparedJob, enqueue_all};
 pub use progress::{Interrupted, Progress};
 pub use queues::QueuePriority;
+pub use recurring::{Cron, Recurring, RecurringRecord};
 pub use retry::{Backoff, JITTER, MAX_BACKOFF, Retry, RetryPolicy, Retryable};
 pub use signal::{JobWatch, Signal};
 pub use worker::Worker;

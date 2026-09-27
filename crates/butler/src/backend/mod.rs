@@ -28,6 +28,7 @@ use crate::{
     AnyJob, Error, Failed, Job, JobId, JobRecord, JobState, Result, Retry, RetryPolicy, Signal,
     job::{after, millis},
     monitor::{JobMetric, ListFilter, MetricBucket, Stats},
+    recurring::RecurringRecord,
     state::{Done, Pending, Processing},
 };
 
@@ -136,6 +137,26 @@ pub trait Store: Send + Sync + 'static {
     /// Interrupted retry transitions preserve their recorded schedule.
     fn recover(&self) -> Result<usize>;
 
+    /// Stores the recurring schedules a worker runs, or refreshes them if
+    /// the backend has them already: their definition and `seen_at_ms` come
+    /// from `schedules`, while a stored schedule keeps its `created_at_ms`
+    /// and last run. Returns the stored schedules, in the same order.
+    /// Default: not supported.
+    fn register_recurring(&self, _schedules: &[RecurringRecord]) -> Result<Vec<RecurringRecord>> {
+        Err(Error::Unsupported("recurring jobs"))
+    }
+
+    /// Enqueues `job` (pending, on its queue) as the run of recurring
+    /// schedule `key` for its tick at `tick`, unless that tick was already
+    /// enqueued: however many workers call it, one job per `(key, tick)`.
+    /// Checking and enqueueing are one atomic step. Records the job as the
+    /// schedule's last run, unless a later tick already ran. Returns the new
+    /// job's id, or `None` if the tick was taken. A tick is remembered for at
+    /// least a day. Default: not supported.
+    fn push_recurring(&self, _key: &str, _tick: SystemTime, _job: NewJob) -> Result<Option<JobId>> {
+        Err(Error::Unsupported("recurring jobs"))
+    }
+
     /// Whether calls can block on I/O (network, disk). Async callers send
     /// blocking backends' calls to tokio's blocking pool; calls to backends
     /// that never block run in place, which is much cheaper. `claim` with a
@@ -180,6 +201,20 @@ pub trait Monitor: Send + Sync + 'static {
     /// `id` isn't a finished job.
     fn discard(&self, _id: &str) -> Result<bool> {
         Err(Error::Unsupported("discarding jobs"))
+    }
+
+    /// Every recurring schedule a worker registered, sorted by key.
+    fn recurring(&self) -> Result<Vec<RecurringRecord>> {
+        Err(Error::Unsupported("listing recurring jobs"))
+    }
+
+    /// Forgets a recurring schedule and its last run. A worker that still
+    /// runs it registers it again, as new. Returns `false` if `key` is
+    /// unknown. Implementations must reject invalid keys with
+    /// [`Error::InvalidRecurringKey`] before touching storage (see
+    /// [`recurring::is_valid_key`](crate::recurring::is_valid_key)).
+    fn remove_recurring(&self, _key: &str) -> Result<bool> {
+        Err(Error::Unsupported("removing recurring jobs"))
     }
 
     /// Records one finished attempt, for history. Default: ignored.
@@ -273,6 +308,11 @@ pub struct Promoted {
     /// When the next job still scheduled is due, if any.
     pub next: Option<SystemTime>,
 }
+
+/// How long backends remember that a recurring tick was enqueued. A tick is
+/// only ever tried around its own time, or once by a worker starting later,
+/// which first checks the schedule's last run; a day covers both.
+pub(crate) const TICK_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The shortest a claim waits for a scheduled job to come due, so a run time
 /// that slips into the past between two calls can't make it spin.
@@ -481,6 +521,37 @@ impl Queue {
             JobState::Scheduled => Failed::Scheduled(Job::from_record(record)),
             _ => Failed::Retry(Job::from_record(record)),
         })
+    }
+
+    /// Stores or refreshes recurring schedules; see
+    /// [`Store::register_recurring`].
+    pub fn register_recurring(
+        &self,
+        schedules: &[RecurringRecord],
+    ) -> Result<Vec<RecurringRecord>> {
+        self.0.register_recurring(schedules)
+    }
+
+    /// Enqueues `job` as tick `tick` of recurring schedule `key`, unless some
+    /// worker already did. Returns its id, or `None` if the tick was taken.
+    /// A run time on `job` is ignored: it is pending at once.
+    pub fn push_recurring(
+        &self,
+        key: &str,
+        tick: SystemTime,
+        mut job: NewJob,
+    ) -> Result<Option<JobId>> {
+        job.run_at = None;
+        self.0.push_recurring(key, tick, job)
+    }
+
+    /// Every registered recurring schedule, sorted by key.
+    pub fn recurring(&self) -> Result<Vec<RecurringRecord>> {
+        self.0.recurring()
+    }
+
+    pub fn remove_recurring(&self, key: &str) -> Result<bool> {
+        self.0.remove_recurring(key)
     }
 
     pub fn heartbeat(&self, worker: &str, ttl: Duration) -> Result<()> {

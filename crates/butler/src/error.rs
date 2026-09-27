@@ -59,6 +59,30 @@ pub enum Error {
     #[error("invalid backoff `{value}`: {reason}")]
     InvalidBackoff { value: String, reason: &'static str },
 
+    #[error("invalid cron expression `{expression}`")]
+    InvalidCron {
+        expression: String,
+        #[source]
+        source: BoxError,
+    },
+
+    #[error("unknown time zone `{name}`: use an IANA name such as `Europe/Paris`, or `UTC`")]
+    UnknownTimeZone { name: String },
+
+    #[error(
+        "invalid recurring key `{key}`: use 1 to 128 of A-Z a-z 0-9 _ - . (not starting with a dot)"
+    )]
+    InvalidRecurringKey { key: String },
+
+    /// A `[[recurring]]` entry names a job this worker doesn't have. Jobs from
+    /// another crate may need [`Worker::register`](crate::Worker::register)
+    /// first.
+    #[error("recurring schedule `{key}` runs job `{name}`, which this worker doesn't have")]
+    UnknownRecurringJob { key: String, name: String },
+
+    #[error("two recurring schedules have the key `{key}`")]
+    DuplicateRecurring { key: String },
+
     /// An [enqueue layer](crate::EnqueueLayer) refused the job; `source` is
     /// its reason. Nothing was enqueued.
     #[error("enqueueing `{name}` was vetoed")]

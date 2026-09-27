@@ -33,6 +33,7 @@ impl IntoResponse for WebError {
     fn into_response(self) -> Response {
         let status = match &self {
             WebError::NotFound(_) => StatusCode::NOT_FOUND,
+            WebError::Queue(butler::Error::InvalidRecurringKey { .. }) => StatusCode::BAD_REQUEST,
             WebError::Queue(butler::Error::Unsupported(_)) => StatusCode::NOT_IMPLEMENTED,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };

@@ -3,8 +3,8 @@
 A web dashboard for [butler](https://crates.io/crates/butler-jobs)'s background jobs:
 live counts over server-sent events, throughput and duration charts, queues,
 workers, and job details. Retry or discard failed jobs, cancel pending work,
-run scheduled jobs now, and inspect arguments, results, errors, and saved
-progress.
+run scheduled jobs now, see recurring schedules' next and last run, and
+inspect arguments, results, errors, and saved progress.
 
 ![The dashboard](https://raw.githubusercontent.com/penso/butler/main/docs/images/dashboard-dark.png)
 
@@ -37,6 +37,7 @@ let app = Router::new()
 | `/jobs?state=dead` | Jobs by state and queue, paged; retry, discard, cancel; retry all / discard all |
 | `/jobs?state=scheduled` | Scheduled jobs and retries waiting out their backoff, soonest first, with when they run next and their last error; run now, cancel |
 | `/jobs/{id}` | Arguments, attempts, the full error chain, result, saved progress |
+| `/recurring` | Recurring schedules: job, queue, cron and time zone, arguments, next run, last run (linking to its job); schedules no running worker registered for three minutes are marked and can be removed |
 | `/workers` | Workers, their heartbeat, and the jobs they hold |
 | `/events` | The live stream (`text/event-stream`), one snapshot per second |
 | `/api/stats`, `/api/metrics?minutes=1440` | The same data as JSON |

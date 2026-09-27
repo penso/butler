@@ -10,6 +10,9 @@
 //! <prefix>:dead                  LIST  ids that exhausted their retries
 //! <prefix>:job:<id>              HASH  { state, queue, data (job JSON) }
 //! <prefix>:slots:<queue>         SET   ids running in one of the queue's global-limit slots
+//! <prefix>:recurring             SET   keys of the recurring schedules workers registered
+//! <prefix>:recurring:<key>       HASH  { data (schedule JSON), created_at, seen_at, last_tick, last_job }
+//! <prefix>:recurring:tick:<key>:<ms>  STRING  the job enqueued for that tick; expires after a day
 //! ```
 //!
 //! A claim is an `LMOVE queue:<q> processing:<worker>` for each queue the
@@ -40,6 +43,10 @@
 //! or failing a job `SREM`s it, and so does recovery, which frees a crashed
 //! worker's slots.
 //!
+//! A recurring tick is one script: `SET recurring:tick:<key>:<ms> NX`, and
+//! only if that succeeded, the job's push. However many workers run it for a
+//! tick, one job is enqueued.
+//!
 //! We use lists instead of `PUBLISH`/`SUBSCRIBE` because pub/sub delivers each
 //! message to every subscriber, and messages sent while no worker is connected
 //! are lost.
@@ -53,9 +60,9 @@ use std::{
 
 use redis::{Client, Connection, RedisResult};
 
-use super::{GlobalLimit, Monitor, NewJob, Promoted, Store, Watch};
+use super::{GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
 use crate::{
-    Error, JobId, JobRecord, JobState, Result, Signal,
+    Error, JobId, JobRecord, JobState, RecurringRecord, Result, Signal,
     job::{from_millis, millis},
     monitor::{
         JobMetric, ListFilter, METRICS_RETENTION_MINUTES, MetricBucket, QueueStats, Stats,
@@ -170,6 +177,25 @@ redis.call('PUBLISH', ARGV[1] .. 'wake', queue)
 return 1
 ";
 
+/// Enqueues a recurring tick's job unless the tick was taken. KEYS: the tick
+/// (1), the schedule's hash (2), the job's hash (3), its queue (4), the set
+/// of queues (5). ARGV: job id, queue, job data, tick (ms), tick expiry (ms),
+/// wake channel. Returns 1 if it enqueued the job, 0 if the tick was taken.
+const PUSH_RECURRING: &str = r"
+if not redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[5]) then return 0 end
+redis.call('HSET', KEYS[3], 'state', 'pending', 'queue', ARGV[2], 'data', ARGV[3])
+redis.call('LPUSH', KEYS[4], ARGV[1])
+redis.call('SADD', KEYS[5], ARGV[2])
+if redis.call('EXISTS', KEYS[2]) == 1 then
+  local last = tonumber(redis.call('HGET', KEYS[2], 'last_tick') or '-1')
+  if tonumber(ARGV[4]) > last then
+    redis.call('HSET', KEYS[2], 'last_tick', ARGV[4], 'last_job', ARGV[1])
+  end
+end
+redis.call('PUBLISH', ARGV[6], ARGV[2])
+return 1
+";
+
 pub struct RedisQueue {
     client: Client,
     /// Idle connections. A blocking claim holds one for up to its wait, so
@@ -273,6 +299,21 @@ impl RedisQueue {
 
     fn queue_key(&self, queue: &str) -> String {
         format!("{}:queue:{queue}", self.prefix)
+    }
+
+    fn recurring_key(&self, key: &str) -> String {
+        format!("{}:recurring:{key}", self.prefix)
+    }
+
+    /// The fields of `recurring:<key>` that [`read_recurring`] reads, in order.
+    fn recurring_fields(pipe: &mut redis::Pipeline, key: String) {
+        pipe.cmd("HMGET")
+            .arg(key)
+            .arg("data")
+            .arg("created_at")
+            .arg("seen_at")
+            .arg("last_tick")
+            .arg("last_job");
     }
 
     fn metrics_key(&self, minute: u64) -> String {
@@ -865,6 +906,66 @@ impl Store for RedisQueue {
         Ok(recovered)
     }
 
+    /// One transaction: `HSETNX` keeps an existing schedule's creation time,
+    /// and its last run is left alone.
+    fn register_recurring(&self, schedules: &[RecurringRecord]) -> Result<Vec<RecurringRecord>> {
+        if schedules.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        for schedule in schedules {
+            let key = self.recurring_key(&schedule.key);
+            pipe.cmd("HSETNX")
+                .arg(&key)
+                .arg("created_at")
+                .arg(schedule.created_at_ms)
+                .ignore()
+                .cmd("HSET")
+                .arg(&key)
+                .arg("data")
+                .arg(serde_json::to_string(schedule)?)
+                .arg("seen_at")
+                .arg(schedule.seen_at_ms)
+                .ignore()
+                .cmd("SADD")
+                .arg(self.key("recurring"))
+                .arg(&schedule.key)
+                .ignore();
+            Self::recurring_fields(&mut pipe, key);
+        }
+        let rows: Vec<RecurringFields> = self.with_conn(|con| pipe.query(con))?;
+        // Written in the same transaction, so the data is there.
+        rows.into_iter()
+            .zip(schedules)
+            .map(|(row, schedule)| Ok(read_recurring(row)?.unwrap_or_else(|| schedule.clone())))
+            .collect()
+    }
+
+    fn push_recurring(&self, key: &str, tick: SystemTime, job: NewJob) -> Result<Option<JobId>> {
+        let job = job.into_record();
+        let data = serde_json::to_string(&job)?;
+        let tick = millis(tick);
+        let pushed: u8 = self.with_conn(|con| {
+            redis::cmd("EVAL")
+                .arg(PUSH_RECURRING)
+                .arg(5)
+                .arg(format!("{}:recurring:tick:{key}:{tick}", self.prefix))
+                .arg(self.recurring_key(key))
+                .arg(self.job_key(&job.id))
+                .arg(self.queue_key(&job.queue))
+                .arg(self.key("queues"))
+                .arg(&job.id)
+                .arg(&job.queue)
+                .arg(&data)
+                .arg(tick)
+                .arg(u64::try_from(TICK_RETENTION.as_millis()).unwrap_or(u64::MAX))
+                .arg(self.key("wake"))
+                .query(con)
+        })?;
+        Ok((pushed > 0).then_some(job.id))
+    }
+
     fn describe(&self) -> String {
         self.display.clone()
     }
@@ -1117,6 +1218,44 @@ impl Monitor for RedisQueue {
         Ok(true)
     }
 
+    fn recurring(&self) -> Result<Vec<RecurringRecord>> {
+        let mut keys: Vec<String> =
+            self.with_conn(|con| redis::cmd("SMEMBERS").arg(self.key("recurring")).query(con))?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        keys.sort();
+        let mut pipe = redis::pipe();
+        for key in &keys {
+            Self::recurring_fields(&mut pipe, self.recurring_key(key));
+        }
+        let rows: Vec<RecurringFields> = self.with_conn(|con| pipe.query(con))?;
+        // A key removed between the two reads has no data left: skip it.
+        Ok(rows
+            .into_iter()
+            .map(read_recurring)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
+    fn remove_recurring(&self, key: &str) -> Result<bool> {
+        crate::recurring::validate_key(key)?;
+        let (removed,): (u8,) = self.with_conn(|con| {
+            redis::pipe()
+                .atomic()
+                .cmd("SREM")
+                .arg(self.key("recurring"))
+                .arg(key)
+                .cmd("DEL")
+                .arg(self.recurring_key(key))
+                .ignore()
+                .query(con)
+        })?;
+        Ok(removed > 0)
+    }
+
     fn record_metric(&self, metric: &JobMetric) -> Result<()> {
         let base = format!("{}{FIELD_SEP}{}{FIELD_SEP}", metric.queue, metric.job);
         self.with_conn(|con| {
@@ -1183,6 +1322,30 @@ impl Watch for RedisQueue {
         self.listen_for_signals();
         Some(self.signals.finished.watch(id))
     }
+}
+
+/// A schedule hash's fields, as [`RedisQueue::recurring_fields`] reads them.
+type RecurringFields = (
+    Option<String>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<String>,
+);
+
+/// The schedule in `fields`, or `None` if it has no data (it was removed).
+fn read_recurring(
+    (data, created_at, seen_at, last_tick, last_job): RecurringFields,
+) -> Result<Option<RecurringRecord>> {
+    let Some(data) = data else {
+        return Ok(None);
+    };
+    let mut schedule: RecurringRecord = serde_json::from_str(&data)?;
+    schedule.created_at_ms = created_at.unwrap_or(schedule.created_at_ms);
+    schedule.seen_at_ms = seen_at.unwrap_or(schedule.seen_at_ms);
+    schedule.last_tick_ms = last_tick;
+    schedule.last_job_id = last_job;
+    Ok(Some(schedule))
 }
 
 /// Redis counts and lengths, which are never negative here.

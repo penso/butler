@@ -74,6 +74,11 @@
   }
   setInterval(refreshTimes, 5000);
 
+  // Exact times, in the viewer's zone, on hover.
+  document.querySelectorAll("[data-local-ms]").forEach(function (el) {
+    el.title = new Date(Number(el.dataset.localMs)).toLocaleString();
+  });
+
   // Charts -----------------------------------------------------------------
 
   function makeChart(el, series, data) {

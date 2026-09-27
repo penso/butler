@@ -26,6 +26,14 @@
 //!
 //! [worker.global_queue_limits] # optional, per queue across every worker
 //! reports = 5
+//!
+//! [[recurring]]                # optional, any number: a job on a cron schedule
+//! job = "nightly_report"       # the job's name
+//! cron = "0 3 * * *"           # minute hour day-of-month month day-of-week
+//! args = ["summary"]           # optional, default none
+//! queue = "reports"            # optional, default the job's own queue
+//! timezone = "Europe/Paris"    # optional, default "UTC"
+//! key = "nightly"              # optional, default derived from the fields above
 //! ```
 //!
 //! The config file is `$BUTLER_CONFIG` if set (it must then exist), otherwise
@@ -40,10 +48,12 @@ use std::{
 };
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::{
-    Backoff, Error, FileQueue, Queue, QueuePriority, Result,
+    Backoff, Cron, Error, FileQueue, Queue, QueuePriority, Result,
     job::{DEFAULT_QUEUE, is_valid_queue_name},
+    recurring,
 };
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -51,6 +61,60 @@ use crate::{
 pub struct Config {
     pub queue: QueueConfig,
     pub worker: WorkerConfig,
+    /// `[[recurring]]` entries: jobs enqueued on a cron schedule by the
+    /// workers built with [`Worker::from_config`](crate::Worker::from_config).
+    pub recurring: Vec<RecurringConfig>,
+}
+
+/// One `[[recurring]]` entry: a job enqueued at every tick of a cron
+/// schedule. See [`Recurring`](crate::Recurring).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RecurringConfig {
+    /// The job's name: its function name, or its `#[job(name = "...")]`.
+    pub job: String,
+    /// Five fields, as in crontab: `"0 3 * * *"` is 03:00 every day.
+    pub cron: String,
+    /// The job's arguments, in order.
+    #[serde(default)]
+    pub args: Vec<Value>,
+    /// The job's own queue if not set.
+    #[serde(default)]
+    pub queue: Option<String>,
+    /// An IANA time zone for `cron`, such as `"Europe/Paris"`; UTC if not set.
+    #[serde(default)]
+    pub timezone: Option<String>,
+    /// What identifies the schedule in the backend; derived from the other
+    /// fields if not set. Set it to keep the schedule's history when changing
+    /// them.
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+impl RecurringConfig {
+    /// Checks what can be checked without the worker's jobs: the cron
+    /// expression, time zone, queue and key.
+    fn validate(&self) -> Result<()> {
+        let cron = Cron::parse(&self.cron)?;
+        if let Some(zone) = &self.timezone {
+            cron.in_time_zone(zone)?;
+        }
+        if let Some(queue) = self.queue.as_deref().filter(|q| !is_valid_queue_name(q)) {
+            return Err(Error::InvalidQueue {
+                name: queue.to_owned(),
+                reason: "use 1 to 64 of A-Z a-z 0-9 _ - . (not starting with a dot)",
+            });
+        }
+        if let Some(key) = self
+            .key
+            .as_deref()
+            .filter(|key| !recurring::is_valid_key(key))
+        {
+            return Err(Error::InvalidRecurringKey {
+                key: key.to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -288,6 +352,15 @@ impl Config {
             .build()?;
         let config: Self = config.try_deserialize()?;
         config.worker.validate()?;
+        let mut keys = std::collections::HashSet::new();
+        for entry in &config.recurring {
+            entry.validate()?;
+            if let Some(key) = entry.key.as_deref().filter(|key| !keys.insert(*key)) {
+                return Err(Error::DuplicateRecurring {
+                    key: key.to_owned(),
+                });
+            }
+        }
         Ok(config)
     }
 
@@ -418,6 +491,73 @@ mod tests {
         let polynomial = load("[worker]\nbackoff = \"polynomial\"\n").unwrap();
         assert_eq!(polynomial.worker.backoff, Backoff::Polynomial);
         assert!(load("[worker]\nbackoff = \"sometimes\"\n").is_err());
+    }
+
+    #[test]
+    fn recurring_entries_load_with_defaults_and_are_validated() {
+        let config = load(
+            "[[recurring]]\njob = \"report\"\ncron = \"0 3 * * *\"\nargs = [42, \"summary\", { Mixed = true }]\n\
+             [[recurring]]\njob = \"cleanup\"\ncron = \"*/15 * * * *\"\nqueue = \"low\"\ntimezone = \"Europe/Paris\"\nkey = \"cleanup\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.recurring.len(), 2);
+        let report = &config.recurring[0];
+        assert_eq!(
+            (report.job.as_str(), report.cron.as_str()),
+            ("report", "0 3 * * *")
+        );
+        assert_eq!(
+            report.args,
+            vec![
+                serde_json::json!(42),
+                serde_json::json!("summary"),
+                serde_json::json!({ "Mixed": true })
+            ]
+        );
+        assert_eq!(
+            (
+                report.queue.as_deref(),
+                report.timezone.as_deref(),
+                report.key.as_deref()
+            ),
+            (None, None, None)
+        );
+        let cleanup = &config.recurring[1];
+        assert_eq!(cleanup.queue.as_deref(), Some("low"));
+        assert_eq!(cleanup.timezone.as_deref(), Some("Europe/Paris"));
+        assert!(load("").unwrap().recurring.is_empty());
+
+        let bad_cron = load("[[recurring]]\njob = \"x\"\ncron = \"0 25 * * *\"\n").unwrap_err();
+        assert!(
+            matches!(bad_cron, Error::InvalidCron { .. }),
+            "{bad_cron:?}"
+        );
+        let bad_zone =
+            load("[[recurring]]\njob = \"x\"\ncron = \"0 3 * * *\"\ntimezone = \"Paris\"\n")
+                .unwrap_err();
+        assert!(
+            matches!(bad_zone, Error::UnknownTimeZone { .. }),
+            "{bad_zone:?}"
+        );
+        let bad_queue =
+            load("[[recurring]]\njob = \"x\"\ncron = \"0 3 * * *\"\nqueue = \"../x\"\n")
+                .unwrap_err();
+        assert!(
+            matches!(bad_queue, Error::InvalidQueue { .. }),
+            "{bad_queue:?}"
+        );
+        let bad_key =
+            load("[[recurring]]\njob = \"x\"\ncron = \"0 3 * * *\"\nkey = \"a/b\"\n").unwrap_err();
+        assert!(
+            matches!(bad_key, Error::InvalidRecurringKey { .. }),
+            "{bad_key:?}"
+        );
+        let twice = "[[recurring]]\njob = \"x\"\ncron = \"0 3 * * *\"\nkey = \"k\"\n";
+        let duplicate = load(&format!("{twice}{twice}")).unwrap_err();
+        assert!(
+            matches!(duplicate, Error::DuplicateRecurring { .. }),
+            "{duplicate:?}"
+        );
     }
 
     #[test]

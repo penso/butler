@@ -30,13 +30,18 @@ axum   = "0.8.9"
 butler = { package = "butler-jobs", path = "crates/butler", version = "0.1.0" }
 # Exact: the macro expands to calls into `butler::__private`, so the two crates
 # are released in lockstep.
-butler-macros  = { path = "crates/butler-macros", version = "=0.1.0" }
+butler-macros = { path = "crates/butler-macros", version = "=0.1.0" }
+# Recurring jobs: time arithmetic in named zones (no clock, no local time).
+chrono         = { default-features = false, version = "0.4.45" }
+chrono-tz      = { default-features = false, version = "0.10.4" }
 config         = { default-features = false, features = ["toml"], version = "0.15.26" }
 http-body-util = "0.1.5"
 inventory      = "0.3.24"
 proc-macro2    = "1.0.107"
-quote          = "1.0.47"
-redis          = { default-features = false, version = "1.7.1" }
+# Five-field crontab expressions for recurring jobs.
+cron-parser = "0.12.0"
+quote       = "1.0.47"
+redis       = { default-features = false, version = "1.7.1" }
 # Bundled: SQLite is compiled in, so there is no system library to install.
 rusqlite           = { features = ["bundled"], version = "0.40.2" }
 serde              = { features = ["derive"], version = "1.0.229" }

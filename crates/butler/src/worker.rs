@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex, PoisonError, RwLock,
+        Arc, Mutex, PoisonError, RwLock, TryLockError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -12,8 +12,9 @@ use std::{
 use tracing::{Instrument, Span, field};
 
 use crate::{
-    Backoff, Config, DeadJob, Failed, Job, JobContext, JobDef, JobError, Layer, Next, Queue,
-    QueuePriority, Result, RetryPolicy, RunFuture, WorkerConfig, block_on,
+    Backoff, Config, Cron, DeadJob, Error, Failed, GlobalLimit, Job, JobContext, JobDef, JobError,
+    Layer, NewJob, Next, PreparedJob, Queue, QueuePriority, Recurring, RecurringConfig, Result,
+    RetryPolicy, RunFuture, WorkerConfig, block_on,
     error::Chain,
     executor::panic_message,
     job::millis,
@@ -21,6 +22,7 @@ use crate::{
     middleware::{DeadHook, Handler, run_dead_hooks, run_handler},
     monitor::JobMetric,
     progress::{Checkpoints, Invocation},
+    recurring::REGISTER_INTERVAL,
     state::Processing,
 };
 
@@ -78,6 +80,9 @@ pub struct Worker {
     id: Arc<str>,
     queues: QueuePriority,
     limits: QueueLimits,
+    /// Per queue, the most of its jobs running at once across every worker
+    /// with the same limit, enforced by the backend.
+    global_limits: Arc<HashMap<String, usize>>,
     claimers: usize,
     concurrency: usize,
     max_retries: u32,
@@ -97,6 +102,17 @@ pub struct Worker {
     layers: Arc<Vec<Arc<dyn Layer>>>,
     /// Run when a job dies, in order.
     dead_hooks: Arc<Vec<DeadHook>>,
+    /// Jobs this worker enqueues on a cron schedule.
+    recurring: Arc<Vec<Recurring>>,
+    recurring_clock: Arc<Mutex<RecurringClock>>,
+}
+
+/// When this worker last registered its recurring schedules, and when each
+/// one is next due (`None` until the first registration).
+#[derive(Default)]
+struct RecurringClock {
+    registered: Option<Instant>,
+    next: Vec<Option<SystemTime>>,
 }
 
 /// When this worker last refreshed its heartbeat, recovered jobs, and
@@ -111,8 +127,14 @@ struct Upkeep {
 
 impl Worker {
     /// Opens the configured backend and applies the `[worker]` settings.
+    /// Opens the configured backend and applies the `[worker]` settings and
+    /// the `[[recurring]]` schedules. A schedule's job must be known by then:
+    /// jobs that need [`register`](Worker::register) should use
+    /// [`with_recurring_config`](Worker::with_recurring_config) after it.
     pub fn from_config(config: &Config) -> Result<Self> {
-        Ok(Self::new(config.connect()?).with_config(&config.worker))
+        Self::new(config.connect()?)
+            .with_config(&config.worker)
+            .with_recurring_config(&config.recurring)
     }
 
     /// # Panics
@@ -133,6 +155,7 @@ impl Worker {
             id: new_worker_id().into(),
             queues: defaults.priority(),
             limits: QueueLimits::default(),
+            global_limits: Arc::default(),
             claimers: defaults.claimers,
             concurrency: defaults.concurrency,
             max_retries: defaults.max_retries,
@@ -146,6 +169,8 @@ impl Worker {
             checkpoint_interval: defaults.checkpoint_interval(),
             layers: Arc::default(),
             dead_hooks: Arc::default(),
+            recurring: Arc::default(),
+            recurring_clock: Arc::default(),
         }
     }
 
@@ -154,6 +179,12 @@ impl Worker {
             .queue_limits
             .iter()
             .fold(self, |worker, (queue, max)| worker.queue_limit(queue, *max));
+        let worker = config
+            .global_queue_limits
+            .iter()
+            .fold(worker, |worker, (queue, max)| {
+                worker.global_queue_limit(queue, *max)
+            });
         worker
             .queues(config.priority())
             .concurrency(config.concurrency)
@@ -220,6 +251,62 @@ impl Worker {
         self
     }
 
+    /// Enqueues `job`, with its arguments and queue, at every tick of `cron`,
+    /// a five-field crontab expression in UTC. Every worker with the same
+    /// schedule enqueues each tick exactly once between them.
+    ///
+    /// ```ignore
+    /// worker.recurring(nightly_report::prepare("summary")?, "0 3 * * *")?
+    /// ```
+    ///
+    /// For a time zone or a key of its own, build a [`Recurring`] and use
+    /// [`add_recurring`](Worker::add_recurring).
+    pub fn recurring<T>(self, job: PreparedJob<T>, cron: &str) -> Result<Self> {
+        self.add_recurring(Recurring::new(job, cron)?)
+    }
+
+    /// Adds a recurring schedule. Fails if this worker already has one with
+    /// the same key.
+    pub fn add_recurring(mut self, schedule: Recurring) -> Result<Self> {
+        if self.recurring.iter().any(|s| s.key() == schedule.key()) {
+            return Err(Error::DuplicateRecurring {
+                key: schedule.key().to_owned(),
+            });
+        }
+        Arc::make_mut(&mut self.recurring).push(schedule);
+        Ok(self)
+    }
+
+    /// Adds the `[[recurring]]` schedules from `butler.toml`. Each one's job
+    /// must be registered with this worker, and runs on the job's own queue
+    /// unless the entry names another.
+    pub fn with_recurring_config(self, entries: &[RecurringConfig]) -> Result<Self> {
+        entries.iter().try_fold(self, |worker, entry| {
+            let Some(def) = worker.jobs.get(entry.job.as_str()) else {
+                return Err(Error::UnknownRecurringJob {
+                    key: entry.key.clone().unwrap_or_default(),
+                    name: entry.job.clone(),
+                });
+            };
+            let queue = entry.queue.as_deref().unwrap_or(def.queue).to_owned();
+            let mut cron = Cron::parse(&entry.cron)?;
+            if let Some(zone) = &entry.timezone {
+                cron = cron.in_time_zone(zone)?;
+            }
+            let mut schedule =
+                Recurring::from_parts(def.name.to_owned(), queue, entry.args.clone(), cron)?;
+            if let Some(key) = &entry.key {
+                schedule = schedule.with_key(key)?;
+            }
+            worker.add_recurring(schedule)
+        })
+    }
+
+    /// This worker's recurring schedules, in the order they were added.
+    pub fn recurring_schedules(&self) -> &[Recurring] {
+        &self.recurring
+    }
+
     /// Which queues to take jobs from, and in what priority. Defaults to just
     /// `"default"`. Jobs on queues not listed are never run by this worker.
     pub fn queues(mut self, queues: QueuePriority) -> Self {
@@ -240,12 +327,38 @@ impl Worker {
         self
     }
 
-    /// Caps how many jobs from `queue` run at once, on top of the overall
-    /// [`concurrency`](Worker::concurrency). When `queue` is at its limit, the
-    /// worker skips it and keeps taking jobs from its other queues.
+    /// Caps how many jobs from `queue` run at once in this worker process, on
+    /// top of the overall [`concurrency`](Worker::concurrency). When `queue`
+    /// is at its limit, the worker skips it and keeps taking jobs from its
+    /// other queues. Each process counts its own jobs, so limits add up
+    /// across workers; see [`global_queue_limit`](Worker::global_queue_limit)
+    /// for one limit shared by all of them.
     pub fn queue_limit(mut self, queue: &str, max: usize) -> Self {
         self.limits.set(queue, max);
         self
+    }
+
+    /// Caps how many jobs from `queue` run at once **across every worker**
+    /// that has this limit, rather than within this one process as
+    /// [`queue_limit`](Worker::queue_limit) does. The backend keeps the
+    /// count, checked and taken atomically with each claim, and frees a slot
+    /// when its job completes, fails, is interrupted, or is recovered from a
+    /// crashed worker. Set the same limit on every worker serving `queue`:
+    /// claims without it neither take a slot nor respect the limit.
+    pub fn global_queue_limit(mut self, queue: &str, max: usize) -> Self {
+        Arc::make_mut(&mut self.global_limits).insert(queue.to_owned(), max.max(1));
+        self
+    }
+
+    /// The global per-queue limits, sorted by queue name.
+    pub fn global_queue_limits(&self) -> Vec<(&str, usize)> {
+        let mut limits: Vec<_> = self
+            .global_limits
+            .iter()
+            .map(|(queue, max)| (queue.as_str(), *max))
+            .collect();
+        limits.sort_unstable();
+        limits
     }
 
     /// The per-queue limits, sorted by queue name.
@@ -472,7 +585,17 @@ impl Worker {
             wait
         };
         let queues: Vec<&str> = reserved.iter().map(|(queue, _)| *queue).collect();
-        let Some(job) = self.queue.claim(&self.id, &queues, wait)? else {
+        let global: Vec<GlobalLimit<'_>> = queues
+            .iter()
+            .filter_map(|queue| {
+                let max = *self.global_limits.get(*queue)?;
+                Some(GlobalLimit { queue, max })
+            })
+            .collect();
+        let Some(job) = self
+            .queue
+            .claim_within_limits(&self.id, &queues, &global, wait)?
+        else {
             return Ok(Claimed::Nothing { throttled: skipped });
         };
         let permit = reserved
@@ -540,6 +663,74 @@ impl Worker {
                 );
             }
         }
+        self.run_recurring(force)
+    }
+
+    /// Registers this worker's recurring schedules with the backend (at
+    /// start, then every [`REGISTER_INTERVAL`], so the dashboard sees they
+    /// are still run), and enqueues each tick once it is due. Only one thread
+    /// of this worker does it at a time; the backend makes sure no other
+    /// worker enqueues the same tick again.
+    fn run_recurring(&self, force: bool) -> Result<()> {
+        if self.recurring.is_empty() {
+            return Ok(());
+        }
+        let mut clock = match self.recurring_clock.try_lock() {
+            Ok(clock) => clock,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return Ok(()),
+        };
+        let now = SystemTime::now();
+        let register = force
+            || clock
+                .registered
+                .is_none_or(|at| at.elapsed() >= REGISTER_INTERVAL);
+        if register {
+            // Retried at the next interval, not every keeper tick.
+            clock.registered = Some(Instant::now());
+            let records: Vec<_> = self.recurring.iter().map(|s| s.record(now)).collect();
+            let stored = self.queue.register_recurring(&records)?;
+            clock.next.resize(self.recurring.len(), None);
+            for ((schedule, stored), next) in
+                self.recurring.iter().zip(&stored).zip(&mut clock.next)
+            {
+                if next.is_none() {
+                    *next = schedule.first_due(stored, now);
+                }
+            }
+        }
+        for (schedule, next) in self.recurring.iter().zip(&mut clock.next) {
+            if next.is_none_or(|due| due > now) {
+                continue;
+            }
+            // The latest tick: after a long pause, the ones in between are
+            // skipped rather than run as a backlog.
+            let tick = schedule.cron().latest_until(now).or(*next).unwrap_or(now);
+            let mut job = NewJob::new(schedule.name(), schedule.queue(), schedule.args().to_vec());
+            let pushed = crate::enqueue::apply(&mut job)
+                .and_then(|()| self.queue.push_recurring(schedule.key(), tick, job));
+            match pushed {
+                Ok(Some(id)) => tracing::info!(
+                    schedule = schedule.key(),
+                    job = %id,
+                    tick_ms = millis(tick),
+                    "enqueued a recurring job"
+                ),
+                Ok(None) => tracing::debug!(
+                    schedule = schedule.key(),
+                    tick_ms = millis(tick),
+                    "another worker already enqueued this recurring tick"
+                ),
+                Err(err @ Error::Vetoed { .. }) => tracing::warn!(
+                    schedule = schedule.key(),
+                    error = %Chain(&err),
+                    "an enqueue layer vetoed a recurring job; skipping this tick"
+                ),
+                // Left due, so the next pass tries again.
+                Err(err) => return Err(err),
+            }
+            *next = schedule.cron().next_after(now);
+        }
         Ok(())
     }
 
@@ -572,7 +763,7 @@ impl Worker {
 
     fn log_upkeep(&self, force: bool) {
         if let Err(err) = self.upkeep(force) {
-            tracing::error!(worker = %self.id, error = %Chain(&err), "heartbeat, recovery or promotion failed");
+            tracing::error!(worker = %self.id, error = %Chain(&err), "heartbeat, recovery, promotion or recurring jobs failed");
         }
     }
 
@@ -832,8 +1023,8 @@ impl Worker {
         }
     }
 
-    fn log_upkeep_error(&self, err: &crate::Error) {
-        tracing::error!(worker = %self.id, error = %Chain(err), "heartbeat, recovery or promotion failed");
+    fn log_upkeep_error(&self, err: &Error) {
+        tracing::error!(worker = %self.id, error = %Chain(err), "heartbeat, recovery, promotion or recurring jobs failed");
     }
 
     async fn execute_async(&self, job: Job<Processing>) {

@@ -3,15 +3,20 @@
 **Call it like an async function. Run it as a durable background job.**
 
 ```rust
-tokio::time::sleep(Duration::from_millis(200)).await; // runs here
-let job = generate_report(user_id).await?;            // queued for a worker
-let report: Option<Report> = job.result().await?;     // typed result, when ready
+let call: JobCall<Report> = generate_report(user_id); // nothing happened yet
+let job: JobHandle<Report> = call.await?;             // saved to a queue; a worker runs it
+let report: Option<Report> = job.result().await?;     // typed result, once it's done
 ```
 
-**The same `.await`. A different place to run.** Butler saves the job to a
-queue and returns a `JobHandle<Report>`. A worker executes it independently—even
-after the calling process exits. Use Redis, SQLite, or files to persist the
-work across process restarts.
+**Calling a job does nothing. Awaiting it enqueues.** `#[butler::job]` makes
+`generate_report` return a `JobCall<Report>`: its arguments, already
+serialized. `JobCall` implements
+[`IntoFuture`](https://doc.rust-lang.org/std/future/trait.IntoFuture.html), so
+`.await` saves the job to a queue and returns a `JobHandle<Report>`. A worker
+executes it independently—even after the calling process exits. Use Redis,
+SQLite, or files to persist the work across process restarts. To run the body
+here instead, `generate_report(user_id).now().await?` returns the `Report`
+itself.
 
 **Async I/O or blocking work. Same enqueue call.** Add `#[butler::job]` to
 your function; its body stays ordinary Rust:
@@ -331,6 +336,28 @@ So `send_email(...).await` in your app resolves to (1). The worker never calls
 `send_email`: it runs (3), which decodes the arguments and runs your original
 body (2). `send_email(...).now()` runs (3) too, in your process. A function and a module can share the name `send_email` because Rust
 keeps values and types in separate namespaces.
+
+The enqueue itself is `JobCall`'s `IntoFuture` implementation. `.await` calls
+`into_future()` on whatever it is given; for a `JobCall`, that future writes the
+job:
+
+```rust
+impl<T: DeserializeOwned + Send + 'static> IntoFuture for JobCall<T> {
+    type Output = Result<JobHandle<T>, butler::Error>;
+    type IntoFuture = Enqueueing<T>;
+
+    fn into_future(self) -> Enqueueing<T> {
+        self.enqueue() // push to the backend; under tokio, on the blocking pool
+    }
+}
+```
+
+`T` is the job's success type, taken from its return type:
+`Result<Report, ReportError>` gives a `JobCall<Report>` and a
+`JobHandle<Report>`, and `()` gives a `JobHandle<()>`. The error type is not
+part of `T`: a failed job reports a `JobError` through the handle. Whatever
+executor polls the caller drives the enqueue, whether that is tokio, another
+runtime, or `butler::block_on`.
 
 The return type also shows the difference. The enqueue returns
 `Result<JobHandle<MessageId>, butler::Error>`, not your function's

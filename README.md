@@ -1295,6 +1295,7 @@ path = "butler.db"           # shared by every process that opens it
 [queue.redis]
 url = "redis://127.0.0.1:6379/"
 prefix = "butler"            # key namespace
+max_idle_connections = 32    # idle connections each process keeps for reuse
 
 [worker]
 concurrency = 4              # jobs running at once
@@ -1480,7 +1481,12 @@ script too: `SET recurring:tick:<key>:<ms> NX`, and the job's push only if
 that succeeded. Under a global queue limit, the claim script first checks
 `SCARD slots:<queue>`, claims nothing at the limit, and adds the claimed id
 to the set; completing, failing and recovering a job `SREM` it. Calls use a
-small connection pool, so concurrent claims don't wait on each other.
+connection pool, so concurrent claims don't wait on each other. It keeps up
+to `max_idle_connections` (32 by default) idle connections per process for
+reuse; beyond that, a call that needs one opens it and closes it afterwards,
+so a burst doesn't leave connections open for good. Set it to about a
+worker's `concurrency` plus `claimers` to avoid reconnecting under steady
+load, or with `RedisQueue::max_idle_connections`.
 
 The job's return value goes into the job hash's `data`, next to its arguments.
 

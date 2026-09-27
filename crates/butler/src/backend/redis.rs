@@ -88,7 +88,7 @@ use redis::{Client, Connection, RedisResult};
 
 use super::{GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
 use crate::{
-    Error, JobId, JobRecord, JobState, RecurringRecord, Result, Signal,
+    Error, JobId, JobRecord, JobState, RecurringRecord, RedisConfig, Result, Signal,
     job::{from_millis, millis},
     monitor::{
         JobMetric, ListFilter, METRICS_RETENTION_MINUTES, MetricBucket, QueueStats, Stats,
@@ -357,9 +357,11 @@ return 1
 
 pub struct RedisQueue {
     client: Client,
-    /// Idle connections. A blocking claim holds one for up to its wait, so
-    /// calls check out their own instead of sharing a single connection.
+    /// Idle connections. Concurrent calls check out their own instead of
+    /// sharing a single connection; at most `max_idle` are kept afterwards,
+    /// so a burst of calls doesn't leave its connections open for good.
     idle: Mutex<Vec<Connection>>,
+    max_idle: usize,
     prefix: String,
     display: String,
     /// Notified from pub/sub messages; see [`Signals`].
@@ -441,11 +443,28 @@ impl RedisQueue {
         Ok(Self {
             client,
             idle: Mutex::new(vec![conn]),
+            max_idle: RedisConfig::DEFAULT_MAX_IDLE_CONNECTIONS,
             prefix: prefix.to_string(),
             display: format!("redis:{} (prefix {prefix})", redact(url)),
             signals: Arc::default(),
             subscriber: OnceLock::new(),
         })
+    }
+
+    /// Keeps at most `max` idle connections for reuse ([`RedisConfig::DEFAULT_MAX_IDLE_CONNECTIONS`] by default). A
+    /// call that finds none idle opens one, and closes it afterwards if
+    /// `max` are already idle; `0` closes every connection after its call.
+    /// It doesn't limit how many calls run at once: size it to the calls a
+    /// process makes concurrently, about its worker's `concurrency` plus
+    /// `claimers`, to avoid reconnecting under steady load.
+    #[must_use]
+    pub fn max_idle_connections(mut self, max: usize) -> Self {
+        self.max_idle = max;
+        self.idle
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .truncate(max);
+        self
     }
 
     fn key(&self, name: &str) -> String {
@@ -508,8 +527,9 @@ impl RedisQueue {
     }
 
     /// Runs `f` on an idle connection, or a new one. The connection goes back
-    /// to the pool afterwards unless it failed at the I/O level. The lock is
-    /// only held to take or return a connection, never during a command.
+    /// to the pool afterwards unless it failed at the I/O level or the pool
+    /// is full. The lock is only held to take or return a connection, never
+    /// during a command.
     fn with_conn<T>(&self, f: impl FnOnce(&mut Connection) -> RedisResult<T>) -> Result<T> {
         let idle = self
             .idle
@@ -524,10 +544,10 @@ impl RedisQueue {
         let broken = matches!(&result, Err(e)
             if e.is_io_error() || e.is_connection_dropped() || e.is_unrecoverable_error());
         if !broken {
-            self.idle
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(conn);
+            let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+            if idle.len() < self.max_idle {
+                idle.push(conn);
+            }
         }
         Ok(result?)
     }
@@ -1578,6 +1598,64 @@ fn redact(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::sync::{Arc, Barrier, PoisonError};
+
+    use super::RedisQueue;
+
+    fn idle(queue: &RedisQueue) -> usize {
+        queue
+            .idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Needs a Redis server, like the integration tests; skipped without one.
+    #[test]
+    fn keeps_at_most_max_idle_connections() {
+        let url = std::env::var("BUTLER_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379/".into());
+        let prefix = format!("butler-pool-{}", std::process::id());
+        let queue = match RedisQueue::connect(&url, &prefix) {
+            Ok(queue) => Arc::new(queue.max_idle_connections(3)),
+            Err(e) => {
+                eprintln!("skipping redis: {e}");
+                return;
+            }
+        };
+        // Eight calls at once, each on its own connection.
+        let calls = 8;
+        let barrier = Arc::new(Barrier::new(calls));
+        let threads: Vec<_> = (0..calls)
+            .map(|_| {
+                let (queue, barrier) = (Arc::clone(&queue), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    queue
+                        .with_conn(|con| {
+                            barrier.wait();
+                            redis::cmd("PING").query::<String>(con)
+                        })
+                        .unwrap()
+                })
+            })
+            .collect();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap(), "PONG");
+        }
+        assert_eq!(idle(&queue), 3);
+
+        let queue = RedisQueue::connect(&url, &prefix)
+            .unwrap()
+            .max_idle_connections(0);
+        assert_eq!(idle(&queue), 0, "the connect-time connection is dropped");
+        queue
+            .with_conn(|con| redis::cmd("PING").query::<String>(con))
+            .unwrap();
+        assert_eq!(idle(&queue), 0);
+    }
+
     #[test]
     fn redacts_credentials() {
         assert_eq!(

@@ -246,6 +246,77 @@ async fn a_base_path_prefixes_every_link() {
 }
 
 #[tokio::test]
+async fn error_pages_keep_the_base_path() {
+    let f = fixture("/admin/jobs");
+    let app = Router::new().nest("/admin/jobs", f.app.clone());
+    let pages = [
+        (
+            "/admin/jobs/jobs/nope",
+            StatusCode::NOT_FOUND,
+            "job nope not found",
+        ),
+        (
+            "/admin/jobs/no-such-page",
+            StatusCode::NOT_FOUND,
+            "page not found",
+        ),
+    ];
+    for (uri, expected, message) in pages {
+        let (status, html) = get(&app, uri).await;
+        assert_eq!(status, expected, "{uri}");
+        assert!(html.contains(message), "{uri}");
+        assert!(
+            html.contains(r#"href="/admin/jobs/assets/app.css""#),
+            "{uri}"
+        );
+        assert!(html.contains(r#"data-base="/admin/jobs""#), "{uri}");
+        assert!(
+            html.contains(r#"href="/admin/jobs/jobs?state=dead""#),
+            "{uri}"
+        );
+        assert!(!html.contains(r#"href="/""#), "{uri}: a link to the root");
+    }
+
+    // Errors from actions, too.
+    let (status, html) = post_page(&app, "/admin/jobs/queues/bad%20queue/pause").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        html.contains(r#"href="/admin/jobs/""#),
+        "back to the dashboard"
+    );
+    assert!(!html.contains(r#"href="/""#));
+}
+
+#[tokio::test]
+async fn error_pages_at_the_root_link_to_the_root() {
+    let f = fixture("");
+    for uri in ["/jobs/nope", "/no-such-page"] {
+        let (status, html) = get(&f.app, uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert!(html.contains(r#"href="/assets/app.css""#), "{uri}");
+        assert!(html.contains(r#"href="/""#), "{uri}");
+    }
+}
+
+/// A same-origin POST, returning the page it answers with.
+async fn post_page(app: &Router, uri: &str) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(uri)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+#[tokio::test]
 async fn json_endpoints_assets_and_the_live_stream() {
     let f = fixture("");
     let (status, body) = get(&f.app, "/api/stats").await;

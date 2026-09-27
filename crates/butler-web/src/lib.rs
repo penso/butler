@@ -97,6 +97,11 @@ impl Dashboard {
             .route("/api/stats", get(events::stats_json))
             .route("/api/metrics", get(pages::metrics_json))
             .route("/assets/{file}", get(assets::serve))
+            .fallback(error::not_found)
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                error::with_base_path,
+            ))
             .layer(middleware::from_fn(same_origin_posts))
             .with_state(state)
     }

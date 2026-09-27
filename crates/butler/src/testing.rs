@@ -25,6 +25,21 @@
 //! being polled, on whatever thread polls it. Work you `tokio::spawn` from
 //! inside is a separate task, so it enqueues normally. It needs no worker, no
 //! configured queue, and no runtime (it also works under [`block_on`](crate::block_on)).
+//!
+//! To check what code enqueues without running it, use [`RecordedJobs`]
+//! instead: like ActiveJob's `assert_enqueued_with`.
+//!
+//! # Nested scopes
+//!
+//! Scopes nest, and the innermost one decides: inside
+//! [`RecordedJobs::record`] within [`InlineJobs::perform`], jobs are
+//! recorded, not run; inside `perform` within `record`, they run inline, and
+//! the outer recording doesn't see them. When the inner scope ends, the outer
+//! one applies again.
+
+mod recorded;
+
+pub use recorded::{EnqueuedJob, RecordedJobs, Recording};
 
 use std::{
     cell::RefCell,
@@ -45,8 +60,29 @@ use crate::{
 };
 
 thread_local! {
-    /// The inline scope being polled on this thread, if any.
-    static INLINE: RefCell<Option<InlineJobs>> = const { RefCell::new(None) };
+    /// The innermost testing scope being polled on this thread, if any.
+    static SCOPE: RefCell<Option<Scope>> = const { RefCell::new(None) };
+}
+
+/// What a testing scope does with the jobs enqueued inside it.
+#[derive(Clone)]
+pub(crate) enum Scope {
+    Inline(InlineJobs),
+    Record(RecordedJobs),
+}
+
+impl Scope {
+    /// Replaces the enqueue of a job that already passed the enqueue layers.
+    pub(crate) async fn enqueue<T>(
+        &self,
+        def: &'static JobDef,
+        job: NewJob,
+    ) -> Result<JobHandle<T>> {
+        match self {
+            Scope::Inline(inline) => inline.run(def, job).await,
+            Scope::Record(recorded) => recorded.record_job(def, job),
+        }
+    }
 }
 
 /// Runs every job enqueued while `body` runs, immediately, like ActiveJob's
@@ -201,23 +237,28 @@ impl<F: Future> Future for Performing<F> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
         let this = &mut *self;
-        let previous = INLINE.with(|inline| inline.replace(Some(this.jobs.clone())));
-        // Restores the outer scope even if `body` panics.
-        let _restore = Restore(previous);
+        let _restore = enter(Scope::Inline(this.jobs.clone()));
         this.body.as_mut().poll(cx)
     }
 }
 
-struct Restore(Option<InlineJobs>);
+/// Makes `scope` the current one on this thread until the guard drops, which
+/// restores the outer scope, even if polling the body panics.
+pub(crate) fn enter(scope: Scope) -> Restore {
+    Restore(SCOPE.with(|current| current.replace(Some(scope))))
+}
+
+pub(crate) struct Restore(Option<Scope>);
 
 impl Drop for Restore {
     fn drop(&mut self) {
         let previous = self.0.take();
-        INLINE.with(|inline| *inline.borrow_mut() = previous);
+        SCOPE.with(|current| *current.borrow_mut() = previous);
     }
 }
 
-/// Used by the enqueue path: `Some` when a job enqueued now must run inline.
-pub(crate) fn current() -> Option<InlineJobs> {
-    INLINE.with(|inline| inline.borrow().clone())
+/// Used by the enqueue path: `Some` when a job enqueued now must run inline
+/// or be recorded rather than enqueued.
+pub(crate) fn current() -> Option<Scope> {
+    SCOPE.with(|current| current.borrow().clone())
 }

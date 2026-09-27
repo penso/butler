@@ -1178,6 +1178,7 @@ assert_eq!(handle.result().await?, Some(()));                   // results are t
 | Run job calls immediately | `perform_enqueued_jobs(async { ... }).await` |
 | Execute work already queued | `Worker::new(queue).drain()` |
 | Assert which jobs ran | `jobs.perform(...)`, then `jobs.performed()` or `jobs.performed_names()` |
+| Assert what was enqueued, without running it | `RecordedJobs::record(...)`, then `assert_enqueued_with(...)` |
 | Inspect an enqueued job | Enqueue outside inline mode, then `handle.job().await` |
 
 How it behaves:
@@ -1195,6 +1196,48 @@ How it behaves:
 - Inline mode is on while the future you pass is being polled. Work you
   `tokio::spawn` from inside is a separate task, so its jobs are enqueued
   normally.
+
+To check what code enqueues without running anything, like ActiveJob's
+`assert_enqueued_with`, record it with `RecordedJobs`:
+
+```rust
+use butler::testing::RecordedJobs;
+
+let jobs = RecordedJobs::new();
+jobs.record(async { signup("ada@example.com").await.unwrap() }).await;
+
+// Same job, same arguments, converted as the call converts them.
+let email = jobs.assert_enqueued_with(send_email("ada@example.com", "Welcome"));
+assert_eq!(email.job.queue, "mailers");
+assert_eq!(jobs.enqueued_names(), ["send_email"]);
+
+// Or match on part of the arguments, decoded as the job decodes them.
+jobs.assert_enqueued(&send_email::JOB, |job| {
+    job.arg::<String>(0).is_ok_and(|to| to.ends_with("@example.com"))
+});
+
+jobs.clear();
+jobs.assert_no_enqueued_jobs();
+```
+
+- Nothing runs and no queue is touched: each enqueue is recorded as the job
+  that would be stored (`EnqueuedJob`: its handle's `id`, and `job`, a
+  `NewJob` with name, queue, JSON arguments, `run_at`, meta, concurrency and
+  unique keys). `jobs.enqueued()` lists them in order; `enqueued_of(&JOB)`
+  filters by job.
+- Every enqueue path is recorded: `.await` on a job call, `.enqueue()`,
+  `prepare(..)` with `on_queue`, `run_in` or `run_at`, and `enqueue_all`, one
+  entry per job. Enqueue layers run first, so their meta and queue changes
+  are recorded, and a veto returns `Error::Vetoed` and records nothing.
+- Each enqueue returns a real `JobHandle`, from a private in-memory store:
+  it stays `Pending` (or `Scheduled`) since nothing runs it, `result()` is
+  `None`, `cancel()` works, and `wait` never returns.
+- Keys are recorded, not enforced: enqueueing the same unique job twice
+  records it twice.
+- Scopes nest and the innermost decides: `record` inside `perform` records,
+  `perform` inside `record` runs inline (and the recording doesn't see those
+  jobs). Recording follows the future you pass, like inline mode, so work you
+  `tokio::spawn` from inside enqueues normally. It needs no runtime.
 
 ### Queues and priority
 
@@ -1358,7 +1401,7 @@ let b = refresh_feed(7).await?;     // the same job: b.id() == a.id()
   `enqueue_all`, duplicates within one batch included). The check and the
   store are one atomic step in every backend.
 - Inside `testing::perform_enqueued_jobs`, jobs run inline as before: no keys
-  apply.
+  apply. `testing::RecordedJobs` records the keys without enforcing them.
 
 ## Configuration
 
@@ -1785,6 +1828,7 @@ crates/butler/                   the library (published as `butler`)
   src/retry.rs                   Backoff, Retry, Retryable, RetryPolicy
   src/recurring.rs               Cron, Recurring, RecurringRecord (recurring jobs)
   src/testing.rs                 perform_enqueued_jobs, InlineJobs
+  src/testing/recorded.rs        RecordedJobs (assert what was enqueued)
   src/backend/mod.rs             Backend traits (Store, Monitor, Watch), Queue handle
   src/backend/file.rs            file backend
   src/backend/redis.rs           Redis backend (feature "redis")

@@ -23,7 +23,7 @@ after crashes. Reliability and correct job lifecycle semantics come first.
 | `crates/butler/src/job.rs` | Serialized job records, identifiers, states, and typed transitions |
 | `crates/butler/src/handle.rs` | `JobHandle<T>`: state, cancel, wait, and the job's result |
 | `crates/butler/src/arg.rs`, `prepared.rs` | Borrow-friendly job arguments, prepared jobs, and bulk enqueueing |
-| `crates/butler/src/progress.rs`, `testing.rs` | Continuations and inline job testing |
+| `crates/butler/src/progress.rs`, `testing.rs`, `testing/` | Continuations, inline job testing, and recorded enqueues |
 | `crates/butler/src/worker.rs` | Claiming, running, retrying: `run` (threads), `run_async` (tokio), `drain` |
 | `crates/butler/src/queues.rs`, `limits.rs`, `signal.rs` | Queue priority, concurrency limits, and wake-ups |
 | `crates/butler/src/retry.rs` | Retry policies: `Backoff`, `Retry`, `Retryable`, `retryable!` for wrapped errors |
@@ -69,7 +69,10 @@ after crashes. Reliability and correct job lifecycle semantics come first.
   never block report `blocks() == false`, so async callers skip the blocking
   pool.
 - `butler::testing` runs jobs inline in tests by calling the job's `JobDef`
-  directly from the enqueue path. Keep it free of queue and worker state.
+  directly from the enqueue path, or records them (`RecordedJobs`) instead of
+  enqueueing. Both hook every enqueue path after the enqueue layers, through
+  one thread-local scope where the innermost wins. Keep it free of queue and
+  worker state.
 - `Backend::push_many` should be one step where the backend allows it (one
   round trip, one transaction); the default loops over `push`.
 - Continuations: a checkpoint saves progress (throttled by

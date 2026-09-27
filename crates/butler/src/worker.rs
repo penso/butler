@@ -65,6 +65,13 @@ const PROMOTE_INTERVAL: Duration = KEEPER_TICK;
 /// resuming one takes effect within about this long.
 const PAUSED_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How often the keeper deletes finished jobs past their retention, and how
+/// many at most per call. A full batch means more are waiting: the next one
+/// runs at the next keeper tick, so a backlog drains without holding the
+/// backend (or delaying the heartbeat) for long at a time.
+const CLEAN_INTERVAL: Duration = Duration::from_secs(60);
+const CLEAN_BATCH: usize = 1_000;
+
 /// Pulls jobs from a [`Queue`] and runs them. It can run every `#[job]`
 /// function compiled into the current binary.
 ///
@@ -123,6 +130,9 @@ struct Upkeep {
     recovered: Option<Instant>,
     promoted: Option<Instant>,
     paused: Option<Instant>,
+    cleaned: Option<Instant>,
+    /// The last cleanup deleted a full batch.
+    clean_backlog: bool,
 }
 
 impl Worker {
@@ -455,6 +465,7 @@ impl Worker {
             thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     worker.log_upkeep(false);
+                    worker.clean_finished();
                     thread::sleep(KEEPER_TICK);
                 }
             })
@@ -734,6 +745,40 @@ impl Worker {
         Ok(())
     }
 
+    /// Deletes a batch of finished jobs past the backend's retention, when
+    /// due: every [`CLEAN_INTERVAL`], or at once after a full batch. Only
+    /// the keeper does it, never a thread about to run a job.
+    fn clean_finished(&self) {
+        let now = Instant::now();
+        {
+            let last = self.upkeep.lock().unwrap_or_else(PoisonError::into_inner);
+            let every = if last.clean_backlog {
+                Duration::ZERO
+            } else {
+                CLEAN_INTERVAL
+            };
+            if last
+                .cleaned
+                .is_some_and(|at| now.duration_since(at) < every)
+            {
+                return;
+            }
+        }
+        let deleted = self.queue.clean_finished(SystemTime::now(), CLEAN_BATCH);
+        let mut last = self.upkeep.lock().unwrap_or_else(PoisonError::into_inner);
+        last.cleaned = Some(now);
+        last.clean_backlog = matches!(deleted, Ok(CLEAN_BATCH));
+        match deleted {
+            Ok(0) => {}
+            Ok(deleted) => tracing::debug!(deleted, "deleted finished jobs past their retention"),
+            Err(err) => tracing::warn!(
+                worker = %self.id,
+                error = %Chain(&err),
+                "could not delete finished jobs past their retention"
+            ),
+        }
+    }
+
     /// Reads the paused queues from the backend, and logs when one this
     /// worker serves is paused or resumed.
     fn refresh_paused(&self) -> Result<()> {
@@ -935,6 +980,11 @@ impl Worker {
             async move {
                 loop {
                     upkeep(worker.clone(), false).await;
+                    let w = worker.clone();
+                    if let Err(err) = tokio::task::spawn_blocking(move || w.clean_finished()).await
+                    {
+                        tracing::error!(error = %err, "cleaning up finished jobs panicked");
+                    }
                     tokio::time::sleep(KEEPER_TICK).await;
                 }
             }

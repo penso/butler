@@ -3,6 +3,10 @@
 
 [queue]
 backend = "redis" # "redis", "sqlite", "file", or "memory" (in-process only)
+# Done and cancelled jobs, with their results, then deleted by workers:
+# "forever" or a duration like "90m", "12h", "7d". Dead jobs: keep_dead.
+keep_dead     = "forever"
+keep_finished = "1d"
 
 [queue.file]
 dir = ".butler"

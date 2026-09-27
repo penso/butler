@@ -53,6 +53,11 @@
 //! After lowering a limit, slots numbered above the new one stay held until
 //! their jobs finish.
 //!
+//! A finished job's file is written (done, dead) or touched (cancelled) when
+//! it finishes, so its modification time is when it finished: cleaning up
+//! deletes the files of `done/`, `cancelled/` and `dead/` older than the
+//! queue's [`Retention`](crate::Retention).
+//!
 //! A recurring tick is claimed by hard-linking a marker file, already
 //! holding the job id, to `recurring/ticks/<key>/<tick>`: a link fails if the
 //! name exists, so exactly one worker creates it, and only that worker then
@@ -70,7 +75,7 @@ use std::{
 
 use super::{GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
 use crate::{
-    JobId, JobRecord, JobState, RecurringRecord, Result,
+    JobId, JobRecord, JobState, RecurringRecord, Result, Retention,
     job::{DEFAULT_QUEUE, from_millis, millis},
     monitor::{ListFilter, QueueStats, Stats, WorkerStats},
 };
@@ -101,6 +106,7 @@ const TICKS: &str = "recurring/ticks";
 #[derive(Debug, Clone)]
 pub struct FileQueue {
     root: PathBuf,
+    retention: Retention,
 }
 
 impl FileQueue {
@@ -113,7 +119,16 @@ impl FileQueue {
             fs::create_dir_all(root.join(state.as_str()))?;
         }
         fs::create_dir_all(root.join(JobState::Pending.as_str()).join(DEFAULT_QUEUE))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            retention: Retention::default(),
+        })
+    }
+
+    /// Keeps finished jobs for `retention`.
+    pub fn retention(mut self, retention: Retention) -> Self {
+        self.retention = retention;
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -728,6 +743,13 @@ impl Store for FileQueue {
         if taken {
             let job: JobRecord = serde_json::from_slice(&fs::read(&cancelled)?)?;
             self.unlock(&job)?;
+            // The rename kept the time it was written; cleaning up counts
+            // from now.
+            match fs::File::options().write(true).open(&cancelled) {
+                Ok(file) => file.set_modified(SystemTime::now())?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         Ok(taken)
     }
@@ -886,6 +908,41 @@ impl Store for FileQueue {
             ignore_missing(fs::remove_file(dir.join(name)))?;
         }
         Ok(Some(job.id))
+    }
+
+    fn clean_finished(&self, now: SystemTime, limit: usize) -> Result<usize> {
+        let mut deleted = 0;
+        for (state, keep) in [
+            (JobState::Done, self.retention.finished),
+            (JobState::Cancelled, self.retention.finished),
+            (JobState::Dead, self.retention.dead),
+        ] {
+            let Some(cutoff) = keep.cutoff(now) else {
+                continue;
+            };
+            for entry in fs::read_dir(self.dir(state))? {
+                if deleted == limit {
+                    return Ok(deleted);
+                }
+                let entry = entry?;
+                let finished_at = match entry.metadata() {
+                    Ok(meta) if meta.is_file() => meta.modified()?,
+                    Ok(_) => continue,
+                    // Discarded or retried meanwhile.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                if finished_at >= cutoff {
+                    continue;
+                }
+                match fs::remove_file(entry.path()) {
+                    Ok(()) => deleted += 1,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(deleted)
     }
 
     fn describe(&self) -> String {
@@ -1137,4 +1194,45 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use crate::{Keep, Retention};
+
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn a_cancelled_job_is_kept_from_when_it_was_cancelled_not_pushed() {
+        let dir = std::env::temp_dir().join(format!(
+            "butler-file-cancel-retention-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let queue = FileQueue::new(&dir).unwrap().retention(Retention {
+            finished: Keep::For(HOUR),
+            dead: Keep::Forever,
+        });
+        let id = queue.push(NewJob::new("a", "default", vec![])).unwrap();
+        // Pushed two hours ago.
+        let file = queue.pending(DEFAULT_QUEUE).join(format!("{id}.json"));
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(SystemTime::now() - 2 * HOUR)
+            .unwrap();
+        assert!(queue.cancel(&id).unwrap());
+
+        let soon = SystemTime::now() + HOUR / 2;
+        assert_eq!(queue.clean_finished(soon, 10).unwrap(), 0);
+        assert_eq!(queue.get(&id).unwrap().unwrap().0, JobState::Cancelled);
+        let later = SystemTime::now() + 2 * HOUR;
+        assert_eq!(queue.clean_finished(later, 10).unwrap(), 1);
+        assert!(queue.get(&id).unwrap().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

@@ -102,6 +102,7 @@ crashes; storage durability still depends on the backend's configuration.
   - [Recurring jobs](#recurring-jobs)
   - [Retries and backoff](#retries-and-backoff)
   - [Results](#results)
+  - [Keeping finished jobs](#keeping-finished-jobs)
   - [Running a worker](#running-a-worker)
   - [Middleware](#middleware)
   - [Job continuations](#job-continuations)
@@ -863,13 +864,42 @@ backend notifies waiters (Redis over pub/sub, memory in-process), and under
 tokio the wait is an `await` on a `tokio::sync::Notify`, so thousands of
 handles can wait without holding a thread each. The interval you pass is only
 a fallback check; the file backend can't notify, so there it is the polling
-interval. The result stays readable as long as the job does (24 hours on
-Redis). A handle rebuilt from an id is untyped:
+interval. The result stays readable as long as the job does: a day by
+default, see [Keeping finished jobs](#keeping-finished-jobs). A handle rebuilt
+from an id is untyped:
 `queue.handle(id).with_output::<i64>()`.
 
 `cancel` is atomic against workers claiming the job: either the worker gets it
 or the cancel does, never both. A job that is already running is not
 interrupted, and `cancel` returns `false`.
+
+### Keeping finished jobs
+
+Done and cancelled jobs, with their results, are kept for `keep_finished`
+(default a day), and dead jobs for `keep_dead` (default forever, until you
+discard or retry them from the dashboard):
+
+```toml
+[queue]
+keep_finished = "7d"         # "forever", or a duration: "90m", "12h", "7d"
+keep_dead = "30d"            # default "forever"
+```
+
+Running workers delete older ones, at most 1,000 per call, once a minute, or
+at every keeper tick while a backlog remains. Only finished jobs are ever
+deleted: nothing pending, scheduled or running, and nothing a live job
+relies on (unique keys, concurrency and limit slots, recurring ticks, which
+are remembered on their own). Retention is at least a minute, so a
+`JobHandle` waiting on a job still finds it when it wakes; read results within
+`keep_finished`, after which `JobNotFound` is returned.
+
+Redis gives done and cancelled jobs a TTL of `keep_finished` when they
+finish, so changing it applies to jobs finishing afterwards. SQLite indexes
+finish times, and keeps its most recently finished job as the numbering
+point for cross-process wake-ups. Databases and dead Redis jobs from before
+this setting existed count their finished jobs from the first time a new
+version sees them. In code, pass a `butler::Retention` to the backend's
+`retention` method: `SqliteQueue::open(path)?.retention(retention)`.
 
 ### Running a worker
 
@@ -1285,6 +1315,8 @@ host application's configuration. To migrate, rename your Butler config to
 ```toml
 [queue]
 backend = "redis"            # "file" (default), "redis", "sqlite", or "memory"
+keep_finished = "1d"         # done and cancelled jobs; "forever" or a duration
+keep_dead = "forever"        # dead jobs; default until discarded or retried
 
 [queue.file]
 dir = ".butler"
@@ -1418,6 +1450,10 @@ exists, so exactly one worker creates it and enqueues the job. The job file is
 written under `tmp/` first and renamed into its queue after the link; a crash
 between the two loses that one tick.
 
+A finished job's file is written when it finishes (touched, for a cancelled
+one), so cleaning up deletes files in `done/`, `cancelled/` and `dead/` whose
+modification time is older than their retention.
+
 ### Redis
 
 `crates/butler/src/backend/redis.rs`. Stores queued job ids in Redis lists:
@@ -1429,10 +1465,10 @@ between the two loses that one tick.
 | `butler:worker:<worker>` | STRING | the worker's heartbeat; expires after `heartbeat_ttl_secs` |
 | `butler:workers` | SET | worker ids that may hold jobs, checked by recovery |
 | `butler:scheduled` | ZSET | ids waiting for their run time; the score is the time in ms |
-| `butler:dead` | LIST | ids that exhausted their retries |
+| `butler:dead` | LIST | ids that exhausted their retries, newest first; cleaned up after `keep_dead` |
 | `butler:wake` | pub/sub channel | a message per push, retry and recovery; wakes idle workers |
 | `butler:done` | pub/sub channel | a message per job done, dead or cancelled; wakes `wait_result` |
-| `butler:job:<id>` | HASH | `state`, `queue`, and `data` (job JSON), plus `ckey`/`climit` and `ukey`/`umode` for keyed and unique jobs; done and cancelled jobs expire after 24h |
+| `butler:job:<id>` | HASH | `state`, `queue`, and `data` (job JSON), plus `ckey`/`climit` and `ukey`/`umode` for keyed and unique jobs, and `finished_at` once dead; done and cancelled jobs expire after `keep_finished` |
 | `butler:running:<key>` | SET | ids running with a concurrency key (by the key's hash) |
 | `butler:blocked:<key>` | LIST | ids skipped because their concurrency key was full |
 | `butler:blocked` | HASH | per queue, how many of its ids wait in blocked lists |
@@ -1491,7 +1527,7 @@ processes on the same machine:
 
 | Table | Columns | Purpose |
 |---|---|---|
-| `butler_jobs` | `id, queue, state, worker, seq, data, run_at, slot, ckey, climit, ukey, umode` | every job; `data` is the job JSON, `seq` the order in its queue, `run_at` a scheduled job's time in ms, `slot` set while it holds a global-limit slot, then its concurrency and unique keys |
+| `butler_jobs` | `id, queue, state, worker, seq, data, finished_seq, run_at, slot, ckey, climit, ukey, umode, finished_at` | every job; `data` is the job JSON, `seq` the order in its queue, `finished_seq` the order jobs finished in, `run_at` a scheduled job's time in ms, `slot` set while it holds a global-limit slot, then its concurrency and unique keys, and when it finished in ms |
 | `butler_workers` | `worker, expires_at_ms` | heartbeats, for crash recovery |
 | `butler_paused` | `queue, paused_at_ms` | paused queues; created when an older database is opened |
 | `butler_recurring` | `key, data, created_at_ms, seen_at_ms, last_tick_ms, last_job_id` | recurring schedules and their last run |
@@ -1552,7 +1588,7 @@ gives one shared queue per process. It follows the same rules as the other
 backends, heartbeats and recovery included, and a waiting claim wakes as soon
 as a job is pushed. Scheduled jobs wait in a `BTreeSet` ordered by run time. Use it for tests, benchmarks, and apps whose workers run
 in the same process. Nothing survives a restart, and finished jobs stay in
-memory until the process exits.
+memory for their retention, while a worker runs to clean them up.
 
 `crates/butler/tests/backends.rs` runs the same contract checks (FIFO claims,
 waking on push, cancel against claim, results, retries, recovery, scheduled

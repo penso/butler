@@ -4,6 +4,8 @@
 //! ```toml
 //! [queue]
 //! backend = "redis"            # "file" (default), "redis", or "memory" (in-process)
+//! keep_finished = "1d"         # done and cancelled jobs, then deleted (default "1d")
+//! keep_dead = "forever"        # dead jobs (default: until discarded or retried)
 //!
 //! [queue.file]
 //! dir = ".butler"
@@ -51,7 +53,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    Backoff, Cron, Error, FileQueue, Queue, QueuePriority, Result,
+    Backoff, Cron, Error, FileQueue, Keep, Queue, QueuePriority, Result, Retention,
     job::{DEFAULT_QUEUE, is_valid_queue_name},
     recurring,
 };
@@ -117,13 +119,43 @@ impl RecurringConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct QueueConfig {
     pub backend: BackendKind,
+    /// How long done and cancelled jobs (and their results) are kept:
+    /// `"forever"`, or a duration of at least a minute such as `"7d"`.
+    /// Running workers delete older ones. Default: a day.
+    pub keep_finished: Keep,
+    /// How long dead jobs are kept, as `keep_finished`. Default: forever,
+    /// until discarded or retried.
+    pub keep_dead: Keep,
     pub file: FileConfig,
     pub redis: RedisConfig,
     pub sqlite: SqliteConfig,
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        let retention = Retention::default();
+        Self {
+            backend: BackendKind::default(),
+            keep_finished: retention.finished,
+            keep_dead: retention.dead,
+            file: FileConfig::default(),
+            redis: RedisConfig::default(),
+            sqlite: SqliteConfig::default(),
+        }
+    }
+}
+
+impl QueueConfig {
+    pub fn retention(&self) -> Retention {
+        Retention {
+            finished: self.keep_finished,
+            dead: self.keep_dead,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -366,17 +398,24 @@ impl Config {
 
     /// Opens the configured backend.
     pub fn connect(&self) -> Result<Queue> {
+        let retention = self.queue.retention();
         match self.queue.backend {
-            BackendKind::File => Ok(FileQueue::new(&self.queue.file.dir)?.into()),
-            BackendKind::Memory => Ok(crate::MemoryQueue::shared().into()),
+            BackendKind::File => Ok(FileQueue::new(&self.queue.file.dir)?
+                .retention(retention)
+                .into()),
+            BackendKind::Memory => Ok(crate::MemoryQueue::shared().retention(retention).into()),
             #[cfg(feature = "sqlite")]
-            BackendKind::Sqlite => Ok(crate::SqliteQueue::open(&self.queue.sqlite.path)?.into()),
+            BackendKind::Sqlite => Ok(crate::SqliteQueue::open(&self.queue.sqlite.path)?
+                .retention(retention)
+                .into()),
             #[cfg(not(feature = "sqlite"))]
             BackendKind::Sqlite => Err(Error::BackendDisabled("sqlite")),
             #[cfg(feature = "redis")]
             BackendKind::Redis => {
                 let redis = &self.queue.redis;
-                Ok(crate::RedisQueue::connect(&redis.url, &redis.prefix)?.into())
+                Ok(crate::RedisQueue::connect(&redis.url, &redis.prefix)?
+                    .retention(retention)
+                    .into())
             }
             #[cfg(not(feature = "redis"))]
             BackendKind::Redis => Err(Error::BackendDisabled("redis")),
@@ -491,6 +530,39 @@ mod tests {
         let polynomial = load("[worker]\nbackoff = \"polynomial\"\n").unwrap();
         assert_eq!(polynomial.worker.backoff, Backoff::Polynomial);
         assert!(load("[worker]\nbackoff = \"sometimes\"\n").is_err());
+    }
+
+    #[test]
+    fn retention_loads_with_defaults_and_rejects_bad_values() {
+        let defaults = load("").unwrap().queue.retention();
+        assert_eq!(defaults, Retention::default());
+        assert_eq!(
+            defaults.finished,
+            Keep::For(Duration::from_secs(24 * 60 * 60))
+        );
+        assert_eq!(defaults.dead, Keep::Forever);
+
+        let set = load("[queue]\nkeep_finished = \"7d\"\nkeep_dead = \"90d\"\n").unwrap();
+        assert_eq!(
+            set.queue.retention(),
+            Retention {
+                finished: Keep::For(Duration::from_secs(7 * 24 * 60 * 60)),
+                dead: Keep::For(Duration::from_secs(90 * 24 * 60 * 60)),
+            }
+        );
+        let forever = load("[queue]\nkeep_finished = \"forever\"\n").unwrap();
+        assert_eq!(forever.queue.keep_finished, Keep::Forever);
+
+        for bad in ["\"7\"", "\"10s\"", "\"never\"", "7"] {
+            assert!(
+                load(&format!("[queue]\nkeep_finished = {bad}\n")).is_err(),
+                "{bad}"
+            );
+            assert!(
+                load(&format!("[queue]\nkeep_dead = {bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

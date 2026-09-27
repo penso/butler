@@ -165,6 +165,20 @@ pub trait Store: Send + Sync + 'static {
         Err(Error::Unsupported("recurring jobs"))
     }
 
+    /// Deletes up to `limit` finished jobs old enough at `now` under the
+    /// backend's [`Retention`](crate::Retention): done and cancelled jobs
+    /// that finished more than `finished` ago, dead ones more than `dead`
+    /// ago. Returns how many it deleted. Jobs in any other state are never
+    /// touched, and neither is anything a live job relies on: unique keys,
+    /// concurrency and limit slots are held by jobs that haven't finished,
+    /// and recurring ticks are kept on their own. Workers call it
+    /// periodically. A backend may expire finished jobs on its own instead
+    /// (Redis expires done and cancelled jobs), and may keep its most
+    /// recently finished job. Default: deletes nothing.
+    fn clean_finished(&self, _now: SystemTime, _limit: usize) -> Result<usize> {
+        Ok(0)
+    }
+
     /// Whether calls can block on I/O (network, disk). Async callers send
     /// blocking backends' calls to tokio's blocking pool; calls to backends
     /// that never block run in place, which is much cheaper. `claim` with a
@@ -618,6 +632,12 @@ impl Queue {
     ) -> Result<Option<JobId>> {
         job.run_at = None;
         self.0.push_recurring(key, tick, job)
+    }
+
+    /// Deletes up to `limit` finished jobs older than the backend's
+    /// retention allows; see [`Store::clean_finished`].
+    pub fn clean_finished(&self, now: SystemTime, limit: usize) -> Result<usize> {
+        self.0.clean_finished(now, limit)
     }
 
     /// Every registered recurring schedule, sorted by key.

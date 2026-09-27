@@ -1,8 +1,8 @@
 //! The same two-process flow as `examples/demo`, without tokio: the worker
 //! runs jobs on plain threads and `.await` is driven by `butler::block_on`.
 //!
-//!   cargo run -p butler --example no_tokio -- worker            # terminal 1
-//!   cargo run -p butler --example no_tokio -- enqueue Ada 3     # terminal 2
+//!   cargo run -p butler-jobs --example no_tokio -- worker            # terminal 1
+//!   cargo run -p butler-jobs --example no_tokio -- enqueue Ada 3     # terminal 2
 //!
 //! Both read the queue settings from ./butler.toml (see `butler::Config`).
 

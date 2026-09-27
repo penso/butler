@@ -1,10 +1,14 @@
 [package]
+authors.workspace      = true
 categories.workspace   = true
 description            = "Web dashboard for butler: live stats over SSE, charts, and failed-job management"
 edition.workspace      = true
+homepage.workspace     = true
 keywords               = ["background", "dashboard", "jobs", "queue", "web"]
+license.workspace      = true
 name                   = "butler-web"
 readme                 = "README.md"
+repository.workspace   = true
 rust-version.workspace = true
 version.workspace      = true
 

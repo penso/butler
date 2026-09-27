@@ -3,6 +3,10 @@
 
 [queue]
 backend = "redis" # "redis", "sqlite", "file", or "memory" (in-process only)
+# Done and cancelled jobs, with their results, then deleted by workers:
+# "forever" or a duration like "90m", "12h", "7d". Dead jobs: keep_dead.
+keep_dead     = "forever"
+keep_finished = "1d"
 
 [queue.file]
 dir = ".butler"
@@ -13,6 +17,8 @@ path = "butler.db"
 [queue.redis]
 prefix = "butler"
 url    = "redis://127.0.0.1:6379/"
+# Idle connections each process keeps for reuse; more open when needed.
+max_idle_connections = 32
 
 [worker]
 concurrency           = 4

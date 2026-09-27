@@ -353,6 +353,14 @@ pub(crate) fn validate_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validates every schedule's key, so a batch with one bad key is rejected
+/// before anything is written.
+pub(crate) fn validate_keys(schedules: &[RecurringRecord]) -> Result<()> {
+    schedules
+        .iter()
+        .try_for_each(|schedule| validate_key(&schedule.key))
+}
+
 /// A recurring schedule as a backend stores it: its definition, when workers
 /// registered it, and its last run. Times are milliseconds since the Unix
 /// epoch.

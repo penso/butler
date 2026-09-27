@@ -13,8 +13,9 @@ use std::{
 };
 
 use butler::{
-    AnyJob, Backoff, ConcurrencyKey, Cron, Failed, FileQueue, GlobalLimit, JITTER, JobState,
-    MemoryQueue, NewJob, Queue, Recurring, RecurringRecord, Retry, RetryPolicy, Unique, UniqueKey,
+    AnyJob, Backend, Backoff, ConcurrencyKey, Cron, Failed, FileQueue, GlobalLimit, JITTER,
+    JobState, Keep, MemoryQueue, NewJob, Queue, Recurring, RecurringRecord, Retention, Retry,
+    RetryPolicy, Unique, UniqueKey,
     monitor::{JobMetric, ListFilter},
 };
 use serde_json::json;
@@ -27,6 +28,11 @@ enum Claim {
 }
 
 fn backends(test: &str) -> Vec<(Queue, Claim)> {
+    backends_keeping(test, Retention::default())
+}
+
+/// Every backend, keeping finished jobs for `retention`.
+fn backends_keeping(test: &str, retention: Retention) -> Vec<(Queue, Claim)> {
     static RUN: AtomicU32 = AtomicU32::new(0);
     let run = RUN.fetch_add(1, Ordering::Relaxed);
     let unique = format!("{test}-{}-{run}", std::process::id());
@@ -35,13 +41,20 @@ fn backends(test: &str) -> Vec<(Queue, Claim)> {
     let _ = std::fs::remove_dir_all(&dir);
     #[cfg_attr(not(any(feature = "redis", feature = "sqlite")), allow(unused_mut))]
     let mut all: Vec<(Queue, Claim)> = vec![
-        (MemoryQueue::new().into(), Claim::Blocks),
-        (FileQueue::new(&dir).unwrap().into(), Claim::ReturnsAtOnce),
+        (
+            MemoryQueue::new().retention(retention).into(),
+            Claim::Blocks,
+        ),
+        (
+            FileQueue::new(&dir).unwrap().retention(retention).into(),
+            Claim::ReturnsAtOnce,
+        ),
     ];
     #[cfg(feature = "sqlite")]
     all.push((
         butler::SqliteQueue::open(dir.with_extension("db"))
             .unwrap()
+            .retention(retention)
             .into(),
         Claim::Blocks,
     ));
@@ -50,7 +63,7 @@ fn backends(test: &str) -> Vec<(Queue, Claim)> {
         let url = std::env::var("BUTLER_TEST_REDIS_URL")
             .unwrap_or_else(|_| "redis://127.0.0.1:6379/".into());
         match butler::RedisQueue::connect(&url, &format!("butler-backends-{unique}")) {
-            Ok(q) => all.push((q.into(), Claim::Blocks)),
+            Ok(q) => all.push((q.retention(retention).into(), Claim::Blocks)),
             Err(e) => eprintln!("skipping redis: {e}"),
         }
     }
@@ -418,6 +431,100 @@ fn resumptions_are_counted_and_kept_until_a_dashboard_retry() {
         let (state, stored) = queue.get(&id).unwrap().unwrap().into_parts();
         assert_eq!(state, JobState::Pending, "{name}");
         assert_eq!((stored.attempts, stored.resumptions), (0, 0), "{name}");
+    }
+}
+
+#[test]
+fn a_checkpoint_saves_only_while_the_worker_holds_the_job() {
+    for (queue, _) in backends("checkpoint-holder") {
+        let name = queue.describe();
+        let progress =
+            |queue: &Queue, id: &str| queue.get(id).unwrap().unwrap().record().progress.clone();
+        queue.heartbeat("slow", Duration::from_secs(60)).unwrap();
+        let id = queue.push("long", "default", vec![]).unwrap();
+        let mut stale = queue
+            .claim("slow", DEFAULT, NOW)
+            .unwrap()
+            .unwrap()
+            .into_record();
+
+        // Its heartbeat lapses while it still runs: the job moves to another worker.
+        queue.heartbeat("slow", Duration::from_millis(1)).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(queue.recover().unwrap(), 1, "{name}");
+        let job = queue.claim("fresh", DEFAULT, NOW).unwrap().unwrap();
+        let mut current = job.record().clone();
+        current.progress = Some(json!({ "run": 2 }));
+        queue.checkpoint("fresh", &current).unwrap();
+
+        stale.progress = Some(json!({ "run": 1 }));
+        queue.checkpoint("slow", &stale).unwrap();
+        assert_eq!(progress(&queue, &id), Some(json!({ "run": 2 })), "{name}");
+
+        // Nor can its holder save once the job is done.
+        queue.complete("fresh", job, json!(null)).unwrap();
+        let completed = progress(&queue, &id);
+        current.progress = Some(json!({ "run": 3 }));
+        queue.checkpoint("fresh", &current).unwrap();
+        assert_eq!(progress(&queue, &id), completed, "{name}");
+        assert_eq!(queue.state(&id), Some(JobState::Done), "{name}");
+    }
+}
+
+#[test]
+fn stats_count_running_jobs_per_queue_through_every_way_out() {
+    for (queue, _) in backends("running-per-queue") {
+        let name = queue.describe();
+        let running = |queue: &Queue| -> Vec<(String, u64, u64)> {
+            queue
+                .stats()
+                .unwrap()
+                .queues
+                .into_iter()
+                // The file backend always lists `default`.
+                .filter(|q| q.name != "default")
+                .map(|q| (q.name, q.pending, q.running))
+                .collect()
+        };
+        let row = |name: &str, pending, running| (name.to_owned(), pending, running);
+        queue.heartbeat("w", Duration::from_secs(60)).unwrap();
+        queue.heartbeat("doomed", Duration::from_secs(60)).unwrap();
+        for (job, on) in [
+            ("a", "mail"),
+            ("b", "mail"),
+            ("c", "mail"),
+            ("d", "reports"),
+        ] {
+            queue.push(job, on, vec![]).unwrap();
+        }
+        let first = queue.claim("w", &["mail"], NOW).unwrap().unwrap();
+        let second = queue.claim("w", &["mail"], NOW).unwrap().unwrap();
+        queue.claim("doomed", &["mail"], NOW).unwrap().unwrap();
+        queue.claim("doomed", &["reports"], NOW).unwrap().unwrap();
+        assert_eq!(
+            running(&queue),
+            [row("mail", 0, 3), row("reports", 0, 1)],
+            "{name}"
+        );
+        assert_eq!(queue.stats().unwrap().processing, 4, "{name}");
+
+        queue.complete("w", first, json!(null)).unwrap();
+        // A retry goes back to pending.
+        queue.fail("w", second, "boom".into(), 1).unwrap();
+        assert_eq!(
+            running(&queue),
+            [row("mail", 1, 1), row("reports", 0, 1)],
+            "{name}"
+        );
+
+        queue.heartbeat("doomed", Duration::from_millis(1)).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(queue.recover().unwrap(), 2, "{name}");
+        assert_eq!(
+            running(&queue),
+            [row("mail", 2, 0), row("reports", 1, 0)],
+            "{name}"
+        );
     }
 }
 
@@ -1681,6 +1788,125 @@ fn removing_a_schedule_rejects_invalid_keys_without_changing_jobs() {
     }
 }
 
+/// Every backend on its own, not behind a `Queue`, for contracts a backend
+/// must keep when used directly. Also returns the directory the file backend
+/// lives in.
+fn raw_backends(test: &str) -> (Vec<Box<dyn Backend>>, PathBuf) {
+    static RUN: AtomicU32 = AtomicU32::new(0);
+    let run = RUN.fetch_add(1, Ordering::Relaxed);
+    let unique = format!("raw-{test}-{}-{run}", std::process::id());
+
+    let dir: PathBuf = std::env::temp_dir()
+        .join(format!("butler-backends-{unique}"))
+        .join("root");
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    #[cfg_attr(not(any(feature = "redis", feature = "sqlite")), allow(unused_mut))]
+    let mut all: Vec<Box<dyn Backend>> = vec![
+        Box::new(MemoryQueue::new()),
+        Box::new(FileQueue::new(&dir).unwrap()),
+    ];
+    #[cfg(feature = "sqlite")]
+    all.push(Box::new(
+        butler::SqliteQueue::open(dir.with_extension("db")).unwrap(),
+    ));
+    #[cfg(feature = "redis")]
+    {
+        let url = std::env::var("BUTLER_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379/".into());
+        match butler::RedisQueue::connect(&url, &format!("butler-backends-{unique}")) {
+            Ok(q) => all.push(Box::new(q)),
+            Err(e) => eprintln!("skipping redis: {e}"),
+        }
+    }
+    (all, dir)
+}
+
+/// Keys that could leave the schedule store if used as paths or key parts.
+const BAD_RECURRING_KEYS: &[&str] = &[
+    "",
+    ".",
+    "..",
+    "../pending/default/zz",
+    "../../pending/default/zz",
+    "../../escaped",
+    "/pending",
+    "a/b",
+    "a\\b",
+    "a b",
+];
+
+fn is_invalid_key<T: std::fmt::Debug>(result: &butler::Result<T>) -> bool {
+    matches!(result, Err(butler::Error::InvalidRecurringKey { .. }))
+}
+
+#[test]
+fn registering_or_pushing_a_schedule_rejects_invalid_keys_and_writes_nothing() {
+    let now = SystemTime::now();
+    let long = "a".repeat(129);
+    let bad_keys = BAD_RECURRING_KEYS.iter().copied().chain([long.as_str()]);
+    // `Recurring::with_key` refuses these, so build the records by hand.
+    let with_key = |key: &str| RecurringRecord {
+        key: key.into(),
+        ..hourly("report", "good", now)
+    };
+
+    for (queue, _) in backends("recurring-invalid-keys") {
+        let name = queue.describe();
+        for key in bad_keys.clone() {
+            // One bad key rejects the whole batch.
+            let batch = [hourly("report", "good", now), with_key(key)];
+            assert!(
+                is_invalid_key(&queue.register_recurring(&batch)),
+                "{name}: {key:?}"
+            );
+            let job = NewJob::new("report", "default", vec![]);
+            assert!(
+                is_invalid_key(&queue.push_recurring(key, now, job)),
+                "{name}: {key:?}"
+            );
+        }
+        assert!(queue.recurring().unwrap().is_empty(), "{name}");
+        assert!(queue.claim("w", DEFAULT, NOW).unwrap().is_none(), "{name}");
+    }
+
+    let (raw, dir) = raw_backends("recurring-invalid-keys");
+    for backend in raw {
+        let name = backend.describe();
+        for key in bad_keys.clone() {
+            let batch = [hourly("report", "good", now), with_key(key)];
+            assert!(
+                is_invalid_key(&backend.register_recurring(&batch)),
+                "{name}: {key:?}"
+            );
+            let job = NewJob::new("report", "default", vec![]);
+            assert!(
+                is_invalid_key(&backend.push_recurring(key, now, job)),
+                "{name}: {key:?}"
+            );
+            assert!(
+                is_invalid_key(&backend.remove_recurring(key)),
+                "{name}: {key:?}"
+            );
+        }
+        assert!(backend.recurring().unwrap().is_empty(), "{name}");
+        assert!(
+            backend.claim("w", DEFAULT, NOW).unwrap().is_none(),
+            "{name}"
+        );
+    }
+    // Nothing was created beside the file backend's root.
+    let beside: Vec<_> = std::fs::read_dir(dir.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|entry| {
+            entry != "root"
+                && entry != "root.db"
+                && !entry.to_string_lossy().starts_with("root.db-")
+        })
+        .collect();
+    assert!(beside.is_empty(), "{beside:?}");
+}
+
 #[test]
 fn a_global_limit_and_concurrency_keys_apply_together() {
     for (queue, _) in backends("global-and-keys") {
@@ -1712,5 +1938,188 @@ fn a_global_limit_and_concurrency_keys_apply_together() {
         assert_eq!(claim("w3").unwrap().id(), a2, "{name}");
         assert!(claim("w4").is_none(), "{name}");
         assert_eq!(queue.state(&c1), Some(JobState::Pending), "{name}");
+    }
+}
+
+/// Cleans up at `now` in batches of `batch` while the backend reports more,
+/// as the keeper does; returns how many it deleted. Once it reports no more,
+/// nothing old enough is left.
+fn clean_all(queue: &Queue, now: SystemTime, batch: usize) -> usize {
+    let name = queue.describe();
+    let mut deleted = 0;
+    for _ in 0..1_000 {
+        let cleaned = queue.clean_finished(now, batch).unwrap();
+        assert!(cleaned.deleted <= batch, "{name}: {cleaned:?} > {batch}");
+        if cleaned.deleted == batch {
+            assert!(cleaned.more, "{name}: a full batch must report more");
+        }
+        deleted += cleaned.deleted;
+        if !cleaned.more {
+            let again = queue.clean_finished(now, batch).unwrap();
+            assert_eq!(
+                again.deleted, 0,
+                "{name}: {again:?} after reporting no more"
+            );
+            return deleted;
+        }
+    }
+    panic!("{name}: still reporting more after 1,000 calls");
+}
+
+#[test]
+fn finished_jobs_past_their_retention_are_deleted_in_batches_and_nothing_else() {
+    let retention = Retention {
+        finished: Keep::For(HOUR),
+        dead: Keep::For(3 * HOUR),
+    };
+    for (queue, _) in backends_keeping("retention", retention) {
+        let name = queue.describe();
+        // Redis expires done and cancelled jobs itself, with a TTL.
+        let expires_itself = name.starts_with("redis");
+        queue.heartbeat("w", HOUR).unwrap();
+
+        // Finished: two done (one of them unique, one a recurring tick's
+        // run), one cancelled, one dead.
+        let done = queue.push("a", "default", vec![]).unwrap();
+        let done_unique = queue.push_job(unique("u", Unique::UntilFinished)).unwrap();
+        let tick = SystemTime::now();
+        let ticked = queue
+            .push_recurring("hourly", tick, NewJob::new("a", "default", vec![]))
+            .unwrap()
+            .unwrap();
+        for _ in 0..3 {
+            let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+            queue.complete("w", job, json!(1)).unwrap();
+        }
+        let cancelled = queue.push("b", "default", vec![]).unwrap();
+        assert!(queue.cancel(&cancelled).unwrap());
+        let dead = queue.push("c", "default", vec![]).unwrap();
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        queue.fail("w", job, "boom".into(), 0).unwrap();
+        // Dead, then retried: pending again.
+        let retried = queue.push("d", "default", vec![]).unwrap();
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        queue.fail("w", job, "boom".into(), 0).unwrap();
+        assert!(queue.retry(&retried).unwrap());
+        // Not finished: running, pending (holding a unique key), scheduled.
+        let running = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        assert_eq!(running.id(), retried, "{name}");
+        let pending = queue.push_job(unique("p", Unique::UntilStarted)).unwrap();
+        let scheduled = queue
+            .schedule("e", "default", vec![], SystemTime::now() + 10 * HOUR)
+            .unwrap();
+        // The last job to finish, which a backend may keep.
+        let latest = queue.push("f", "other", vec![]).unwrap();
+        let job = queue.claim("w", &["other"], NOW).unwrap().unwrap();
+        queue.complete("w", job, json!(1)).unwrap();
+
+        let unfinished = [
+            (&retried, JobState::Processing),
+            (&pending, JobState::Pending),
+            (&scheduled, JobState::Scheduled),
+        ];
+        let check_unfinished = || {
+            for (id, state) in unfinished {
+                assert_eq!(queue.state(id), Some(state), "{name}: {id}");
+            }
+        };
+
+        // Nothing is old enough yet.
+        assert_eq!(
+            queue
+                .clean_finished(SystemTime::now(), 100)
+                .unwrap()
+                .deleted,
+            0,
+            "{name}"
+        );
+        assert_eq!(queue.state(&done), Some(JobState::Done), "{name}");
+
+        // Two hours on, done and cancelled jobs are past their hour; dead
+        // jobs have three.
+        let later = SystemTime::now() + 2 * HOUR;
+        let deleted = clean_all(&queue, later, 1);
+        let old_finished = [&done, &done_unique, &ticked, &cancelled];
+        if expires_itself {
+            assert_eq!(deleted, 0, "{name}");
+            assert_eq!(queue.state(&done), Some(JobState::Done), "{name}");
+        } else {
+            assert!((4..=5).contains(&deleted), "{name}: {deleted}");
+            for id in old_finished {
+                assert_eq!(queue.state(id), None, "{name}: {id}");
+            }
+            if deleted == 4 {
+                assert_eq!(queue.state(&latest), Some(JobState::Done), "{name}");
+            }
+        }
+        assert_eq!(queue.state(&dead), Some(JobState::Dead), "{name}");
+        check_unfinished();
+
+        // A deleted job no longer holds its unique key, and its tick still
+        // counts as enqueued.
+        let again = queue.push_job(unique("u", Unique::UntilFinished)).unwrap();
+        assert_ne!(again, done_unique, "{name}");
+        assert_eq!(
+            queue
+                .push_recurring("hourly", tick, NewJob::new("a", "default", vec![]))
+                .unwrap(),
+            None,
+            "{name}"
+        );
+        assert_eq!(
+            queue.push_job(unique("p", Unique::UntilStarted)).unwrap(),
+            pending,
+            "{name}"
+        );
+
+        // Four hours on, the dead job goes too.
+        assert_eq!(
+            clean_all(&queue, SystemTime::now() + 4 * HOUR, 10),
+            1,
+            "{name}"
+        );
+        assert_eq!(queue.state(&dead), None, "{name}");
+        check_unfinished();
+        assert_eq!(
+            clean_all(&queue, SystemTime::now() + 4 * HOUR, 10),
+            0,
+            "{name}"
+        );
+
+        // The running job still completes, and the pending ones still run.
+        queue.complete("w", running, json!(1)).unwrap();
+        assert_eq!(queue.state(&retried), Some(JobState::Done), "{name}");
+        let mut claimed = HashSet::new();
+        while let Some(job) = queue.claim("w", DEFAULT, NOW).unwrap() {
+            claimed.insert(job.id().to_owned());
+        }
+        assert!(claimed.contains(&pending), "{name}");
+        assert!(claimed.contains(&again), "{name}");
+    }
+}
+
+#[test]
+fn keeping_forever_deletes_nothing() {
+    let forever = Retention {
+        finished: Keep::Forever,
+        dead: Keep::Forever,
+    };
+    for (queue, _) in backends_keeping("retention-forever", forever) {
+        let name = queue.describe();
+        queue.heartbeat("w", HOUR).unwrap();
+        let done = queue.push("a", "default", vec![]).unwrap();
+        let dead = queue.push("b", "default", vec![]).unwrap();
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        queue.complete("w", job, json!(1)).unwrap();
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        queue.fail("w", job, "boom".into(), 0).unwrap();
+        let cancelled = queue.push("c", "default", vec![]).unwrap();
+        assert!(queue.cancel(&cancelled).unwrap());
+
+        let far = SystemTime::now() + 1000 * 24 * HOUR;
+        assert_eq!(queue.clean_finished(far, 100).unwrap().deleted, 0, "{name}");
+        assert_eq!(queue.state(&done), Some(JobState::Done), "{name}");
+        assert_eq!(queue.state(&dead), Some(JobState::Dead), "{name}");
+        assert_eq!(queue.state(&cancelled), Some(JobState::Cancelled), "{name}");
     }
 }

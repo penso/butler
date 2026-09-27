@@ -59,6 +59,11 @@ pub enum Error {
     #[error("invalid backoff `{value}`: {reason}")]
     InvalidBackoff { value: String, reason: &'static str },
 
+    /// A `keep_finished` or `keep_dead` setting that isn't `"forever"` or a
+    /// duration of at least [`Keep::MIN`](crate::Keep::MIN).
+    #[error("invalid retention `{value}`: {reason}")]
+    InvalidRetention { value: String, reason: &'static str },
+
     /// A job's concurrency limit is 0, which would keep it waiting forever.
     #[error("concurrency limit of `{key}` must be at least 1")]
     InvalidConcurrencyLimit { key: String },

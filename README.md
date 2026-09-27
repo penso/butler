@@ -3,15 +3,20 @@
 **Call it like an async function. Run it as a durable background job.**
 
 ```rust
-tokio::time::sleep(Duration::from_millis(200)).await; // runs here
-let job = generate_report(user_id).await?;            // queued for a worker
-let report: Option<Report> = job.result().await?;     // typed result, when ready
+let call: JobCall<Report> = generate_report(user_id); // nothing happened yet
+let job: JobHandle<Report> = call.await?;             // saved to a queue; a worker runs it
+let report: Option<Report> = job.result().await?;     // typed result, once it's done
 ```
 
-**The same `.await`. A different place to run.** Butler saves the job to a
-queue and returns a `JobHandle<Report>`. A worker executes it independently—even
-after the calling process exits. Use Redis, SQLite, or files to persist the
-work across process restarts.
+**Calling a job does nothing. Awaiting it enqueues.** `#[butler::job]` makes
+`generate_report` return a `JobCall<Report>`: its arguments, already
+serialized. `JobCall` implements
+[`IntoFuture`](https://doc.rust-lang.org/std/future/trait.IntoFuture.html), so
+`.await` saves the job to a queue and returns a `JobHandle<Report>`. A worker
+executes it independently—even after the calling process exits. Use Redis,
+SQLite, or files to persist the work across process restarts. To run the body
+here instead, `generate_report(user_id).now().await?` returns the `Report`
+itself.
 
 **Async I/O or blocking work. Same enqueue call.** Add `#[butler::job]` to
 your function; its body stays ordinary Rust:
@@ -102,6 +107,7 @@ crashes; storage durability still depends on the backend's configuration.
   - [Recurring jobs](#recurring-jobs)
   - [Retries and backoff](#retries-and-backoff)
   - [Results](#results)
+  - [Keeping finished jobs](#keeping-finished-jobs)
   - [Running a worker](#running-a-worker)
   - [Middleware](#middleware)
   - [Job continuations](#job-continuations)
@@ -218,7 +224,8 @@ each. See [Concurrency and cores](#concurrency-and-cores) for tuning.
 ## Web dashboard
 
 `butler-web` shows live counts streamed over server-sent events, throughput and
-duration charts, queues, workers, and job details. Retry or discard failed
+duration charts, queues with their pending and running jobs, workers, and job
+details. Retry or discard failed
 jobs, cancel pending work, run scheduled jobs now, pause and resume queues,
 see each recurring schedule's next and last run, and inspect arguments,
 results, errors, and saved progress from one place.
@@ -331,6 +338,28 @@ So `send_email(...).await` in your app resolves to (1). The worker never calls
 `send_email`: it runs (3), which decodes the arguments and runs your original
 body (2). `send_email(...).now()` runs (3) too, in your process. A function and a module can share the name `send_email` because Rust
 keeps values and types in separate namespaces.
+
+The enqueue itself is `JobCall`'s `IntoFuture` implementation. `.await` calls
+`into_future()` on whatever it is given; for a `JobCall`, that future writes the
+job:
+
+```rust
+impl<T: DeserializeOwned + Send + 'static> IntoFuture for JobCall<T> {
+    type Output = Result<JobHandle<T>, butler::Error>;
+    type IntoFuture = Enqueueing<T>;
+
+    fn into_future(self) -> Enqueueing<T> {
+        self.enqueue() // push to the backend; under tokio, on the blocking pool
+    }
+}
+```
+
+`T` is the job's success type, taken from its return type:
+`Result<Report, ReportError>` gives a `JobCall<Report>` and a
+`JobHandle<Report>`, and `()` gives a `JobHandle<()>`. The error type is not
+part of `T`: a failed job reports a `JobError` through the handle. Whatever
+executor polls the caller drives the enqueue, whether that is tokio, another
+runtime, or `butler::block_on`.
 
 The return type also shows the difference. The enqueue returns
 `Result<JobHandle<MessageId>, butler::Error>`, not your function's
@@ -866,13 +895,44 @@ backend notifies waiters (Redis over pub/sub, memory in-process), and under
 tokio the wait is an `await` on a `tokio::sync::Notify`, so thousands of
 handles can wait without holding a thread each. The interval you pass is only
 a fallback check; the file backend can't notify, so there it is the polling
-interval. The result stays readable as long as the job does (24 hours on
-Redis). A handle rebuilt from an id is untyped:
+interval. The result stays readable as long as the job does: a day by
+default, see [Keeping finished jobs](#keeping-finished-jobs). A handle rebuilt
+from an id is untyped:
 `queue.handle(id).with_output::<i64>()`.
 
 `cancel` is atomic against workers claiming the job: either the worker gets it
 or the cancel does, never both. A job that is already running is not
 interrupted, and `cancel` returns `false`.
+
+### Keeping finished jobs
+
+Done and cancelled jobs, with their results, are kept for `keep_finished`
+(default a day), and dead jobs for `keep_dead` (default forever, until you
+discard or retry them from the dashboard):
+
+```toml
+[queue]
+keep_finished = "7d"         # "forever", or a duration: "90m", "12h", "7d"
+keep_dead = "30d"            # default "forever"
+```
+
+Running workers delete older ones, at most 1,000 per call, once a minute, or
+at every keeper tick while the backend says there is more to look at (a full
+batch, or a scan that ran out of budget before reaching the end). Only finished jobs are ever
+deleted: nothing pending, scheduled or running, and nothing a live job
+relies on (unique keys, concurrency and limit slots, recurring ticks, which
+are remembered on their own). Retention is at least a minute, so a
+`JobHandle` waiting on a job still finds it when it wakes; read results within
+`keep_finished`, after which `JobNotFound` is returned.
+
+Redis gives done and cancelled jobs a TTL of `keep_finished` when they
+finish, so changing it applies to jobs finishing afterwards. SQLite indexes
+finish times, and keeps its most recently finished job as the numbering
+point for cross-process wake-ups. Existing SQLite jobs count from the database
+upgrade. Dead Redis jobs without finish times share the time cleanup first
+encounters a legacy job, so the entire backlog gets one grace period.
+In code, pass a `butler::Retention` to the backend's
+`retention` method: `SqliteQueue::open(path)?.retention(retention)`.
 
 ### Running a worker
 
@@ -1313,6 +1373,8 @@ host application's configuration. To migrate, rename your Butler config to
 ```toml
 [queue]
 backend = "redis"            # "file" (default), "redis", "sqlite", or "memory"
+keep_finished = "1d"         # done and cancelled jobs; "forever" or a duration
+keep_dead = "forever"        # dead jobs; default until discarded or retried
 
 [queue.file]
 dir = ".butler"
@@ -1323,6 +1385,7 @@ path = "butler.db"           # shared by every process that opens it
 [queue.redis]
 url = "redis://127.0.0.1:6379/"
 prefix = "butler"            # key namespace
+max_idle_connections = 32    # idle connections each process keeps for reuse
 
 [worker]
 concurrency = 4              # jobs running at once
@@ -1448,6 +1511,14 @@ exists, so exactly one worker creates it and enqueues the job. The job file is
 written under `tmp/` first and renamed into its queue after the link; a crash
 between the two loses that one tick.
 
+A finished job's file is written when it finishes (touched before the rename,
+for a cancelled one), so cleaning up deletes files in `done/`, `cancelled/`
+and `dead/` whose modification time is older than their retention. Each call
+examines at most 1,000 directory entries and resumes its scan on the next
+call, including when a batch finds no expired jobs: until a sweep ends, the
+worker comes back at its next keeper tick rather than a minute later. Queue
+clones share the scan cursor; a completed sweep starts over on the next call.
+
 ### Redis
 
 `crates/butler/src/backend/redis.rs`. Stores queued job ids in Redis lists:
@@ -1459,10 +1530,10 @@ between the two loses that one tick.
 | `butler:worker:<worker>` | STRING | the worker's heartbeat; expires after `heartbeat_ttl_secs` |
 | `butler:workers` | SET | worker ids that may hold jobs, checked by recovery |
 | `butler:scheduled` | ZSET | ids waiting for their run time; the score is the time in ms |
-| `butler:dead` | LIST | ids that exhausted their retries |
+| `butler:dead` | LIST | ids that exhausted their retries, newest first; cleaned up after `keep_dead` |
 | `butler:wake` | pub/sub channel | a message per push, retry and recovery; wakes idle workers |
 | `butler:done` | pub/sub channel | a message per job done, dead or cancelled; wakes `wait_result` |
-| `butler:job:<id>` | HASH | `state`, `queue`, and `data` (job JSON), plus `ckey`/`climit` and `ukey`/`umode` for keyed and unique jobs; done and cancelled jobs expire after 24h |
+| `butler:job:<id>` | HASH | `state`, `queue`, and `data` (job JSON); `worker`, the holder, while it runs; plus `ckey`/`climit` and `ukey`/`umode` for keyed and unique jobs, and `finished_at` once dead; done and cancelled jobs expire after `keep_finished` |
 | `butler:running:<key>` | SET | ids running with a concurrency key (by the key's hash) |
 | `butler:blocked:<key>` | LIST | ids skipped because their concurrency key was full |
 | `butler:blocked` | HASH | per queue, how many of its ids wait in blocked lists |
@@ -1470,6 +1541,7 @@ between the two loses that one tick.
 | `butler:unique:<key>` | STRING | the id of the job holding a unique key (by the key's hash) |
 | `butler:paused` | SET | paused queues, which workers leave out of their claims |
 | `butler:slots:<queue>` | SET | ids running in one of the queue's global-limit slots |
+| `butler:active:<queue>` | SET | ids of the queue that workers are running, for per-queue running counts |
 | `butler:recurring` | SET | keys of the recurring schedules workers registered |
 | `butler:recurring:<key>` | HASH | `data` (schedule JSON), `created_at`, `seen_at`, `last_tick`, `last_job` |
 | `butler:recurring:tick:<key>:<ms>` | STRING | the job enqueued for that tick; expires after 24h |
@@ -1483,6 +1555,15 @@ that key completes, fails or is recovered, the oldest parked job goes back
 to the claim end of its queue, in the same step. Parked jobs stay pending:
 they are counted, listed and cancellable. A unique job is pushed by a script
 that checks `unique:<key>` and the job it names first.
+
+The claim also writes the worker's id into the job hash's `worker` field,
+which completing, failing and recovering the job remove. A checkpoint is a
+script that saves the job's progress only while that field names the saving
+worker: one hash read, however many jobs the worker holds, so a worker whose
+heartbeat lapsed can't overwrite the progress of the job's next run. The
+claim adds the id to `active:<queue>` too, and completing, failing and
+recovering the job remove it in the same step, so `stats()` counts each
+queue's running jobs with one `SCARD`.
 
 **Idle workers are woken by pub/sub, not polling.** Every push, retry and
 recovery also `PUBLISH`es to `butler:wake`. Each worker process keeps one
@@ -1504,7 +1585,12 @@ script too: `SET recurring:tick:<key>:<ms> NX`, and the job's push only if
 that succeeded. Under a global queue limit, the claim script first checks
 `SCARD slots:<queue>`, claims nothing at the limit, and adds the claimed id
 to the set; completing, failing and recovering a job `SREM` it. Calls use a
-small connection pool, so concurrent claims don't wait on each other.
+connection pool, so concurrent claims don't wait on each other. It keeps up
+to `max_idle_connections` (32 by default) idle connections per process for
+reuse; beyond that, a call that needs one opens it and closes it afterwards,
+so a burst doesn't leave connections open for good. Set it to about a
+worker's `concurrency` plus `claimers` to avoid reconnecting under steady
+load, or with `RedisQueue::max_idle_connections`.
 
 The job's return value goes into the job hash's `data`, next to its arguments.
 
@@ -1521,11 +1607,12 @@ processes on the same machine:
 
 | Table | Columns | Purpose |
 |---|---|---|
-| `butler_jobs` | `id, queue, state, worker, seq, data, run_at, slot, ckey, climit, ukey, umode` | every job; `data` is the job JSON, `seq` the order in its queue, `run_at` a scheduled job's time in ms, `slot` set while it holds a global-limit slot, then its concurrency and unique keys |
+| `butler_jobs` | `id, queue, state, worker, seq, data, finished_seq, run_at, slot, ckey, climit, ukey, umode, finished_at` | every job; `data` is the job JSON, `seq` the order in its queue, `finished_seq` the order jobs finished in, `run_at` a scheduled job's time in ms, `slot` set while it holds a global-limit slot, then its concurrency and unique keys, and when it finished in ms |
 | `butler_workers` | `worker, expires_at_ms` | heartbeats, for crash recovery |
 | `butler_paused` | `queue, paused_at_ms` | paused queues; created when an older database is opened |
 | `butler_recurring` | `key, data, created_at_ms, seen_at_ms, last_tick_ms, last_job_id` | recurring schedules and their last run |
 | `butler_recurring_ticks` | `key, tick_ms, job_id` | ticks enqueued; the primary key `(key, tick_ms)` makes each one run once |
+| `butler_job_counts` | `queue, state, n` | jobs per queue and state, kept by triggers on `butler_jobs`; what the dashboard reads |
 
 A claim is one `UPDATE ... RETURNING` that moves the oldest pending row of a
 queue to `processing` under the claiming worker. SQLite runs it under its write
@@ -1555,6 +1642,14 @@ the job's insert, in one transaction: only the worker whose tick row went in
 enqueues the job. Databases from before recurring jobs get both tables when
 opened.
 
+The dashboard's counts per queue and state come from `butler_job_counts`,
+not from counting `butler_jobs`. Triggers on `butler_jobs` adjust it on every
+insert, delete and change of queue or state, inside the statement that makes
+the change, so it stays exact whatever writes the rows, including another
+version or a job deleted by hand. With 5 million jobs, `stats()` takes about
+20 µs instead of 200 ms. Databases from before it get the table and its
+triggers when opened, filled from their rows in the same transaction.
+
 **Waking waiters without a server.** SQLite has no pub/sub between processes:
 its hooks only see changes made through the same connection. butler combines
 two things instead:
@@ -1582,7 +1677,7 @@ gives one shared queue per process. It follows the same rules as the other
 backends, heartbeats and recovery included, and a waiting claim wakes as soon
 as a job is pushed. Scheduled jobs wait in a `BTreeSet` ordered by run time. Use it for tests, benchmarks, and apps whose workers run
 in the same process. Nothing survives a restart, and finished jobs stay in
-memory until the process exits.
+memory for their retention, while a worker runs to clean them up.
 
 `crates/butler/tests/backends.rs` runs the same contract checks (FIFO claims,
 waking on push, cancel against claim, results, retries, recovery, scheduled
@@ -1613,6 +1708,13 @@ the claim is now a script (one round trip instead of two); in SQLite four
 the file backend `ckeys/` and `unique/` directories and keyed pending file
 names. Jobs without keys are stored and claimed as before.
 
+**Upgrading to kept job counts (SQLite).** The first open by this version
+creates `butler_job_counts` and its triggers, and counts the existing jobs
+once, in one transaction that holds the write lock: one pass over an index,
+about 0.2 s for 5 million jobs on a warm cache, longer from a cold disk. The triggers live in the database, so writes from
+older versions still running keep the counts exact, and an older dashboard
+keeps working (it counts `butler_jobs` itself, as before).
+
 **Upgrading to paused queues.** Pausing adds storage only: a
 `<prefix>:paused` set in Redis, a `butler_paused` table in SQLite (created
 when a database is opened), and a `paused/` directory for the file backend.
@@ -1634,6 +1736,26 @@ backend. Workers without `[[recurring]]` entries never touch them. Only
 workers running this version enqueue recurring jobs; while older workers run
 next to them, they simply don't take part. A dashboard of an older version
 lacks the Recurring page but works otherwise.
+
+**Upgrading to hash-checked Redis checkpoints.** Nothing to migrate: jobs
+claimed by an older version have no `worker` field, and their checkpoints
+search the worker's processing list with `LPOS`, as before, until they finish.
+While versions are mixed, an older process that recovers a newer worker's job
+leaves its `worker` field behind. If an older worker then claims the job too,
+and the first worker is in fact still running (its heartbeat lapsed, it didn't
+crash), the first worker's checkpoints can overwrite the new run's progress
+until the new run saves over them. Claims by this version rewrite the field,
+so the window closes once every worker runs it.
+
+**Upgrading to per-queue running counts.** `QueueStats` gains `running`, and
+the dashboard's Queues table a Running column. SQLite, file and memory
+derive it from what they already store. Redis adds `active:<queue>` sets,
+which only this version maintains: jobs claimed before the upgrade aren't
+counted until they finish, and jobs an older process claims or recovers
+while versions are mixed can leave the count too low or too high. Each
+`recover` (every `recover_interval_secs`) compares the sets with the
+processing lists and, when the sets hold more, drops ids whose jobs are no
+longer processing, so counts settle once every worker runs this version.
 
 ## Limitations
 

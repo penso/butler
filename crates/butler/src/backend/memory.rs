@@ -479,6 +479,7 @@ impl Store for MemoryQueue {
     }
 
     fn register_recurring(&self, schedules: &[RecurringRecord]) -> Result<Vec<RecurringRecord>> {
+        crate::recurring::validate_keys(schedules)?;
         let mut state = self.lock();
         Ok(schedules
             .iter()
@@ -496,6 +497,7 @@ impl Store for MemoryQueue {
     }
 
     fn push_recurring(&self, key: &str, tick: SystemTime, job: NewJob) -> Result<Option<JobId>> {
+        crate::recurring::validate_key(key)?;
         let tick = millis(tick);
         let mut state = self.lock();
         let ticks = state.ticks.entry(key.to_owned()).or_default();

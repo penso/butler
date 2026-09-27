@@ -137,6 +137,13 @@ pub trait Store: Send + Sync + 'static {
     /// Interrupted retry transitions preserve their recorded schedule.
     fn recover(&self) -> Result<usize>;
 
+    /// The queues an operator paused with [`Monitor::pause_queue`], sorted.
+    /// Workers leave them out of their claim order; they still accept new
+    /// jobs, and scheduled jobs are still promoted onto them. Default: none.
+    fn paused_queues(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// Stores the recurring schedules a worker runs, or refreshes them if
     /// the backend has them already: their definition and `seen_at_ms` come
     /// from `schedules`, while a stored schedule keeps its `created_at_ms`
@@ -201,6 +208,18 @@ pub trait Monitor: Send + Sync + 'static {
     /// `id` isn't a finished job.
     fn discard(&self, _id: &str) -> Result<bool> {
         Err(Error::Unsupported("discarding jobs"))
+    }
+
+    /// Pauses `queue`: workers stop claiming its jobs (the running ones
+    /// finish), while it keeps accepting jobs. Returns `false` if it was
+    /// already paused.
+    fn pause_queue(&self, _queue: &str) -> Result<bool> {
+        Err(Error::Unsupported("pausing queues"))
+    }
+
+    /// Resumes a paused `queue`. Returns `false` if it wasn't paused.
+    fn resume_queue(&self, _queue: &str) -> Result<bool> {
+        Err(Error::Unsupported("pausing queues"))
     }
 
     /// Every recurring schedule a worker registered, sorted by key.
@@ -321,6 +340,17 @@ const MIN_SCHEDULE_WAIT: Duration = Duration::from_millis(1);
 // Schedules can change from another process while a backend waits for pending
 // work. Periodically return to promotion even when no due time was known.
 const MAX_SCHEDULE_WAIT: Duration = Duration::from_millis(100);
+
+/// Queue names become file names and Redis keys.
+fn check_queue_name(queue: &str) -> Result<()> {
+    if crate::is_valid_queue_name(queue) {
+        return Ok(());
+    }
+    Err(Error::InvalidQueue {
+        name: queue.to_owned(),
+        reason: "use 1 to 64 of A-Z a-z 0-9 _ - . (not starting with a dot)",
+    })
+}
 
 /// Whether `at` has passed, to the millisecond backends store.
 fn is_due(at: SystemTime) -> bool {
@@ -521,6 +551,26 @@ impl Queue {
             JobState::Scheduled => Failed::Scheduled(Job::from_record(record)),
             _ => Failed::Retry(Job::from_record(record)),
         })
+    }
+
+    /// The paused queues, sorted; see [`Store::paused_queues`].
+    pub fn paused_queues(&self) -> Result<Vec<String>> {
+        self.0.paused_queues()
+    }
+
+    /// Pauses `queue`: workers stop claiming from it within about a second,
+    /// and the jobs already running finish. It still accepts jobs, and
+    /// scheduled jobs are still promoted onto it. Returns `false` if it was
+    /// already paused.
+    pub fn pause_queue(&self, queue: &str) -> Result<bool> {
+        check_queue_name(queue)?;
+        self.0.pause_queue(queue)
+    }
+
+    /// Resumes a paused `queue`. Returns `false` if it wasn't paused.
+    pub fn resume_queue(&self, queue: &str) -> Result<bool> {
+        check_queue_name(queue)?;
+        self.0.resume_queue(queue)
     }
 
     /// Stores or refreshes recurring schedules; see

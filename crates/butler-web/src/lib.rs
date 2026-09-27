@@ -1,8 +1,9 @@
 //! A web dashboard for [butler](https://crates.io/crates/butler), like
 //! Sidekiq's Web UI or Rails' Mission Control: live counts over server-sent
 //! events, throughput and duration charts, and the jobs themselves, with
-//! retry and discard for failed ones, run now or cancel for scheduled
-//! ones, and the recurring schedules with their next and last run.
+//! retry and discard for failed ones, run now or cancel for scheduled ones,
+//! pause or resume for queues, and the recurring schedules with their next and
+//! last run.
 //!
 //! Mount it in your own axum app, behind your own authentication:
 //!
@@ -15,7 +16,8 @@
 //! or run the `butler-web` binary, which reads `butler.toml` like a worker.
 //!
 //! The dashboard has no authentication of its own. Actions (retry, discard,
-//! cancel, run now, remove a schedule) are POSTs, and cross-site POSTs are rejected, so another site
+//! cancel, run now, pause and resume a queue, remove a schedule) are POSTs, and
+//! cross-site POSTs are rejected, so another site
 //! can't trigger them through a logged-in browser.
 
 mod actions;
@@ -87,6 +89,8 @@ impl Dashboard {
             .route("/jobs/retry-all", post(actions::retry_all))
             .route("/jobs/discard-all", post(actions::discard_all))
             .route("/workers", get(pages::workers))
+            .route("/queues/{queue}/pause", post(actions::pause_queue))
+            .route("/queues/{queue}/resume", post(actions::resume_queue))
             .route("/recurring", get(pages::recurring))
             .route("/recurring/{key}/remove", post(actions::remove_recurring))
             .route("/events", get(events::stream))

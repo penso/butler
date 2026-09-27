@@ -969,6 +969,54 @@ fn metadata_is_kept_through_scheduling_claims_retries_and_recovery() {
     }
 }
 
+#[test]
+fn paused_queues_are_listed_until_resumed() {
+    for (queue, _) in backends("pause") {
+        let name = queue.describe();
+        assert!(queue.paused_queues().unwrap().is_empty(), "{name}");
+        assert!(queue.pause_queue("mailers").unwrap(), "{name}");
+        assert!(
+            !queue.pause_queue("mailers").unwrap(),
+            "{name}: already paused"
+        );
+        assert!(queue.pause_queue("low").unwrap(), "{name}");
+        assert_eq!(queue.paused_queues().unwrap(), ["low", "mailers"], "{name}");
+
+        assert!(queue.resume_queue("mailers").unwrap(), "{name}");
+        assert!(
+            !queue.resume_queue("mailers").unwrap(),
+            "{name}: not paused"
+        );
+        assert_eq!(queue.paused_queues().unwrap(), ["low"], "{name}");
+
+        let bad = queue.pause_queue("../etc").unwrap_err();
+        assert!(matches!(bad, butler::Error::InvalidQueue { .. }), "{name}");
+    }
+}
+
+#[test]
+fn a_paused_queue_still_accepts_jobs_and_promotions() {
+    for (queue, _) in backends("pause-accepts") {
+        let name = queue.describe();
+        queue.pause_queue("default").unwrap();
+        let first = queue.push("a", "default", vec![]).unwrap();
+        let at = SystemTime::now() + HOUR;
+        let scheduled = queue.schedule("b", "default", vec![], at).unwrap();
+        assert_eq!(queue.promote(at).unwrap().moved, 1, "{name}");
+        assert_eq!(queue.state(&first), Some(JobState::Pending), "{name}");
+        assert_eq!(queue.state(&scheduled), Some(JobState::Pending), "{name}");
+        assert_eq!(queue.stats().unwrap().pending(), 2, "{name}");
+
+        // Resumed, its jobs are claimed in their order.
+        queue.resume_queue("default").unwrap();
+        assert_eq!(queue.claim("w", DEFAULT, NOW).unwrap().unwrap().id(), first);
+        assert_eq!(
+            queue.claim("w", DEFAULT, NOW).unwrap().unwrap().id(),
+            scheduled
+        );
+    }
+}
+
 const MAILERS: &[&str] = &["mailers"];
 
 fn at_most(max: usize) -> [GlobalLimit<'static>; 1] {

@@ -1,8 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex, PoisonError, TryLockError,
+        Arc, Mutex, PoisonError, RwLock, TryLockError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -61,6 +61,10 @@ const KEEPER_TICK: Duration = Duration::from_millis(250);
 /// idle, so a due job on a queue they serve first doesn't wait for a lull.
 const PROMOTE_INTERVAL: Duration = KEEPER_TICK;
 
+/// How often the keeper reads which queues are paused, so pausing or
+/// resuming one takes effect within about this long.
+const PAUSED_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Pulls jobs from a [`Queue`] and runs them. It can run every `#[job]`
 /// function compiled into the current binary.
 ///
@@ -87,6 +91,9 @@ pub struct Worker {
     heartbeat_ttl: Duration,
     recover_interval: Duration,
     upkeep: Arc<Mutex<Upkeep>>,
+    /// The queues paused in the backend, as the keeper last read them: left
+    /// out of every claim.
+    paused: Arc<RwLock<HashSet<String>>>,
     /// Set when the worker starts shutting down: jobs with a `Progress` stop
     /// at their next checkpoint and go back on their queue.
     stopping: Arc<AtomicBool>,
@@ -115,6 +122,7 @@ struct Upkeep {
     beat: Option<Instant>,
     recovered: Option<Instant>,
     promoted: Option<Instant>,
+    paused: Option<Instant>,
 }
 
 impl Worker {
@@ -156,6 +164,7 @@ impl Worker {
             heartbeat_ttl: defaults.heartbeat_ttl(),
             recover_interval: defaults.recover_interval(),
             upkeep: Arc::default(),
+            paused: Arc::default(),
             stopping: Arc::default(),
             checkpoint_interval: defaults.checkpoint_interval(),
             layers: Arc::default(),
@@ -549,14 +558,24 @@ impl Worker {
     fn claim_limited(&self, wait: Duration) -> Result<Claimed> {
         let mut reserved: Vec<(&str, Permit)> = Vec::new();
         let mut skipped = false;
-        for queue in self.queues.claim_order() {
+        let order: Vec<&str> = {
+            let paused = self.paused.read().unwrap_or_else(PoisonError::into_inner);
+            self.queues
+                .claim_order()
+                .into_iter()
+                .filter(|queue| !paused.contains(*queue))
+                .collect()
+        };
+        for queue in order {
             match self.limits.try_acquire(queue) {
                 Some(permit) => reserved.push((queue, permit)),
                 None => skipped = true,
             }
         }
         if reserved.is_empty() {
-            return Ok(Claimed::Nothing { throttled: true });
+            // Only full queues are worth rechecking soon; paused ones wait
+            // for the keeper.
+            return Ok(Claimed::Nothing { throttled: skipped });
         }
         // A waiting claim can't see a slot free up on a skipped queue, so keep
         // waits short while any queue is full.
@@ -592,7 +611,7 @@ impl Worker {
     /// on the next call.
     fn upkeep(&self, force: bool) -> Result<()> {
         let now = Instant::now();
-        let (beat, recover, promote) = {
+        let (beat, recover, promote, paused) = {
             let last = self.upkeep.lock().unwrap_or_else(PoisonError::into_inner);
             let due = |at: Option<Instant>, every: Duration| {
                 force || at.is_none_or(|at| now.duration_since(at) >= every)
@@ -601,8 +620,16 @@ impl Worker {
                 due(last.beat, self.heartbeat_ttl / 3),
                 due(last.recovered, self.recover_interval),
                 due(last.promoted, PROMOTE_INTERVAL),
+                due(last.paused, PAUSED_INTERVAL),
             )
         };
+        if paused {
+            self.refresh_paused()?;
+            self.upkeep
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .paused = Some(now);
+        }
         if beat {
             self.queue.heartbeat(&self.id, self.heartbeat_ttl)?;
             self.upkeep
@@ -704,6 +731,25 @@ impl Worker {
             }
             *next = schedule.cron().next_after(now);
         }
+        Ok(())
+    }
+
+    /// Reads the paused queues from the backend, and logs when one this
+    /// worker serves is paused or resumed.
+    fn refresh_paused(&self) -> Result<()> {
+        let now: HashSet<String> = self.queue.paused_queues()?.into_iter().collect();
+        let mut paused = self.paused.write().unwrap_or_else(PoisonError::into_inner);
+        if *paused == now {
+            return Ok(());
+        }
+        for queue in self.queues.names() {
+            match (paused.contains(queue), now.contains(queue)) {
+                (false, true) => tracing::info!(queue, "queue paused: not claiming its jobs"),
+                (true, false) => tracing::info!(queue, "queue resumed"),
+                _ => {}
+            }
+        }
+        *paused = now;
         Ok(())
     }
 

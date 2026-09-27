@@ -35,6 +35,8 @@ async fn blocking<T: Send + 'static>(
 pub(crate) struct QueueRow {
     pub name: String,
     pub pending: String,
+    /// Workers don't claim its jobs until it is resumed.
+    pub paused: bool,
 }
 
 #[derive(Template)]
@@ -53,6 +55,7 @@ struct DashboardPage {
     queues: Vec<QueueRow>,
     jobs: Vec<JobSummary>,
     snapshot_json: String,
+    return_to: String,
 }
 
 pub(crate) async fn dashboard(
@@ -61,7 +64,17 @@ pub(crate) async fn dashboard(
     let stats = read_stats(&state.queue).await?;
     let since = current_minute().saturating_sub(DAY_MINUTES);
     let buckets = blocking(&state.queue, move |queue| queue.metrics(since)).await?;
+    let paused = blocking(&state.queue, Queue::paused_queues).await?;
     let snapshot = Snapshot::from_stats(&stats);
+    // Every queue with jobs, and the paused ones even without.
+    let mut queues: BTreeMap<&str, u64> = stats
+        .queues
+        .iter()
+        .map(|queue| (queue.name.as_str(), queue.pending))
+        .collect();
+    for queue in &paused {
+        queues.entry(queue).or_default();
+    }
     let page = DashboardPage {
         base: state.base.clone(),
         nav: "dashboard",
@@ -73,16 +86,22 @@ pub(crate) async fn dashboard(
         scheduled: thousands(stats.scheduled),
         dead: thousands(stats.dead),
         workers: thousands(snapshot.workers_alive as u64),
-        queues: stats
-            .queues
-            .iter()
-            .map(|queue| QueueRow {
-                name: queue.name.clone(),
-                pending: thousands(queue.pending),
+        queues: queues
+            .into_iter()
+            .map(|(name, pending)| QueueRow {
+                name: name.to_owned(),
+                pending: thousands(pending),
+                paused: paused.iter().any(|queue| queue == name),
             })
             .collect(),
         jobs: views::summarize(&buckets).into_iter().take(12).collect(),
         snapshot_json: script_json(&snapshot),
+        // The dashboard itself: a nested router serves it at the bare base.
+        return_to: if state.base.is_empty() {
+            "/".to_owned()
+        } else {
+            state.base.clone()
+        },
     };
     Ok(Html(page.render()?))
 }

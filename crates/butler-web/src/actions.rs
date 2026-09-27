@@ -1,6 +1,6 @@
 //! What the dashboard changes: retry and discard failed jobs, cancel pending
-//! and scheduled ones, run scheduled ones now, and forget recurring schedules
-//! no worker runs anymore. Every action is a POST and
+//! and scheduled ones, run scheduled ones now, pause and resume queues, and
+//! forget recurring schedules no worker runs anymore. Every action is a POST and
 //! redirects back to the page it came from.
 
 use std::sync::Arc;
@@ -83,6 +83,30 @@ pub(crate) async fn run_now(
     Form(form): Form<Back>,
 ) -> Result<Redirect, WebError> {
     act(&state, move |queue| queue.run_now(&id)).await?;
+    Ok(back(&state, form.return_to.as_deref()))
+}
+
+pub(crate) async fn pause_queue(
+    State(state): State<Arc<AppState>>,
+    Path(queue): Path<String>,
+    Form(form): Form<Back>,
+) -> Result<Redirect, WebError> {
+    let name = queue.clone();
+    if act(&state, move |backend| backend.pause_queue(&name)).await? {
+        tracing::info!(queue, "paused a queue from the dashboard");
+    }
+    Ok(back(&state, form.return_to.as_deref()))
+}
+
+pub(crate) async fn resume_queue(
+    State(state): State<Arc<AppState>>,
+    Path(queue): Path<String>,
+    Form(form): Form<Back>,
+) -> Result<Redirect, WebError> {
+    let name = queue.clone();
+    if act(&state, move |backend| backend.resume_queue(&name)).await? {
+        tracing::info!(queue, "resumed a queue from the dashboard");
+    }
     Ok(back(&state, form.return_to.as_deref()))
 }
 

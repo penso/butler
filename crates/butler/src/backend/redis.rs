@@ -9,6 +9,7 @@
 //! <prefix>:workers               SET   worker ids that may hold jobs
 //! <prefix>:dead                  LIST  ids that exhausted their retries
 //! <prefix>:job:<id>              HASH  { state, queue, data (job JSON) }
+//! <prefix>:paused                SET   queues workers don't claim from
 //! <prefix>:slots:<queue>         SET   ids running in one of the queue's global-limit slots
 //! <prefix>:recurring             SET   keys of the recurring schedules workers registered
 //! <prefix>:recurring:<key>       HASH  { data (schedule JSON), created_at, seen_at, last_tick, last_job }
@@ -906,6 +907,13 @@ impl Store for RedisQueue {
         Ok(recovered)
     }
 
+    fn paused_queues(&self) -> Result<Vec<String>> {
+        let mut paused: Vec<String> =
+            self.with_conn(|con| redis::cmd("SMEMBERS").arg(self.key("paused")).query(con))?;
+        paused.sort();
+        Ok(paused)
+    }
+
     /// One transaction: `HSETNX` keeps an existing schedule's creation time,
     /// and its last run is left alone.
     fn register_recurring(&self, schedules: &[RecurringRecord]) -> Result<Vec<RecurringRecord>> {
@@ -1216,6 +1224,33 @@ impl Monitor for RedisQueue {
                 .exec(con)
         })?;
         Ok(true)
+    }
+
+    fn pause_queue(&self, queue: &str) -> Result<bool> {
+        let added: u8 = self.with_conn(|con| {
+            redis::cmd("SADD")
+                .arg(self.key("paused"))
+                .arg(queue)
+                .query(con)
+        })?;
+        Ok(added > 0)
+    }
+
+    /// Also wakes idle claims, which can take the queue's jobs again.
+    fn resume_queue(&self, queue: &str) -> Result<bool> {
+        let (removed,): (u8,) = self.with_conn(|con| {
+            redis::pipe()
+                .atomic()
+                .cmd("SREM")
+                .arg(self.key("paused"))
+                .arg(queue)
+                .cmd("PUBLISH")
+                .arg(self.key("wake"))
+                .arg(queue)
+                .ignore()
+                .query(con)
+        })?;
+        Ok(removed > 0)
     }
 
     fn recurring(&self) -> Result<Vec<RecurringRecord>> {

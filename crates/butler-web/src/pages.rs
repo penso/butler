@@ -274,6 +274,8 @@ struct JobPage {
     /// For a scheduled job: when it runs, in ms and as "in 5m".
     run_at: Option<(u64, String)>,
     args: String,
+    /// What enqueue layers stored with the job, if anything.
+    meta: Option<String>,
     last_error: Option<String>,
     result: Option<String>,
     progress: Option<String>,
@@ -314,6 +316,7 @@ pub(crate) async fn job(
             .filter(|_| job_state == JobState::Scheduled)
             .map(|ms| (ms, until(ms))),
         args: pretty(&record.args),
+        meta: (!record.meta.is_empty()).then(|| pretty(&record.meta)),
         last_error: record.last_error.clone(),
         result: record.result.as_ref().map(pretty),
         progress: record.progress.as_ref().map(pretty),

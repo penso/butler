@@ -46,7 +46,6 @@ use std::{
 };
 
 use redis::{Client, Connection, RedisResult};
-use serde_json::Value;
 
 use super::{Monitor, NewJob, Promoted, Store, Watch};
 use crate::{
@@ -385,9 +384,9 @@ impl RedisQueue {
     }
 }
 
-impl Store for RedisQueue {
-    fn push(&self, name: &str, queue: &str, args: Vec<Value>) -> Result<JobId> {
-        let job = JobRecord::new(name, queue, args);
+impl RedisQueue {
+    fn push_pending(&self, job: JobRecord) -> Result<JobId> {
+        let queue = &job.queue;
         let data = serde_json::to_string(&job)?;
         self.with_conn(|con| {
             redis::pipe()
@@ -418,72 +417,8 @@ impl Store for RedisQueue {
         Ok(job.id)
     }
 
-    /// One pipelined transaction for every job, and one wake-up per queue.
-    fn push_many(&self, jobs: Vec<NewJob>) -> Result<Vec<JobId>> {
-        let mut pipe = redis::pipe();
-        pipe.atomic();
-        let mut ids = Vec::with_capacity(jobs.len());
-        // Queues that got a pending job, which wakes claims, and whether it did.
-        let mut queues: Vec<(String, bool)> = Vec::new();
-        for new in jobs {
-            let mut job = JobRecord::new(&new.name, &new.queue, new.args);
-            job.run_at_ms = new.run_at.map(millis);
-            let state = match job.run_at_ms {
-                Some(_) => JobState::Scheduled,
-                None => JobState::Pending,
-            };
-            pipe.cmd("HSET")
-                .arg(self.job_key(&job.id))
-                .arg("state")
-                .arg(state.as_str())
-                .arg("queue")
-                .arg(&new.queue)
-                .arg("data")
-                .arg(serde_json::to_string(&job)?)
-                .ignore();
-            match job.run_at_ms {
-                Some(run_at) => pipe
-                    .cmd("ZADD")
-                    .arg(self.key("scheduled"))
-                    .arg(run_at)
-                    .arg(&job.id)
-                    .ignore(),
-                None => pipe
-                    .cmd("LPUSH")
-                    .arg(self.queue_key(&new.queue))
-                    .arg(&job.id)
-                    .ignore(),
-            };
-            let pending = job.run_at_ms.is_none();
-            match queues.iter_mut().find(|(queue, _)| *queue == new.queue) {
-                Some((_, wakes)) => *wakes |= pending,
-                None => queues.push((new.queue, pending)),
-            }
-            ids.push(job.id);
-        }
-        for (queue, wakes) in &queues {
-            pipe.cmd("SADD").arg(self.key("queues")).arg(queue).ignore();
-            if *wakes {
-                pipe.cmd("PUBLISH")
-                    .arg(self.key("wake"))
-                    .arg(queue)
-                    .ignore();
-            }
-        }
-        self.with_conn(|con| pipe.exec(con))?;
-        Ok(ids)
-    }
-
-    fn schedule(
-        &self,
-        name: &str,
-        queue: &str,
-        args: Vec<Value>,
-        run_at: SystemTime,
-    ) -> Result<JobId> {
-        let mut job = JobRecord::new(name, queue, args);
-        let run_at = millis(run_at);
-        job.run_at_ms = Some(run_at);
+    fn push_scheduled(&self, job: JobRecord, run_at: u64) -> Result<JobId> {
+        let queue = &job.queue;
         let data = serde_json::to_string(&job)?;
         // No wake-up: there is nothing to claim until it is promoted.
         self.with_conn(|con| {
@@ -510,6 +445,71 @@ impl Store for RedisQueue {
                 .exec(con)
         })?;
         Ok(job.id)
+    }
+}
+
+impl Store for RedisQueue {
+    fn push(&self, job: NewJob) -> Result<JobId> {
+        let job = job.into_record();
+        match job.run_at_ms {
+            Some(run_at) => self.push_scheduled(job, run_at),
+            None => self.push_pending(job),
+        }
+    }
+
+    /// One pipelined transaction for every job, and one wake-up per queue.
+    fn push_many(&self, jobs: Vec<NewJob>) -> Result<Vec<JobId>> {
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        let mut ids = Vec::with_capacity(jobs.len());
+        // Queues that got a pending job, which wakes claims, and whether it did.
+        let mut queues: Vec<(String, bool)> = Vec::new();
+        for new in jobs {
+            let job = new.into_record();
+            let state = match job.run_at_ms {
+                Some(_) => JobState::Scheduled,
+                None => JobState::Pending,
+            };
+            pipe.cmd("HSET")
+                .arg(self.job_key(&job.id))
+                .arg("state")
+                .arg(state.as_str())
+                .arg("queue")
+                .arg(&job.queue)
+                .arg("data")
+                .arg(serde_json::to_string(&job)?)
+                .ignore();
+            match job.run_at_ms {
+                Some(run_at) => pipe
+                    .cmd("ZADD")
+                    .arg(self.key("scheduled"))
+                    .arg(run_at)
+                    .arg(&job.id)
+                    .ignore(),
+                None => pipe
+                    .cmd("LPUSH")
+                    .arg(self.queue_key(&job.queue))
+                    .arg(&job.id)
+                    .ignore(),
+            };
+            let pending = job.run_at_ms.is_none();
+            match queues.iter_mut().find(|(queue, _)| *queue == job.queue) {
+                Some((_, wakes)) => *wakes |= pending,
+                None => queues.push((job.queue.clone(), pending)),
+            }
+            ids.push(job.id);
+        }
+        for (queue, wakes) in &queues {
+            pipe.cmd("SADD").arg(self.key("queues")).arg(queue).ignore();
+            if *wakes {
+                pipe.cmd("PUBLISH")
+                    .arg(self.key("wake"))
+                    .arg(queue)
+                    .ignore();
+            }
+        }
+        self.with_conn(|con| pipe.exec(con))?;
+        Ok(ids)
     }
 
     fn promote(&self, now: SystemTime) -> Result<Promoted> {

@@ -36,17 +36,27 @@ pub struct JobRecord {
     /// it was due. Absent from records written before scheduling existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_at_ms: Option<u64>,
+    /// Metadata that [enqueue layers](crate::EnqueueLayer) added, such as a
+    /// tenant or a trace id. Worker layers read it from the
+    /// [`JobContext`](crate::JobContext).
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub meta: serde_json::Map<String, Value>,
 }
 
 impl JobRecord {
     pub fn new(name: &str, queue: &str, args: Vec<Value>) -> Self {
+        Self::owned(name.to_owned(), queue.to_owned(), args)
+    }
+
+    /// Like [`new`](JobRecord::new), without copying the names again.
+    pub(crate) fn owned(name: String, queue: String, args: Vec<Value>) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         JobRecord {
             id: new_id(now.as_nanos()),
-            name: name.to_string(),
-            queue: queue.to_string(),
+            name,
+            queue,
             args,
             attempts: 0,
             enqueued_at_ms: now.as_millis() as u64,
@@ -54,6 +64,7 @@ impl JobRecord {
             result: None,
             progress: None,
             run_at_ms: None,
+            meta: serde_json::Map::new(),
         }
     }
 

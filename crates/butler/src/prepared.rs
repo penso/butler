@@ -158,23 +158,26 @@ pub async fn enqueue_all<T>(
     if jobs.is_empty() {
         return Ok(Vec::new());
     }
+    // Every job passes the enqueue layers before any is stored: one veto
+    // fails the whole batch, and nothing is enqueued.
+    let jobs = jobs
+        .into_iter()
+        .map(|job| {
+            let mut new = NewJob::new(job.def.name, job.queue, job.args);
+            new.run_at = job.run_at;
+            crate::enqueue::apply(&mut new)?;
+            Ok((job.def, new))
+        })
+        .collect::<Result<Vec<_>>>()?;
     if let Some(inline) = crate::testing::current() {
         let mut handles = Vec::with_capacity(jobs.len());
-        for job in jobs {
-            handles.push(inline.run(job.def, &job.queue, job.args).await?);
+        for (def, new) in jobs {
+            handles.push(inline.run(def, new).await?);
         }
         return Ok(handles);
     }
     let queue: Queue = crate::queue()?;
-    let new_jobs: Vec<NewJob> = jobs
-        .into_iter()
-        .map(|job| NewJob {
-            name: job.def.name.to_owned(),
-            queue: job.queue,
-            args: job.args,
-            run_at: job.run_at,
-        })
-        .collect();
+    let new_jobs: Vec<NewJob> = jobs.into_iter().map(|(_, new)| new).collect();
     let pushing = queue.clone();
     let ids = unblock(queue.blocks(), move || pushing.push_many(new_jobs)).await?;
     Ok(ids

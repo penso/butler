@@ -60,6 +60,8 @@ types, and the `reports` module belong to your application. See
 - **Recovery and retries.** Worker heartbeats recover abandoned jobs; failed
   attempts retry with exponential, polynomial or fixed backoff and jitter, per
   job or per error, then remain visible for inspection.
+- **Middleware.** Layers around every job run and every enqueue, with job
+  metadata, vetoes, a tracing span per run, and an `on_dead` hook for alerts.
 - **Scheduled jobs.** Run a job in five minutes or at 03:00 with
   `prepare(..)?.run_in(..)` or `.run_at(..)`, and cancel it while it waits.
 - **Resumable work.** Typed checkpoints let long jobs continue after a deploy,
@@ -96,6 +98,7 @@ crashes; storage durability still depends on the backend's configuration.
   - [Retries and backoff](#retries-and-backoff)
   - [Results](#results)
   - [Running a worker](#running-a-worker)
+  - [Middleware](#middleware)
   - [Job continuations](#job-continuations)
   - [Testing](#testing)
   - [Queues and priority](#queues-and-priority)
@@ -727,10 +730,19 @@ impl butler::Retryable for CrmError {
 ```
 
 `After` replaces the backoff (without jitter) but still counts as an attempt.
-The `#[job]` macro reads it from the error type the function returns, so it
-works for your own error types; an error boxed into `anyhow::Error` or
-`BoxError` uses the default. Errors from butler itself, such as a panic or an
-argument that no longer deserializes, follow the job's backoff.
+The `#[job]` macro reads it from the error type the function returns. When
+that error arrives wrapped (the job returns `anyhow::Result` or `BoxError`, or
+the `Retryable` error is the `source` of another one), register its type once:
+
+```rust
+butler::retryable!(CrmError);
+```
+
+The error and its sources are then searched, outermost first, for one of a
+registered type, and its classification applies. butler does this without
+depending on anyhow: an `anyhow::Error` converts into a `BoxError` whose
+source chain holds your error. Errors from butler itself, such as a panic or
+an argument that no longer deserializes, follow the job's backoff.
 
 ### Results
 
@@ -801,6 +813,84 @@ Without tokio, `Worker::run()` runs jobs on plain threads using butler's own
 
 In tests, `worker.drain()` runs the work on its configured queues, including
 retries, and returns when those queues are empty.
+
+### Middleware
+
+Code that runs around jobs, like ActiveJob's callbacks and Sidekiq's
+middleware: for logging context, tenant or database setup, metrics, and
+alerting.
+
+**Worker layers** wrap every job a worker runs. A layer gets the job and the
+next step, and can act before and after it, change its result, or
+short-circuit by not calling `next` at all:
+
+```rust
+use butler::{JobContext, Next};
+
+let worker = butler::Worker::from_config(&config)?
+    .wrap(|job: JobContext, next: Next| async move {
+        let tenant = job.meta().get("tenant").cloned();   // from an enqueue layer
+        let started = Instant::now();
+        let result = with_tenant(tenant, next.run()).await;
+        metrics::record(job.name(), job.queue(), started.elapsed(), result.is_ok());
+        result
+    })
+    .wrap(|job: JobContext, next: Next| async move {
+        if maintenance(job.queue()) {
+            return Ok(serde_json::Value::Null);           // skip: counts as done
+        }
+        next.run().await
+    });
+```
+
+- Layers run in the order they are added: the first is the outermost. They
+  work the same under `run_async` (in the job's task) and `run`, and wrap
+  plain `fn` jobs too, around their trip to the blocking pool.
+- `JobContext` has the job's `id()`, `name()`, `queue()`, `args()`,
+  `attempt()` (from 1), `last_error()`, `retry_policy()`,
+  `is_last_attempt()`, `scheduled_at()`, `enqueued_at()`, `meta()` and the
+  whole `record()`.
+- A short-circuit's `Ok` is stored as the job's output; an `Err` is a failed
+  attempt like any other. A panic in a layer fails the attempt, as a panic in
+  the job does. Don't hold a synchronous lock across `.await` in a layer.
+- A layer can be any type implementing `butler::Layer`, too.
+
+**Enqueue layers** see every job before it is stored, from a `#[job]` call, a
+prepared job, or `enqueue_all`. They can add metadata, which is stored with the
+job for worker layers to read, or veto it:
+
+```rust
+butler::configure_enqueue(|job: &mut butler::NewJob| {
+    if job.queue == "mailers" && mail_paused() {
+        return Err(MailPaused);                           // nothing is stored
+    }
+    job.meta.insert("tenant".into(), current_tenant().into());
+    Ok(())
+});
+```
+
+A veto makes the enqueue return `butler::Error::Vetoed`, with the layer's
+error as its source. In `enqueue_all`, every job passes the layers before any
+is stored, so one veto fails the whole batch. Layers are process-wide, like
+`butler::configure`, and run in the order they were added, in the caller:
+keep them quick. They apply in inline test mode too, but not to `.now()`,
+which enqueues nothing (worker layers don't apply to it either).
+
+**Tracing.** Every run is a `job` span with `id`, `name`, `queue`,
+`attempt` and `worker`, and when it finishes, `outcome` (`done`, `retry`,
+`dead` or `interrupted`) and, for a retry, `retry_at_ms`, the next attempt's
+time in milliseconds since the Unix epoch. The worker's log lines about a
+job, and the job's own, are inside it.
+
+**`on_dead`** runs when a job dies, for alerting: when it used all its
+retries, and when its error said never to retry (`dead.discarded()` tells
+which). It runs after the job is stored as dead, inside its span:
+
+```rust
+worker.on_dead(|dead: butler::DeadJob| async move {
+    pager::alert(format!("{} died: {}", dead.job().name(), dead.job().error())).await;
+})
+```
 
 ### Job continuations
 

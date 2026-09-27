@@ -23,7 +23,9 @@
 //! `#[job(retries = 10, backoff = "exponential")]` how often and how late it is
 //! retried (default: the worker's settings; backoff is `"exponential"`,
 //! `"polynomial"` or `"fixed:30s"`). If the job's error type implements
-//! `butler::Retryable`, each error decides whether and when to retry.
+//! `butler::Retryable`, each error decides whether and when to retry; for
+//! errors wrapped in a `BoxError` or `anyhow::Error`, register the inner type
+//! with `butler::retryable!`.
 //! - `send_email::prepare(...)`, which builds the job without enqueueing it,
 //!   for `butler::enqueue_all`, `.on_queue(..)`, or `.run_in(..)` to schedule it.
 //! - `send_email::JOB`, a handle for `Worker::register`. Jobs defined in another

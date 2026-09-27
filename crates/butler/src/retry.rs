@@ -154,7 +154,7 @@ const BACKOFF_FORMS: &str = r#"use "exponential", "polynomial", or "fixed:<durat
 const DURATION_FORMS: &str = "a fixed delay is a whole number with ms, s, m, h or d, like 30s";
 
 /// `"30s"` in milliseconds. The `#[job]` macro accepts the same forms.
-fn parse_millis(text: &str) -> Option<u64> {
+pub(crate) fn parse_millis(text: &str) -> Option<u64> {
     let split = text.find(|c: char| !c.is_ascii_digit())?;
     let (number, unit) = text.split_at(split);
     let scale = match unit {

@@ -23,7 +23,7 @@ unwrap_used = "deny"
 
 [workspace.dependencies]
 anyhow = "1.0.104"
-askama = "0.15"
+askama = "0.16"
 axum   = "0.8.9"
 # `butler` is taken on crates.io, so the package is `butler-jobs`; its library
 # is still named `butler`, which is the path the macro expands to.

@@ -7,7 +7,9 @@
 //! heartbeats and recovery, atomic claim, cancel and promotion (here, under
 //! one lock). A claim with a `wait` sleeps on a condition variable and wakes
 //! as soon as a job is pushed. Scheduled jobs wait in a set ordered by run
-//! time until they are promoted onto their queue.
+//! time until they are promoted onto their queue. Recurring ticks are
+//! remembered in a set per schedule, checked and filled under the same lock
+//! as the push.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
@@ -15,9 +17,9 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use super::{Monitor, NewJob, Promoted, Store, Watch};
+use super::{Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
 use crate::{
-    JobId, JobRecord, JobState, Result, Signal,
+    JobId, JobRecord, JobState, RecurringRecord, Result, Signal,
     job::{from_millis, millis},
     monitor::{
         JobMetric, ListFilter, METRICS_RETENTION_MINUTES, MetricBucket, QueueStats, Stats,
@@ -52,6 +54,10 @@ struct State {
     processing: HashMap<String, HashSet<JobId>>,
     /// When each worker's heartbeat expires.
     heartbeats: HashMap<String, Instant>,
+    /// Recurring schedules, by key.
+    recurring: BTreeMap<String, RecurringRecord>,
+    /// Per recurring schedule, the ticks enqueued (ms), for a day.
+    ticks: HashMap<String, BTreeSet<u64>>,
     /// History, per (minute, queue, job).
     metrics: BTreeMap<(u64, String, String), MetricBucket>,
     processed_total: u64,
@@ -335,6 +341,41 @@ impl Store for MemoryQueue {
         Ok(recovered)
     }
 
+    fn register_recurring(&self, schedules: &[RecurringRecord]) -> Result<Vec<RecurringRecord>> {
+        let mut state = self.lock();
+        Ok(schedules
+            .iter()
+            .map(|schedule| {
+                let mut schedule = schedule.clone();
+                if let Some(stored) = state.recurring.get(&schedule.key) {
+                    schedule.merge_stored(stored);
+                }
+                state
+                    .recurring
+                    .insert(schedule.key.clone(), schedule.clone());
+                schedule
+            })
+            .collect())
+    }
+
+    fn push_recurring(&self, key: &str, tick: SystemTime, job: NewJob) -> Result<Option<JobId>> {
+        let tick = millis(tick);
+        let mut state = self.lock();
+        let ticks = state.ticks.entry(key.to_owned()).or_default();
+        if !ticks.insert(tick) {
+            return Ok(None);
+        }
+        let oldest = tick.saturating_sub(millis_of(TICK_RETENTION));
+        *ticks = ticks.split_off(&oldest);
+        let id = state.insert_new(job.into_record());
+        if let Some(schedule) = state.recurring.get_mut(key) {
+            schedule.record_run(tick, &id);
+        }
+        drop(state);
+        self.inner.pushed.notify_all();
+        Ok(Some(id))
+    }
+
     /// Every call is a few map updates under a lock.
     fn blocks(&self) -> bool {
         false
@@ -473,6 +514,16 @@ impl Monitor for MemoryQueue {
         Ok(finished)
     }
 
+    fn recurring(&self) -> Result<Vec<RecurringRecord>> {
+        Ok(self.lock().recurring.values().cloned().collect())
+    }
+
+    fn remove_recurring(&self, key: &str) -> Result<bool> {
+        let mut state = self.lock();
+        state.ticks.remove(key);
+        Ok(state.recurring.remove(key).is_some())
+    }
+
     fn record_metric(&self, metric: &JobMetric) -> Result<()> {
         let mut state = self.lock();
         state.processed_total += 1;
@@ -511,4 +562,8 @@ impl Watch for MemoryQueue {
     fn watch_finished(&self, id: &str) -> Option<Arc<Signal>> {
         Some(self.inner.finished.watch(id))
     }
+}
+
+fn millis_of(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }

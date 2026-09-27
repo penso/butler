@@ -13,6 +13,8 @@
 //! <dir>/done/                  succeeded
 //! <dir>/dead/                  failed after exhausting retries
 //! <dir>/cancelled/             removed from pending/ before a worker claimed it
+//! <dir>/recurring/schedules/<key>.json   a recurring schedule workers registered
+//! <dir>/recurring/ticks/<key>/<tick ms>  one per tick enqueued, holding its job id
 //! ```
 //!
 //! Cancelling is a rename from `pending/<queue>/` or `scheduled/` to
@@ -22,18 +24,25 @@
 //! transitions use `<id>.retry.json` in the processing directory and recover
 //! to `scheduled/` when they carry a run time. They all race with
 //! other renames the way two claims do: exactly one succeeds.
+//!
+//! A recurring tick is claimed by hard-linking a marker file, already
+//! holding the job id, to `recurring/ticks/<key>/<tick>`: a link fails if the
+//! name exists, so exactly one worker creates it, and only that worker then
+//! renames the job file (written under `tmp/` first) into its queue. A crash
+//! between the two steps loses that one tick: the marker says it ran.
 
 use std::{
     collections::BTreeMap,
     ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use super::{Monitor, NewJob, Promoted, Store, Watch};
+use super::{Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
 use crate::{
-    JobId, JobRecord, JobState, Result,
+    JobId, JobRecord, JobState, RecurringRecord, Result,
     job::{DEFAULT_QUEUE, from_millis, millis},
     monitor::{ListFilter, QueueStats, Stats, WorkerStats},
 };
@@ -50,6 +59,8 @@ const LOOKUP_ORDER: [JobState; 6] = [
 ];
 
 const WORKERS: &str = "workers";
+const SCHEDULES: &str = "recurring/schedules";
+const TICKS: &str = "recurring/ticks";
 
 #[derive(Debug, Clone)]
 pub struct FileQueue {
@@ -59,7 +70,7 @@ pub struct FileQueue {
 impl FileQueue {
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
-        for dir in ["tmp", WORKERS] {
+        for dir in ["tmp", WORKERS, SCHEDULES, TICKS] {
             fs::create_dir_all(root.join(dir))?;
         }
         for state in LOOKUP_ORDER {
@@ -202,11 +213,71 @@ impl FileQueue {
     /// Writes `contents` under `tmp/` and then renames it to `to`, so readers
     /// never see a half-written file.
     fn write_atomic(&self, to: &Path, contents: &[u8]) -> Result<()> {
-        let name = to.file_name().unwrap_or_default();
-        let tmp = self.root.join("tmp").join(name);
+        let tmp = self.staged(to.file_name().unwrap_or_default())?;
         fs::write(&tmp, contents)?;
         fs::rename(&tmp, to)?;
         Ok(())
+    }
+
+    /// A path under `tmp/` no other writer uses, even one writing a file of
+    /// the same name at the same time, such as another process registering
+    /// the same recurring schedule.
+    fn staged(&self, name: &std::ffi::OsStr) -> Result<PathBuf> {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let mut unique = name.to_owned();
+        unique.push(format!(
+            ".{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        Ok(self.root.join("tmp").join(unique))
+    }
+
+    fn schedule_path(&self, key: &str) -> PathBuf {
+        self.root.join(SCHEDULES).join(format!("{key}.json"))
+    }
+
+    fn ticks_dir(&self, key: &str) -> PathBuf {
+        self.root.join(TICKS).join(key)
+    }
+
+    /// The tick markers of schedule `key`: `(tick ms, file name)`, oldest
+    /// first.
+    fn ticks(&self, key: &str) -> Result<Vec<(u64, OsString)>> {
+        let entries = match fs::read_dir(self.ticks_dir(key)) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut ticks = Vec::new();
+        for entry in entries {
+            let name = entry?.file_name();
+            if let Some(tick) = name.to_str().and_then(|name| name.parse().ok()) {
+                ticks.push((tick, name));
+            }
+        }
+        ticks.sort();
+        Ok(ticks)
+    }
+
+    /// Schedule `key` as stored, with its last run from its newest tick
+    /// marker. `None` if it isn't registered.
+    fn read_schedule(&self, key: &str) -> Result<Option<RecurringRecord>> {
+        let mut schedule: RecurringRecord = match fs::read(self.schedule_path(key)) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        schedule.last_tick_ms = None;
+        schedule.last_job_id = None;
+        if let Some((tick, name)) = self.ticks(key)?.pop() {
+            match fs::read_to_string(self.ticks_dir(key).join(name)) {
+                Ok(job) => schedule.record_run(tick, job.trim()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(Some(schedule))
     }
 
     fn scheduled_path(&self, job: &JobRecord) -> PathBuf {
@@ -423,6 +494,63 @@ impl Store for FileQueue {
         Ok(recovered)
     }
 
+    fn register_recurring(&self, schedules: &[RecurringRecord]) -> Result<Vec<RecurringRecord>> {
+        fs::create_dir_all(self.root.join(SCHEDULES))?;
+        let mut stored = Vec::with_capacity(schedules.len());
+        for schedule in schedules {
+            let mut schedule = schedule.clone();
+            if let Some(existing) = self.read_schedule(&schedule.key)? {
+                schedule.merge_stored(&existing);
+            }
+            let mut written = schedule.clone();
+            // The last run lives in the tick markers, not here.
+            written.last_tick_ms = None;
+            written.last_job_id = None;
+            self.write_atomic(
+                &self.schedule_path(&schedule.key),
+                &serde_json::to_vec_pretty(&written)?,
+            )?;
+            stored.push(schedule);
+        }
+        Ok(stored)
+    }
+
+    fn push_recurring(&self, key: &str, tick: SystemTime, job: NewJob) -> Result<Option<JobId>> {
+        let job = job.into_record();
+        let tick = millis(tick);
+        let dir = self.ticks_dir(key);
+        fs::create_dir_all(&dir)?;
+        // Both written where no worker looks, before the tick is claimed.
+        let file = format!("{}.json", job.id);
+        let staged_job = self.staged(file.as_ref())?;
+        fs::write(&staged_job, serde_json::to_vec_pretty(&job)?)?;
+        let staged_marker = self.staged(format!("{key}-{tick}").as_ref())?;
+        fs::write(&staged_marker, &job.id)?;
+        let claimed = fs::hard_link(&staged_marker, dir.join(format!("{tick:020}")));
+        ignore_missing(fs::remove_file(&staged_marker))?;
+        match claimed {
+            Ok(()) => {}
+            Err(e) => {
+                ignore_missing(fs::remove_file(&staged_job))?;
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    return Ok(None);
+                }
+                return Err(e.into());
+            }
+        }
+        let queue = self.pending(&job.queue);
+        fs::create_dir_all(&queue)?;
+        fs::rename(&staged_job, queue.join(file))?;
+        let oldest = tick.saturating_sub(u64::try_from(TICK_RETENTION.as_millis()).unwrap_or(0));
+        for (old, name) in self.ticks(key)? {
+            if old >= oldest {
+                break;
+            }
+            ignore_missing(fs::remove_file(dir.join(name)))?;
+        }
+        Ok(Some(job.id))
+    }
+
     fn describe(&self) -> String {
         format!("file:{}", self.root.display())
     }
@@ -557,6 +685,36 @@ impl Monitor for FileQueue {
             Some(path) => self.enqueue_scheduled(&path),
             None => Ok(false),
         }
+    }
+
+    fn recurring(&self) -> Result<Vec<RecurringRecord>> {
+        let mut keys = Vec::new();
+        for entry in fs::read_dir(self.root.join(SCHEDULES))? {
+            let name = entry?.file_name();
+            if let Some(key) = name.to_str().and_then(|name| name.strip_suffix(".json")) {
+                keys.push(key.to_owned());
+            }
+        }
+        keys.sort();
+        let mut schedules = Vec::with_capacity(keys.len());
+        for key in keys {
+            // Removed while we were listing: skip it.
+            schedules.extend(self.read_schedule(&key)?);
+        }
+        Ok(schedules)
+    }
+
+    fn remove_recurring(&self, key: &str) -> Result<bool> {
+        let removed = match fs::remove_file(self.schedule_path(key)) {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
+        match fs::remove_dir_all(self.ticks_dir(key)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        Ok(removed)
     }
 
     fn discard(&self, id: &str) -> Result<bool> {

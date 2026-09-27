@@ -13,8 +13,8 @@ use std::{
 };
 
 use butler::{
-    AnyJob, Backoff, Failed, FileQueue, JITTER, JobState, MemoryQueue, NewJob, Queue, Retry,
-    RetryPolicy,
+    AnyJob, Backoff, Cron, Failed, FileQueue, JITTER, JobState, MemoryQueue, NewJob, Queue,
+    Recurring, RecurringRecord, Retry, RetryPolicy,
     monitor::{JobMetric, ListFilter},
 };
 use serde_json::json;
@@ -966,5 +966,154 @@ fn metadata_is_kept_through_scheduling_claims_retries_and_recovery() {
         queue.promote(later).unwrap();
         assert_eq!(queue.state(&scheduled), Some(JobState::Pending), "{name}");
         assert_eq!(meta_of(&scheduled), expected, "{name}");
+    }
+}
+
+/// A recurring schedule for job `name` every hour, as a worker registers it
+/// at `now`.
+fn hourly(name: &str, key: &str, now: SystemTime) -> RecurringRecord {
+    Recurring::from_parts(
+        name.into(),
+        "reports".into(),
+        vec![json!("summary")],
+        Cron::parse("0 * * * *").unwrap(),
+    )
+    .unwrap()
+    .with_key(key)
+    .unwrap()
+    .record(now)
+}
+
+#[test]
+fn a_recurring_tick_is_enqueued_once_however_many_workers_push_it() {
+    for (queue, _) in backends("recurring-once") {
+        let name = queue.describe();
+        let now = SystemTime::now();
+        queue
+            .register_recurring(&[hourly("report", "hourly", now)])
+            .unwrap();
+        let tick = UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+
+        // Eight workers reach the same tick at once: one of them enqueues it.
+        let pushers: Vec<_> = (0..8)
+            .map(|_| {
+                let queue = queue.clone();
+                thread::spawn(move || {
+                    let job = NewJob::new("report", "reports", vec![json!("summary")]);
+                    queue.push_recurring("hourly", tick, job).unwrap()
+                })
+            })
+            .collect();
+        let ids: Vec<_> = pushers
+            .into_iter()
+            .filter_map(|pusher| pusher.join().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 1, "{name}: one job per tick");
+
+        // Pending on its own queue, with its arguments, claimable once.
+        assert_eq!(queue.state(&ids[0]), Some(JobState::Pending), "{name}");
+        let job = queue.claim("w", &["reports"], NOW).unwrap().unwrap();
+        assert_eq!(job.id(), ids[0], "{name}");
+        assert_eq!(job.args(), [json!("summary")], "{name}");
+        assert!(
+            queue.claim("w", &["reports"], NOW).unwrap().is_none(),
+            "{name}"
+        );
+
+        // Later tries of the same tick still find it taken; the next tick runs.
+        let again = NewJob::new("report", "reports", vec![]);
+        assert_eq!(
+            queue.push_recurring("hourly", tick, again).unwrap(),
+            None,
+            "{name}"
+        );
+        let next = tick + HOUR;
+        let next_id = queue
+            .push_recurring("hourly", next, NewJob::new("report", "reports", vec![]))
+            .unwrap();
+        assert!(next_id.is_some(), "{name}");
+
+        // The same tick of another schedule is its own.
+        let other = queue
+            .push_recurring("other", tick, NewJob::new("report", "reports", vec![]))
+            .unwrap();
+        assert!(other.is_some(), "{name}");
+
+        let listed = queue.recurring().unwrap();
+        assert_eq!(
+            listed.len(),
+            1,
+            "{name}: only registered schedules are listed"
+        );
+        assert_eq!(listed[0].last_tick_ms, Some(millis(next) as u64), "{name}");
+        assert_eq!(listed[0].last_job_id, next_id, "{name}");
+    }
+}
+
+#[test]
+fn registering_a_schedule_keeps_its_creation_time_and_last_run() {
+    for (queue, _) in backends("recurring-register") {
+        let name = queue.describe();
+        let first = UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let stored = queue
+            .register_recurring(&[hourly("report", "hourly", first)])
+            .unwrap();
+        assert_eq!(stored[0].created_at_ms, millis(first) as u64, "{name}");
+        assert_eq!(stored[0].last_tick_ms, None, "{name}");
+        let id = queue
+            .push_recurring("hourly", first, NewJob::new("report", "reports", vec![]))
+            .unwrap()
+            .unwrap();
+
+        // A later registration, with new arguments: the definition and
+        // `seen_at_ms` change, the creation time and last run stay.
+        let later = first + HOUR;
+        let mut changed = hourly("report", "hourly", later);
+        changed.args = vec![json!("detailed")];
+        let stored = queue
+            .register_recurring(&[changed, hourly("cleanup", "cleanup", later)])
+            .unwrap();
+        assert_eq!(stored.len(), 2, "{name}");
+        assert_eq!(stored[0].key, "hourly", "{name}: in the order given");
+        assert_eq!(stored[0].created_at_ms, millis(first) as u64, "{name}");
+        assert_eq!(stored[0].seen_at_ms, millis(later) as u64, "{name}");
+        assert_eq!(stored[0].last_tick_ms, Some(millis(first) as u64), "{name}");
+        assert_eq!(
+            stored[0].last_job_id.as_deref(),
+            Some(id.as_str()),
+            "{name}"
+        );
+        assert_eq!(stored[0].args, vec![json!("detailed")], "{name}");
+        assert_eq!(stored[1].created_at_ms, millis(later) as u64, "{name}");
+
+        let listed = queue.recurring().unwrap();
+        let keys: Vec<_> = listed.iter().map(|s| s.key.as_str()).collect();
+        assert_eq!(keys, ["cleanup", "hourly"], "{name}: sorted by key");
+        assert_eq!(listed[1], stored[0], "{name}");
+    }
+}
+
+#[test]
+fn removing_a_schedule_forgets_it_and_its_last_run() {
+    for (queue, _) in backends("recurring-remove") {
+        let name = queue.describe();
+        let now = SystemTime::now();
+        queue
+            .register_recurring(&[hourly("report", "hourly", now)])
+            .unwrap();
+        let tick = UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        queue
+            .push_recurring("hourly", tick, NewJob::new("report", "reports", vec![]))
+            .unwrap()
+            .unwrap();
+        assert!(queue.remove_recurring("hourly").unwrap(), "{name}");
+        assert!(!queue.remove_recurring("hourly").unwrap(), "{name}");
+        assert!(queue.recurring().unwrap().is_empty(), "{name}");
+
+        // Registered again, it is new: no last run.
+        let stored = queue
+            .register_recurring(&[hourly("report", "hourly", now)])
+            .unwrap();
+        assert_eq!(stored[0].last_tick_ms, None, "{name}");
     }
 }

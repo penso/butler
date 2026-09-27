@@ -33,7 +33,10 @@ tokio = ["dep:tokio"]
 
 [dependencies]
 butler-macros.workspace = true
+chrono.workspace        = true
+chrono-tz.workspace     = true
 config.workspace        = true
+cron-parser.workspace   = true
 inventory.workspace     = true
 redis                   = { optional = true, workspace = true }
 rusqlite                = { optional = true, workspace = true }

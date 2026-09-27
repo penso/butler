@@ -29,7 +29,7 @@ after crashes. Reliability and correct job lifecycle semantics come first.
 | `crates/butler/src/retry.rs` | Retry policies: `Backoff`, `Retry`, `Retryable`, `retryable!` for wrapped errors |
 | `crates/butler/src/middleware.rs`, `enqueue.rs` | Worker layers (`Layer`, `Next`, `JobContext`), `on_dead`, and enqueue layers |
 | `crates/butler/src/monitor.rs` | Dashboard statistics, filters, and metric history |
-| `crates/butler/src/config.rs` | `butler.toml` and `BUTLER_*` environment loading |
+| `crates/butler/src/config.rs`, `retention.rs` | `butler.toml` and `BUTLER_*` environment loading; how long finished jobs are kept |
 | `crates/butler/src/lib.rs` | Public API, the global queue, the `#[job]` enqueue helpers |
 | `crates/butler-macros/` | The `#[job]` attribute macro |
 | `crates/butler-web/` | Dashboard: axum routes, Askama templates, Tailwind CSS, uPlot charts, SSE |

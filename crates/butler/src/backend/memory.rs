@@ -1,7 +1,7 @@
 //! An in-process queue: no files, no server. Enqueuers and workers must share
 //! one `MemoryQueue` (clones share state), so it suits tests, and apps that run
 //! their workers in the same process. Nothing survives a restart, and finished
-//! jobs are kept until the process exits.
+//! jobs are kept for their [`Retention`], until a worker cleans them up.
 //!
 //! It follows the same contract as the other backends: per-worker processing,
 //! heartbeats and recovery, atomic claim, cancel and promotion (here, under
@@ -17,9 +17,9 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use super::{GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
+use super::{Cleaned, GlobalLimit, Monitor, NewJob, Promoted, Store, TICK_RETENTION, Watch};
 use crate::{
-    JobId, JobRecord, JobState, RecurringRecord, Result, Signal,
+    JobId, JobRecord, JobState, RecurringRecord, Result, Retention, Signal,
     job::{from_millis, millis},
     monitor::{
         JobMetric, ListFilter, METRICS_RETENTION_MINUTES, MetricBucket, QueueStats, Stats,
@@ -74,6 +74,12 @@ struct State {
     /// The minute history was last pruned, so it's pruned once a minute, not
     /// on every job.
     pruned_at_minute: u64,
+    retention: Retention,
+    /// When each finished job finished (ms), and the same in finishing
+    /// order, done and cancelled jobs apart from dead ones, for cleaning up.
+    finished_at: HashMap<JobId, u64>,
+    finished: BTreeSet<(u64, JobId)>,
+    dead: BTreeSet<(u64, JobId)>,
 }
 
 impl MemoryQueue {
@@ -87,6 +93,12 @@ impl MemoryQueue {
     pub fn shared() -> Self {
         static SHARED: OnceLock<MemoryQueue> = OnceLock::new();
         SHARED.get_or_init(MemoryQueue::new).clone()
+    }
+
+    /// Keeps finished jobs for `retention`, for every clone of this queue.
+    pub fn retention(self, retention: Retention) -> Self {
+        self.lock().retention = retention;
+        self
     }
 
     /// Every operation is a few map updates that cannot panic halfway, so a
@@ -127,6 +139,51 @@ impl State {
                 .get_mut(&concurrency.key)
                 .is_some_and(|running| running.remove(&job.id))
         })
+    }
+
+    /// Records that job `id` finished now, for [`Store::clean_finished`].
+    fn finish(&mut self, id: &str, dead: bool) {
+        self.unfinish(id);
+        let now = millis(SystemTime::now());
+        self.finished_at.insert(id.to_owned(), now);
+        let order = if dead {
+            &mut self.dead
+        } else {
+            &mut self.finished
+        };
+        order.insert((now, id.to_owned()));
+    }
+
+    /// Forgets when job `id` finished: it was retried or discarded.
+    fn unfinish(&mut self, id: &str) {
+        if let Some(at) = self.finished_at.remove(id) {
+            let entry = (at, id.to_owned());
+            self.finished.remove(&entry);
+            self.dead.remove(&entry);
+        }
+    }
+
+    /// Deletes up to `limit` jobs of `order` that finished before `cutoff`.
+    fn clean(&mut self, dead: bool, cutoff: u64, limit: usize) -> usize {
+        let mut deleted = 0;
+        while deleted < limit {
+            let order = if dead {
+                &mut self.dead
+            } else {
+                &mut self.finished
+            };
+            let Some((at, id)) = order.pop_first() else {
+                break;
+            };
+            if at >= cutoff {
+                order.insert((at, id));
+                break;
+            }
+            self.jobs.remove(&id);
+            self.finished_at.remove(&id);
+            deleted += 1;
+        }
+        deleted
     }
 
     /// Frees `job`'s unique key, if it still holds it.
@@ -336,6 +393,7 @@ impl Store for MemoryQueue {
         state
             .jobs
             .insert(job.id.clone(), (JobState::Done, job.clone()));
+        state.finish(&job.id, false);
         self.inner.finished.notify(&job.id);
         Ok(())
     }
@@ -362,6 +420,7 @@ impl Store for MemoryQueue {
         }
         state.jobs.insert(job.id.clone(), (next, job.clone()));
         if next == JobState::Dead {
+            state.finish(&job.id, true);
             self.inner.finished.notify(&job.id);
         }
         Ok(())
@@ -413,6 +472,7 @@ impl Store for MemoryQueue {
             *job_state = JobState::Cancelled;
             let job = job.clone();
             state.unlock(&job);
+            state.finish(id, false);
         }
         self.inner.finished.notify(id);
         Ok(true)
@@ -479,6 +539,7 @@ impl Store for MemoryQueue {
     }
 
     fn register_recurring(&self, schedules: &[RecurringRecord]) -> Result<Vec<RecurringRecord>> {
+        crate::recurring::validate_keys(schedules)?;
         let mut state = self.lock();
         Ok(schedules
             .iter()
@@ -496,6 +557,7 @@ impl Store for MemoryQueue {
     }
 
     fn push_recurring(&self, key: &str, tick: SystemTime, job: NewJob) -> Result<Option<JobId>> {
+        crate::recurring::validate_key(key)?;
         let tick = millis(tick);
         let mut state = self.lock();
         let ticks = state.ticks.entry(key.to_owned()).or_default();
@@ -514,6 +576,21 @@ impl Store for MemoryQueue {
     }
 
     /// Every call is a few map updates under a lock.
+    fn clean_finished(&self, now: SystemTime, limit: usize) -> Result<Cleaned> {
+        let mut state = self.lock();
+        let retention = state.retention;
+        let mut deleted = 0;
+        for (dead, keep) in [(false, retention.finished), (true, retention.dead)] {
+            if let Some(cutoff) = keep.cutoff(now) {
+                deleted += state.clean(dead, millis(cutoff), limit - deleted);
+            }
+        }
+        Ok(Cleaned {
+            deleted,
+            more: deleted == limit,
+        })
+    }
+
     fn blocks(&self) -> bool {
         false
     }
@@ -616,6 +693,7 @@ impl Monitor for MemoryQueue {
         *job_state = JobState::Pending;
         job.attempts = 0;
         let queue = job.queue.clone();
+        state.unfinish(id);
         state
             .pending
             .entry(queue)
@@ -647,6 +725,7 @@ impl Monitor for MemoryQueue {
             .is_some_and(|(job_state, _)| job_state.is_finished());
         if finished {
             state.jobs.remove(id);
+            state.unfinish(id);
         }
         Ok(finished)
     }

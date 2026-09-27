@@ -223,8 +223,19 @@ fn counts_stay_exact_through_every_write() {
     other.complete("w2", &theirs).unwrap();
     assert_exact(&queue, "writes from another connection");
 
-    // Writes the backend doesn't make: deleting finished jobs, as a
-    // retention cleanup would, and moving a job to another queue.
+    // Retention cleanup, two days on: done and cancelled jobs go (but the
+    // last to finish), dead ones stay.
+    let cleaned = queue
+        .clean_finished(
+            SystemTime::now() + Duration::from_secs(2 * 24 * 3600),
+            1_000,
+        )
+        .unwrap();
+    assert!(cleaned.deleted > 0);
+    assert_exact(&queue, "retention cleanup");
+
+    // Writes the backend doesn't make: deleting finished jobs by hand, and
+    // moving a job to another queue.
     let conn = Connection::open(&path).unwrap();
     let deleted = conn
         .execute(

@@ -39,7 +39,8 @@ impl<T> JobHandle<T> {
     }
 
     /// The job's current state, or `None` if the backend no longer knows it
-    /// (for example, Redis expired it a day after it finished).
+    /// (it finished longer ago than the backend's
+    /// [`Retention`](crate::Retention) keeps it).
     pub async fn state(&self) -> Result<Option<JobState>> {
         Ok(self.job().await?.map(|job| job.state()))
     }

@@ -24,6 +24,13 @@ recover_interval_secs = 10
 backoff = "exponential"
 # Jobs with a Progress: the most often their progress is saved.
 checkpoint_interval_ms = 1000
+# Jobs with a Progress: how many shutdowns may interrupt one at a checkpoint
+# before the next counts as a failed attempt (default: no limit). A job can
+# set its own with #[job(max_resumptions = N)].
+# max_resumptions = 10
+# On shutdown, the longest to wait for running jobs (at least 1). Jobs still
+# running then are requeued once this worker's heartbeat expires.
+shutdown_timeout_secs = 25
 # Weighted: "critical" comes first 3 times out of 4. A plain list like
 # ["critical", "default"] would be strict priority instead.
 queues = [["critical", 3], ["default", 1]]

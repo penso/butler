@@ -40,7 +40,10 @@
 //!   the binary references something from it.
 //!
 //! A parameter of type `butler::Progress<S>` makes the job resumable: the
-//! worker provides it from saved progress, and callers don't pass it.
+//! worker provides it from saved progress, and callers don't pass it. Such a
+//! job may set `#[job(max_resumptions = N)]`: after `N` worker shutdowns
+//! interrupted it at a checkpoint, the next interruption counts as a failed
+//! attempt (default: the worker's setting, unlimited unless configured).
 //!
 //! The function may be `async` (runs as a task on the worker's runtime) or a
 //! plain `fn` (runs on the blocking thread pool, for CPU-bound work). Job
@@ -60,6 +63,7 @@ struct Attrs {
     queue: Option<LitStr>,
     retries: Option<LitInt>,
     backoff: Option<proc_macro2::TokenStream>,
+    max_resumptions: Option<LitInt>,
     /// The argument names the concurrency key is made of.
     concurrency_key: Option<LitStr>,
     limit: Option<LitInt>,
@@ -79,6 +83,11 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
             let value: LitInt = meta.value()?.parse()?;
             value.base10_parse::<u32>()?;
             attrs.retries = Some(value);
+            Ok(())
+        } else if meta.path.is_ident("max_resumptions") {
+            let value: LitInt = meta.value()?.parse()?;
+            value.base10_parse::<u32>()?;
+            attrs.max_resumptions = Some(value);
             Ok(())
         } else if meta.path.is_ident("backoff") {
             let value: LitStr = meta.value()?.parse()?;
@@ -125,7 +134,7 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             Err(meta.error(
                 "unsupported job attribute, expected `name`, `queue`, `retries`, `backoff`, \
-                 `concurrency_key`, `limit` or `unique`",
+                 `max_resumptions`, `concurrency_key`, `limit` or `unique`",
             ))
         }
     });
@@ -237,6 +246,7 @@ fn expand(func: ItemFn, attrs: Attrs) -> syn::Result<proc_macro2::TokenStream> {
         queue,
         retries,
         backoff,
+        max_resumptions,
         concurrency_key,
         limit,
         unique,
@@ -294,6 +304,13 @@ fn expand(func: ItemFn, attrs: Attrs) -> syn::Result<proc_macro2::TokenStream> {
         idents.push(pat_ident.ident.clone());
         types.push((*pat_type.ty).clone());
     }
+    if let (None, Some(max)) = (&progress, &max_resumptions) {
+        return Err(syn::Error::new(
+            max.span(),
+            "max_resumptions limits how often a job resumes from its checkpoints: \
+             add a `Progress` parameter",
+        ));
+    }
     // Built by the worker from saved progress, never passed by callers.
     let progress_init = progress.as_ref().map(|(ident, ty)| {
         quote! {
@@ -315,6 +332,10 @@ fn expand(func: ItemFn, attrs: Attrs) -> syn::Result<proc_macro2::TokenStream> {
     };
     let backoff = match backoff {
         Some(backoff) => quote!(::core::option::Option::Some(#backoff)),
+        None => quote!(::core::option::Option::None),
+    };
+    let max_resumptions = match max_resumptions {
+        Some(max) => quote!(::core::option::Option::Some(#max)),
         None => quote!(::core::option::Option::None),
     };
     let concurrency = match &concurrency_key {
@@ -409,6 +430,7 @@ fn expand(func: ItemFn, attrs: Attrs) -> syn::Result<proc_macro2::TokenStream> {
                     queue: #queue,
                     retries: #retries,
                     backoff: #backoff,
+                    max_resumptions: #max_resumptions,
                     concurrency: #concurrency,
                     unique: #unique,
                     perform: super::#dispatch,

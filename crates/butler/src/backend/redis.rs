@@ -1277,6 +1277,7 @@ impl Monitor for RedisQueue {
             return Ok(false);
         };
         job.attempts = 0;
+        job.resumptions = 0;
         let data = serde_json::to_string(&job)?;
         self.with_conn(|con| {
             redis::pipe()

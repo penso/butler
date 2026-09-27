@@ -615,6 +615,7 @@ impl Monitor for MemoryQueue {
         }
         *job_state = JobState::Pending;
         job.attempts = 0;
+        job.resumptions = 0;
         let queue = job.queue.clone();
         state
             .pending

@@ -7,14 +7,15 @@
 
 use std::{
     sync::{
-        Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Duration,
 };
 
 use butler::{
-    Interrupted, JobHandle, JobState, MemoryQueue, Progress, Queue, Worker, testing::InlineJobs,
+    Backoff, DeadJob, Interrupted, JobError, JobHandle, JobState, MemoryQueue, Progress, Queue,
+    QueuePriority, Worker, testing::InlineJobs,
 };
 use serde::{Deserialize, Serialize};
 
@@ -195,5 +196,191 @@ async fn progress_that_no_longer_fits_its_type_fails_clearly() {
     assert!(
         error.starts_with("saved job progress doesn't match"),
         "{error}"
+    );
+}
+
+/// Runs of `endless` so far: it checkpoints forever and never finishes, so
+/// only a worker shutdown ends a run.
+static ENDLESS_RUNS: AtomicU32 = AtomicU32::new(0);
+static STUBBORN_RUNS: AtomicU32 = AtomicU32::new(0);
+
+#[butler::job(max_resumptions = 1, retries = 0)]
+async fn endless(mut progress: Progress<u32>) -> Result<(), Interrupted> {
+    ENDLESS_RUNS.fetch_add(1, Ordering::SeqCst);
+    loop {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        progress.set(*progress + 1).await?;
+    }
+}
+
+/// Like `endless`, without a limit of its own: the worker's applies.
+#[butler::job]
+async fn stubborn(mut progress: Progress<u32>) -> Result<(), Interrupted> {
+    STUBBORN_RUNS.fetch_add(1, Ordering::SeqCst);
+    loop {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        progress.set(*progress + 1).await?;
+    }
+}
+
+/// Starts `worker`, waits until `runs` goes past `before` (a run of the job
+/// has started), then shuts the worker down and waits for it to return.
+async fn interrupt_one_run(worker: Worker, runs: &AtomicU32, before: u32) {
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(worker.run_async(async {
+        let _ = stopped.await;
+    }));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while runs.load(Ordering::SeqCst) <= before {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the job started");
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the job stopped at a checkpoint")
+        .unwrap();
+}
+
+fn worker_for(queue: &Queue) -> Worker {
+    Worker::new(queue.clone()).poll_interval(Duration::from_millis(10))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_interrupted_past_max_resumptions_counts_a_failed_attempt() {
+    assert_eq!(endless::JOB.max_resumptions, Some(1));
+    assert_eq!(stubborn::JOB.max_resumptions, None);
+    let queue: Queue = MemoryQueue::new().into();
+    let id = queue.push("endless", "default", vec![]).unwrap();
+    let dead = Arc::new(Mutex::new(None));
+    let worker = || {
+        let dead = Arc::clone(&dead);
+        worker_for(&queue).on_dead(move |job: DeadJob| {
+            let dead = Arc::clone(&dead);
+            async move {
+                let limit = matches!(job.error(), JobError::ResumeLimit { max: 1 });
+                *dead.lock().unwrap() = Some(limit);
+            }
+        })
+    };
+
+    // The first shutdown is within the limit: back on the queue, no attempt.
+    interrupt_one_run(worker(), &ENDLESS_RUNS, 0).await;
+    let (state, record) = queue.get(&id).unwrap().unwrap().into_parts();
+    assert_eq!(state, JobState::Pending);
+    assert_eq!((record.attempts, record.resumptions), (0, 1));
+    let saved = record.progress.and_then(|p| p.as_u64()).expect("progress");
+
+    // The second is past it: a failed attempt, and with `retries = 0`, dead.
+    interrupt_one_run(worker(), &ENDLESS_RUNS, 1).await;
+    let (state, record) = queue.get(&id).unwrap().unwrap().into_parts();
+    assert_eq!(state, JobState::Dead);
+    assert_eq!((record.attempts, record.resumptions), (1, 1));
+    let error = record.last_error.unwrap_or_default();
+    assert!(error.contains("max_resumptions"), "{error}");
+    let progress = record.progress.and_then(|p| p.as_u64()).expect("progress");
+    assert!(
+        progress > saved,
+        "the second run resumed and kept its progress"
+    );
+    assert_eq!(*dead.lock().unwrap(), Some(true), "on_dead saw ResumeLimit");
+    assert_eq!(ENDLESS_RUNS.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_workers_max_resumptions_applies_through_the_retry_policy() {
+    let queue: Queue = MemoryQueue::new().into();
+    let id = queue.push("stubborn", "default", vec![]).unwrap();
+    let worker = worker_for(&queue)
+        .max_resumptions(0)
+        .max_retries(3)
+        .backoff(Backoff::NONE);
+
+    interrupt_one_run(worker, &STUBBORN_RUNS, 0).await;
+    let (state, record) = queue.get(&id).unwrap().unwrap().into_parts();
+    assert_eq!(state, JobState::Pending, "retried, not dead: {record:?}");
+    assert_eq!((record.attempts, record.resumptions), (1, 0));
+    assert!(
+        record.progress.is_some(),
+        "a retry resumes from its progress"
+    );
+}
+
+/// Each execution of `in_two_steps`, and of `bystander`, in order.
+static STEPS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+enum TwoSteps {
+    #[default]
+    First,
+    Second,
+}
+
+#[butler::job]
+async fn in_two_steps(mut progress: Progress<TwoSteps>) -> Result<u32, Interrupted> {
+    match *progress {
+        TwoSteps::First => {
+            STEPS.lock().unwrap().push("first");
+            progress.requeue(TwoSteps::Second)?;
+            unreachable!("requeue always interrupts")
+        }
+        TwoSteps::Second => {
+            STEPS.lock().unwrap().push("second");
+            Ok(2)
+        }
+    }
+}
+
+#[butler::job(queue = "isolated")]
+fn bystander() {
+    STEPS.lock().unwrap().push("bystander");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn requeue_starts_the_next_step_in_a_fresh_execution() {
+    let _serial = serial().await;
+    STEPS.lock().unwrap().clear();
+    let queue: Queue = MemoryQueue::new().into();
+    let id = queue.push("in_two_steps", "isolated", vec![]).unwrap();
+    queue.push("bystander", "isolated", vec![]).unwrap();
+
+    let worker = Worker::new(queue.clone())
+        .queues(QueuePriority::strict(["isolated"]))
+        .max_resumptions(0);
+    let drained = tokio::task::spawn_blocking(move || worker.drain().unwrap());
+    assert_eq!(
+        drained.await.unwrap(),
+        3,
+        "two executions and the bystander"
+    );
+    assert_eq!(
+        *STEPS.lock().unwrap(),
+        ["first", "bystander", "second"],
+        "in memory, the second step waits its turn behind the job queued before it"
+    );
+    let job = queue.get(&id).unwrap().unwrap();
+    assert_eq!(job.state(), JobState::Done);
+    let record = job.record();
+    assert_eq!(
+        (record.attempts, record.resumptions),
+        (0, 0),
+        "neither an attempt nor a resumption, even with max_resumptions = 0"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn requeue_resumes_at_once_when_run_now_or_inline() {
+    let _serial = serial().await;
+    STEPS.lock().unwrap().clear();
+    assert_eq!(in_two_steps().now().await.unwrap(), 2);
+
+    let jobs = InlineJobs::new();
+    let handle = jobs.perform(async { in_two_steps().await.unwrap() }).await;
+    assert_eq!(handle.result().await.unwrap(), Some(2));
+    assert_eq!(
+        *STEPS.lock().unwrap(),
+        ["first", "second", "first", "second"]
     );
 }

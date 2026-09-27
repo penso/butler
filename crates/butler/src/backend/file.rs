@@ -1012,6 +1012,7 @@ impl Monitor for FileQueue {
         }
         let mut job: JobRecord = serde_json::from_slice(&fs::read(&taken)?)?;
         job.attempts = 0;
+        job.resumptions = 0;
         self.write(JobState::Pending, &job)?;
         ignore_missing(fs::remove_file(taken))?;
         Ok(true)

@@ -959,6 +959,7 @@ impl Monitor for SqliteQueue {
         };
         let mut job: JobRecord = serde_json::from_str(&data)?;
         job.attempts = 0;
+        job.resumptions = 0;
         let data = serde_json::to_string(&job)?;
         let changed = self.with_conn(|conn| {
             conn.execute(

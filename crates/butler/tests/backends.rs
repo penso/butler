@@ -372,6 +372,56 @@ fn saved_progress_survives_crash_recovery() {
 }
 
 #[test]
+fn resumptions_are_counted_and_kept_until_a_dashboard_retry() {
+    for (queue, _) in backends("resumptions") {
+        let name = queue.describe();
+        let id = queue.push("long", "default", vec![]).unwrap();
+
+        // Each interruption counts one, stored with the job, and read back
+        // by the next claim.
+        for expected in 1..=2 {
+            let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+            assert_eq!(job.resumptions(), expected - 1, "{name}");
+            let pending = queue.interrupt("w", job).unwrap();
+            assert_eq!(pending.resumptions(), expected, "{name}");
+            let (state, stored) = queue.get(&id).unwrap().unwrap().into_parts();
+            assert_eq!(state, JobState::Pending, "{name}");
+            assert_eq!(
+                (stored.attempts, stored.resumptions),
+                (0, expected),
+                "{name}"
+            );
+        }
+
+        // A requeue on the job's own request doesn't count.
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        queue.requeue("w", job).unwrap();
+        let stored = queue.get(&id).unwrap().unwrap().record().clone();
+        assert_eq!(stored.resumptions, 2, "{name}");
+
+        // Kept through crash recovery and failed attempts.
+        queue
+            .heartbeat("crashed", Duration::from_millis(1))
+            .unwrap();
+        queue.claim("crashed", DEFAULT, NOW).unwrap().unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(queue.recover().unwrap(), 1, "{name}");
+        let job = queue.claim("w", DEFAULT, NOW).unwrap().unwrap();
+        assert_eq!(job.resumptions(), 2, "{name}");
+        let Failed::Dead(dead) = queue.fail("w", job, "boom".into(), 0).unwrap() else {
+            panic!("{name}: no retries left");
+        };
+        assert_eq!((dead.attempts(), dead.resumptions()), (1, 2), "{name}");
+
+        // A dashboard retry starts over: attempts and resumptions reset.
+        assert!(queue.retry(&id).unwrap(), "{name}");
+        let (state, stored) = queue.get(&id).unwrap().unwrap().into_parts();
+        assert_eq!(state, JobState::Pending, "{name}");
+        assert_eq!((stored.attempts, stored.resumptions), (0, 0), "{name}");
+    }
+}
+
+#[test]
 fn stats_listing_retry_and_discard_for_a_dashboard() {
     for (queue, _) in backends("monitor") {
         let name = queue.describe();

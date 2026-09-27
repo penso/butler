@@ -47,6 +47,16 @@ pub struct JobRecord {
     /// Its uniqueness, from `#[job(unique = ...)]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unique: Option<crate::UniqueKey>,
+    /// How many times a worker shutdown interrupted it at a checkpoint and
+    /// put it back on its queue without counting an attempt. Bounded by
+    /// `max_resumptions`. Absent from records written before it existed,
+    /// and left out while zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub resumptions: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl JobRecord {
@@ -73,6 +83,7 @@ impl JobRecord {
             meta: serde_json::Map::new(),
             concurrency: None,
             unique: None,
+            resumptions: 0,
         }
     }
 
@@ -265,6 +276,12 @@ impl<S: State> Job<S> {
         self.record.attempts
     }
 
+    /// Times a worker shutdown interrupted it at a checkpoint so far; see
+    /// [`JobRecord::resumptions`].
+    pub fn resumptions(&self) -> u32 {
+        self.record.resumptions
+    }
+
     pub fn state(&self) -> JobState {
         S::STATE
     }
@@ -441,4 +458,37 @@ fn new_id(nanos: u128) -> JobId {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     format!("{nanos:020}-{}-{seq}", std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn a_record_written_before_resumptions_existed_still_parses() {
+        let old = r#"{"id":"1","name":"import","queue":"default","args":[3],
+            "attempts":1,"enqueued_at_ms":1,"last_error":"boom",
+            "progress":{"Items":{"next":2}}}"#;
+        let record: JobRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(record.resumptions, 0);
+        assert_eq!(record.attempts, 1);
+        assert_eq!(
+            record.progress,
+            Some(serde_json::json!({ "Items": { "next": 2 } }))
+        );
+    }
+
+    #[test]
+    fn resumptions_are_stored_only_once_counted() {
+        let mut record = JobRecord::new("import", "default", Vec::new());
+        let fresh = serde_json::to_value(&record).unwrap();
+        assert!(fresh.get("resumptions").is_none(), "{fresh}");
+
+        record.resumptions = 2;
+        let json = serde_json::to_string(&record).unwrap();
+        let back: JobRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.resumptions, 2);
+    }
 }

@@ -193,8 +193,8 @@ pub trait Monitor: Send + Sync + 'static {
         Err(Error::Unsupported("listing jobs"))
     }
 
-    /// Puts a dead job back on its queue, with its attempts reset. Returns
-    /// `false` if `id` isn't a dead job.
+    /// Puts a dead job back on its queue, with its attempts and resumptions
+    /// reset. Returns `false` if `id` isn't a dead job.
     fn retry(&self, _id: &str) -> Result<bool> {
         Err(Error::Unsupported("retrying jobs"))
     }
@@ -534,8 +534,20 @@ impl Queue {
 
     /// Puts a job interrupted at a checkpoint back on its queue, with its
     /// progress, to resume. Unlike [`fail`](Queue::fail), it isn't counted as
-    /// a failed attempt.
+    /// a failed attempt, but as one more of its
+    /// [`resumptions`](JobRecord::resumptions).
     pub fn interrupt(&self, worker: &str, job: Job<Processing>) -> Result<Job<Pending>> {
+        let mut record = job.into_record();
+        record.resumptions = record.resumptions.saturating_add(1);
+        self.0.fail(worker, &record, JobState::Pending)?;
+        Ok(Job::from_record(record))
+    }
+
+    /// Puts a job back on its queue, with its progress, as a retry at once
+    /// would, so its next step starts in a fresh execution: what
+    /// [`Progress::requeue`](crate::Progress::requeue) asks for. Counted
+    /// neither as a failed attempt nor as a resumption.
+    pub fn requeue(&self, worker: &str, job: Job<Processing>) -> Result<Job<Pending>> {
         let record = job.into_record();
         self.0.fail(worker, &record, JobState::Pending)?;
         Ok(Job::from_record(record))

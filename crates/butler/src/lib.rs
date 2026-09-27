@@ -140,6 +140,9 @@ pub struct JobDef {
     pub retries: Option<u32>,
     /// Set with `#[job(backoff = "...")]`; the worker's backoff otherwise.
     pub backoff: Option<Backoff>,
+    /// Set with `#[job(max_resumptions = N)]`; the worker's
+    /// `max_resumptions` otherwise.
+    pub max_resumptions: Option<u32>,
     /// Set with `#[job(concurrency_key = "...", limit = N)]`.
     pub concurrency: Option<ConcurrencyLimit>,
     /// Set with `#[job(unique = "...")]`.

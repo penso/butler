@@ -12,15 +12,15 @@ format-check:
 # Every feature combination, so a cfg gate that only breaks one is caught.
 lint:
     cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-    cargo clippy --locked -p butler --all-targets --no-default-features -- -D warnings
-    cargo clippy --locked -p butler --all-targets --no-default-features --features tokio -- -D warnings
-    cargo clippy --locked -p butler --all-targets --no-default-features --features redis -- -D warnings
-    cargo clippy --locked -p butler --all-targets --no-default-features --features sqlite -- -D warnings
+    cargo clippy --locked -p butler-jobs --all-targets --no-default-features -- -D warnings
+    cargo clippy --locked -p butler-jobs --all-targets --no-default-features --features tokio -- -D warnings
+    cargo clippy --locked -p butler-jobs --all-targets --no-default-features --features redis -- -D warnings
+    cargo clippy --locked -p butler-jobs --all-targets --no-default-features --features sqlite -- -D warnings
 
 # The Redis test is skipped when no server is reachable; see `just redis`.
 test:
     cargo test --locked --workspace
-    cargo test --locked -p butler --no-default-features
+    cargo test --locked -p butler-jobs --no-default-features
 
 ci: format-check lint test
 
@@ -41,9 +41,15 @@ bench:
 publish-dry-run:
     cargo publish --locked --workspace --dry-run
 
-# Publishes butler-macros, then butler. Needs `cargo login` and a license in Cargo.toml.
-publish:
-    cargo publish --locked --workspace
+# Publish main's HEAD to crates.io through the Publish workflow, which checks
+# that CI passed on it, then tags v<version>. Bump the workspace version first.
+release:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    git fetch origin main
+    sha=$(git rev-parse origin/main)
+    echo "Publishing $sha"
+    gh workflow run publish.yml --ref main -f expected_sha="$sha"
 
 # Parse every mermaid diagram in the README the way GitHub does. Needs Node.
 check-diagrams:

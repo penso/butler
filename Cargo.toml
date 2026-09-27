@@ -2,11 +2,14 @@
 members  = ["crates/butler", "crates/butler-macros", "crates/butler-web", "examples/demo"]
 resolver = "3"
 
-# Shared by every crate. Published crates also need `license` (and ideally
-# `repository`) here before `cargo publish`.
+# Shared by every crate.
 [workspace.package]
+authors      = ["Fabien Penso <fabienpenso@gmail.com>"]
 categories   = ["asynchronous", "concurrency"]
 edition      = "2024"
+homepage     = "https://github.com/penso/butler"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/penso/butler"
 rust-version = "1.96"
 version      = "0.1.0"
 
@@ -22,7 +25,9 @@ unwrap_used = "deny"
 anyhow = "1.0.104"
 askama = "0.15"
 axum   = "0.8.9"
-butler = { path = "crates/butler", version = "0.1.0" }
+# `butler` is taken on crates.io, so the package is `butler-jobs`; its library
+# is still named `butler`, which is the path the macro expands to.
+butler = { package = "butler-jobs", path = "crates/butler", version = "0.1.0" }
 # Exact: the macro expands to calls into `butler::__private`, so the two crates
 # are released in lockstep.
 butler-macros  = { path = "crates/butler-macros", version = "=0.1.0" }

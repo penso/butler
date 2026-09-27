@@ -34,8 +34,10 @@ after crashes. Reliability and correct job lifecycle semantics come first.
 | `crates/butler-web/` | Dashboard: axum routes, Askama templates, Tailwind CSS, uPlot charts, SSE |
 | `examples/demo/` | `injector` and `worker` binaries sharing one job crate, and `bench`; not published |
 
-- `butler` and `butler-macros` are published together with the same version;
-  `butler` pins the macros with `=`. The macro's output may only call
+- `butler`, `butler-macros` and `butler-web` are published together with the
+  same version; `butler` pins the macros with `=`. The core package is named
+  `butler-jobs` on crates.io (`butler` was taken) but its library is `butler`,
+  so `-p butler-jobs` selects it and code still says `butler::`. The macro's output may only call
   `butler::__private` items that exist in that exact version.
 - In normal operation, `.await` on a `#[job]` function enqueues rather than
   running the body (inline testing is the explicit exception). Keep the enqueue
@@ -170,9 +172,9 @@ just check-diagrams    # after README mermaid changes
 Focused examples:
 
 ```sh
-cargo test --locked -p butler --test backends
-cargo test --locked -p butler --test job_args
-cargo test --locked -p butler --test continuations
+cargo test --locked -p butler-jobs --test backends
+cargo test --locked -p butler-jobs --test job_args
+cargo test --locked -p butler-jobs --test continuations
 cargo test --locked -p butler-web --test dashboard
 ```
 

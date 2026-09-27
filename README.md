@@ -519,6 +519,18 @@ already running to finish.
 
 ## Usage
 
+### Installing
+
+The crate is published as `butler-jobs` (the name `butler` was taken on
+crates.io); its library is still `butler`, so code reads `butler::job`:
+
+```toml
+[dependencies]
+butler = { package = "butler-jobs", version = "0.1" }
+```
+
+Plain `butler-jobs = "0.1"` works too, and is still imported as `butler`.
+
 ### Defining jobs
 
 ```rust
@@ -1041,7 +1053,7 @@ Environment variables override any key, with `__` between levels:
 To build without Redis, for example to use only the file backend:
 
 ```toml
-butler = { path = "...", default-features = false, features = ["tokio"] }
+butler = { package = "butler-jobs", version = "0.1", default-features = false, features = ["tokio"] }
 ```
 
 If `butler.toml` selects `redis` in a build without the feature,
@@ -1271,7 +1283,27 @@ just bench         # multi-core benchmark, in memory
 just publish-dry-run  # package and verify publishable workspace crates
 ```
 
+Releases publish `butler-macros`, `butler-jobs` and `butler-web` together
+from the `Publish` workflow; see [Releasing](#releasing).
+
 Workspace lints deny `unsafe_code`, `unused_qualifications`, `unwrap_used` and
 `expect_used`; tests opt out with a file-level `#![allow(...)]`. The Redis test
 needs a server at `$BUTLER_TEST_REDIS_URL` or `redis://127.0.0.1:6379/`, and is
 skipped when none is reachable. Code conventions are in `AGENTS.md`.
+
+### Releasing
+
+1. Bump `version` in the root `Cargo.toml` (and the `=` pin on
+   `butler-macros` beside it), merge to `main`, and wait for CI.
+2. Run `just release`. It dispatches the `Publish` workflow for `main`'s HEAD,
+   which re-audits the workflows, checks that CI passed on that exact commit
+   and that the tag is new, publishes `butler-macros`, `butler-jobs` and
+   `butler-web`, then tags `v<version>` with a GitHub release.
+
+The crates.io token lives only in the `crates-io` environment, which only
+`main` can use.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.

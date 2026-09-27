@@ -1565,6 +1565,7 @@ processes on the same machine:
 | `butler_paused` | `queue, paused_at_ms` | paused queues; created when an older database is opened |
 | `butler_recurring` | `key, data, created_at_ms, seen_at_ms, last_tick_ms, last_job_id` | recurring schedules and their last run |
 | `butler_recurring_ticks` | `key, tick_ms, job_id` | ticks enqueued; the primary key `(key, tick_ms)` makes each one run once |
+| `butler_job_counts` | `queue, state, n` | jobs per queue and state, kept by triggers on `butler_jobs`; what the dashboard reads |
 
 A claim is one `UPDATE ... RETURNING` that moves the oldest pending row of a
 queue to `processing` under the claiming worker. SQLite runs it under its write
@@ -1593,6 +1594,14 @@ A recurring tick is an `INSERT OR IGNORE` into `butler_recurring_ticks` and
 the job's insert, in one transaction: only the worker whose tick row went in
 enqueues the job. Databases from before recurring jobs get both tables when
 opened.
+
+The dashboard's counts per queue and state come from `butler_job_counts`,
+not from counting `butler_jobs`. Triggers on `butler_jobs` adjust it on every
+insert, delete and change of queue or state, inside the statement that makes
+the change, so it stays exact whatever writes the rows, including another
+version or a job deleted by hand. With 5 million jobs, `stats()` takes about
+20 µs instead of 200 ms. Databases from before it get the table and its
+triggers when opened, filled from their rows in the same transaction.
 
 **Waking waiters without a server.** SQLite has no pub/sub between processes:
 its hooks only see changes made through the same connection. butler combines
@@ -1651,6 +1660,13 @@ the claim is now a script (one round trip instead of two); in SQLite four
 `butler_jobs` columns and two indexes, added when a database is opened; for
 the file backend `ckeys/` and `unique/` directories and keyed pending file
 names. Jobs without keys are stored and claimed as before.
+
+**Upgrading to kept job counts (SQLite).** The first open by this version
+creates `butler_job_counts` and its triggers, and counts the existing jobs
+once, in one transaction that holds the write lock: one pass over an index,
+about 0.2 s for 5 million jobs on a warm cache, longer from a cold disk. The triggers live in the database, so writes from
+older versions still running keep the counts exact, and an older dashboard
+keeps working (it counts `butler_jobs` itself, as before).
 
 **Upgrading to paused queues.** Pausing adds storage only: a
 `<prefix>:paused` set in Redis, a `butler_paused` table in SQLite (created

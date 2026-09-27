@@ -56,9 +56,14 @@ check-diagrams:
     bash scripts/check-mermaid.sh README.md
 
 # Rebuild the dashboard's stylesheet after changing templates or ui/input.css.
-# Needs the standalone Tailwind CSS v4 CLI (`tailwindcss`).
+# Needs the standalone Tailwind CSS CLI v4.2.1 (`tailwindcss`), the version CI
+# pins: other versions can emit different CSS and fail the stale check.
 web-css:
     cd crates/butler-web && tailwindcss -i ui/input.css -o assets/app.css --minify
+
+# Fail if the committed stylesheet differs from a fresh build, as CI does.
+web-css-check: web-css
+    git diff --exit-code --stat -- crates/butler-web/assets/app.css
 
 # The dashboard, reading ./butler.toml like the demo worker: http://127.0.0.1:9090
 web:

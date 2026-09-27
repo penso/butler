@@ -150,8 +150,9 @@ after crashes. Reliability and correct job lifecycle semantics come first.
   vendored uPlot for charts. Paths in this section are relative to
   `crates/butler-web/`. Use Tailwind classes and the component classes in
   `ui/input.css`, not inline styles.
-- After changing templates or `ui/input.css`, run `just web-css`: the built
-  `assets/app.css` is committed so the crate publishes as is.
+- After changing templates or `ui/input.css`, run `just web-css` with
+  Tailwind CSS v4.2.1: the built `assets/app.css` is committed so the crate
+  publishes as is, and CI fails when it is stale (`just web-css-check`).
 - Anything from a job (names, arguments, errors) goes through Askama's escaping;
   never mark it `|safe`. Actions are POSTs, and must keep the cross-site check
   and the in-dashboard `return_to` redirect.

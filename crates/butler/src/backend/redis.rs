@@ -8,7 +8,7 @@
 //! <prefix>:worker:<worker>       STRING  heartbeat; expires unless the worker refreshes it
 //! <prefix>:workers               SET   worker ids that may hold jobs
 //! <prefix>:dead                  LIST  ids that exhausted their retries
-//! <prefix>:job:<id>              HASH  { state, queue, data (job JSON), ckey, climit, ukey, umode }
+//! <prefix>:job:<id>              HASH  { state, queue, data (job JSON), worker, ckey, climit, ukey, umode }
 //! <prefix>:running:<key>         SET   ids running with that concurrency key (by its hash)
 //! <prefix>:blocked:<key>         LIST  ids skipped because their concurrency key was full
 //! <prefix>:blocked               HASH  per queue, how many of its ids wait in blocked lists
@@ -24,7 +24,12 @@
 //! A claim is one script per queue the worker serves, in its priority order:
 //! it pops the job's id from `queue:<q>`, pushes it on `processing:<worker>`
 //! and marks it processing, all at once, so only one worker gets each job,
-//! and the job never exists only in a worker's memory.
+//! and the job never exists only in a worker's memory. It also writes the
+//! worker's id into the job hash's `worker` field, which completing, failing
+//! and recovering the job remove: a checkpoint saves progress only while that
+//! field names the saving worker, one hash read however many jobs the worker
+//! holds. Jobs claimed by an older version have no `worker` field; their
+//! checkpoints search the processing list with `LPOS`, as that version did.
 //!
 //! Waiting is push-based. Every push, retry and recovery also `PUBLISH`es to
 //! `<prefix>:wake`; a listener thread per worker process turns those messages
@@ -119,13 +124,22 @@ const FIELD_SEP: char = '\u{1f}';
 /// How long finished (done or cancelled) jobs stay queryable before Redis expires them.
 const DONE_TTL_SECS: u64 = 24 * 60 * 60;
 
-/// Stores a job's data (KEYS[2]) only while the job's id is still in the
-/// worker's processing list (KEYS[1]).
+/// Stores a job's data (KEYS[2]) only while worker ARGV[3] holds it. The
+/// claim writes the holder into the job's `worker` field and completing,
+/// failing or recovering the job removes it, so the check is one hash read.
+/// A processing job without the field was claimed by a version that didn't
+/// write it: then the worker's processing list (KEYS[1]) is searched, as
+/// those versions did. ARGV[1] is the job's id, ARGV[2] its data.
 const CHECKPOINT_IF_HELD: &str = r"
-if redis.call('LPOS', KEYS[1], ARGV[1]) then
-  redis.call('HSET', KEYS[2], 'data', ARGV[2])
+local f = redis.call('HMGET', KEYS[2], 'state', 'worker')
+if f[1] ~= 'processing' then return 0 end
+if f[2] then
+  if f[2] ~= ARGV[3] then return 0 end
+elseif not redis.call('LPOS', KEYS[1], ARGV[1]) then
+  return 0
 end
-return 0
+redis.call('HSET', KEYS[2], 'data', ARGV[2])
+return 1
 ";
 
 /// Frees what job `id` holds as it leaves processing (Lua, used by the
@@ -172,6 +186,7 @@ local job = ARGV[1] .. 'job:' .. id
 local queue = redis.call('HGET', job, 'queue') or 'default'
 redis.call('RPUSH', ARGV[1] .. 'queue:' .. queue, id)
 redis.call('HSET', job, 'state', 'pending')
+redis.call('HDEL', job, 'worker')
 release(ARGV[1], id, false)
 redis.call('SREM', ARGV[1] .. 'slots:' .. queue, id)
 redis.call('PUBLISH', ARGV[1] .. 'wake', queue)
@@ -179,8 +194,9 @@ return id
 ";
 
 /// Claims the oldest job of a queue (KEYS[1]) that may start into a
-/// processing list (KEYS[2]), marked processing. ARGV[1] is the key prefix,
-/// ARGV[2] the queue's name. With a global limit ARGV[3] (`''` for none),
+/// processing list (KEYS[2]), marked processing and held by worker ARGV[4].
+/// ARGV[1] is the key prefix, ARGV[2] the queue's name. With a global limit
+/// ARGV[3] (`''` for none),
 /// claims nothing while the queue's slot set (KEYS[3]) holds that many ids,
 /// and adds the claimed id to it. Parks jobs whose concurrency key is full
 /// on that key's blocked list, and drops ids without job data. Returns
@@ -203,7 +219,7 @@ for _ = 1, 100 do
     redis.call('SADD', p .. 'blocked_keys', f[2])
   else
     redis.call('LPUSH', KEYS[2], id)
-    redis.call('HSET', job, 'state', 'processing')
+    redis.call('HSET', job, 'state', 'processing', 'worker', ARGV[4])
     if f[2] then redis.call('SADD', p .. 'running:' .. f[2], id) end
     if limit then redis.call('SADD', KEYS[3], id) end
     if f[5] == 'until_started' and redis.call('GET', p .. 'unique:' .. f[4]) == id then
@@ -543,6 +559,7 @@ impl RedisQueue {
                                 .map(|max| max.to_string())
                                 .unwrap_or_default(),
                         )
+                        .arg(worker)
                         .query(con)
                 })?;
                 match status {
@@ -823,6 +840,10 @@ impl Store for RedisQueue {
                 .arg("data")
                 .arg(&data)
                 .ignore()
+                .cmd("HDEL")
+                .arg(self.job_key(&job.id))
+                .arg("worker")
+                .ignore()
                 .cmd("EXPIRE")
                 .arg(self.job_key(&job.id))
                 .arg(DONE_TTL_SECS)
@@ -871,6 +892,10 @@ impl Store for RedisQueue {
             .arg(state.as_str())
             .arg("data")
             .arg(&data)
+            .ignore()
+            .cmd("HDEL")
+            .arg(self.job_key(&job.id))
+            .arg("worker")
             .ignore()
             .cmd("EVAL")
             .arg(with_release(RELEASE))
@@ -931,7 +956,8 @@ impl Store for RedisQueue {
 
     /// Saves only if `worker` still holds the job, checked and written in one
     /// script: after a recovery, a slow former owner can't overwrite the
-    /// progress of the job's new run.
+    /// progress of the job's new run. The check reads the job's hash, so its
+    /// cost doesn't grow with the number of jobs the worker holds.
     fn checkpoint(&self, worker: &str, job: &JobRecord) -> Result<()> {
         let data = serde_json::to_string(job)?;
         self.with_conn(|con| {
@@ -942,6 +968,7 @@ impl Store for RedisQueue {
                 .arg(self.job_key(&job.id))
                 .arg(&job.id)
                 .arg(&data)
+                .arg(worker)
                 .exec(con)
         })
     }

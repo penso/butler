@@ -1432,7 +1432,7 @@ between the two loses that one tick.
 | `butler:dead` | LIST | ids that exhausted their retries |
 | `butler:wake` | pub/sub channel | a message per push, retry and recovery; wakes idle workers |
 | `butler:done` | pub/sub channel | a message per job done, dead or cancelled; wakes `wait_result` |
-| `butler:job:<id>` | HASH | `state`, `queue`, and `data` (job JSON), plus `ckey`/`climit` and `ukey`/`umode` for keyed and unique jobs; done and cancelled jobs expire after 24h |
+| `butler:job:<id>` | HASH | `state`, `queue`, and `data` (job JSON); `worker`, the holder, while it runs; plus `ckey`/`climit` and `ukey`/`umode` for keyed and unique jobs; done and cancelled jobs expire after 24h |
 | `butler:running:<key>` | SET | ids running with a concurrency key (by the key's hash) |
 | `butler:blocked:<key>` | LIST | ids skipped because their concurrency key was full |
 | `butler:blocked` | HASH | per queue, how many of its ids wait in blocked lists |
@@ -1453,6 +1453,12 @@ that key completes, fails or is recovered, the oldest parked job goes back
 to the claim end of its queue, in the same step. Parked jobs stay pending:
 they are counted, listed and cancellable. A unique job is pushed by a script
 that checks `unique:<key>` and the job it names first.
+
+The claim also writes the worker's id into the job hash's `worker` field,
+which completing, failing and recovering the job remove. A checkpoint is a
+script that saves the job's progress only while that field names the saving
+worker: one hash read, however many jobs the worker holds, so a worker whose
+heartbeat lapsed can't overwrite the progress of the job's next run.
 
 **Idle workers are woken by pub/sub, not polling.** Every push, retry and
 recovery also `PUBLISH`es to `butler:wake`. Each worker process keeps one
@@ -1604,6 +1610,16 @@ backend. Workers without `[[recurring]]` entries never touch them. Only
 workers running this version enqueue recurring jobs; while older workers run
 next to them, they simply don't take part. A dashboard of an older version
 lacks the Recurring page but works otherwise.
+
+**Upgrading to hash-checked Redis checkpoints.** Nothing to migrate: jobs
+claimed by an older version have no `worker` field, and their checkpoints
+search the worker's processing list with `LPOS`, as before, until they finish.
+While versions are mixed, an older process that recovers a newer worker's job
+leaves its `worker` field behind. If an older worker then claims the job too,
+and the first worker is in fact still running (its heartbeat lapsed, it didn't
+crash), the first worker's checkpoints can overwrite the new run's progress
+until the new run saves over them. Claims by this version rewrite the field,
+so the window closes once every worker runs it.
 
 ## Limitations
 

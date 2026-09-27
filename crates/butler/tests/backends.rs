@@ -372,6 +372,43 @@ fn saved_progress_survives_crash_recovery() {
 }
 
 #[test]
+fn a_checkpoint_saves_only_while_the_worker_holds_the_job() {
+    for (queue, _) in backends("checkpoint-holder") {
+        let name = queue.describe();
+        let progress =
+            |queue: &Queue, id: &str| queue.get(id).unwrap().unwrap().record().progress.clone();
+        queue.heartbeat("slow", Duration::from_secs(60)).unwrap();
+        let id = queue.push("long", "default", vec![]).unwrap();
+        let mut stale = queue
+            .claim("slow", DEFAULT, NOW)
+            .unwrap()
+            .unwrap()
+            .into_record();
+
+        // Its heartbeat lapses while it still runs: the job moves to another worker.
+        queue.heartbeat("slow", Duration::from_millis(1)).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(queue.recover().unwrap(), 1, "{name}");
+        let job = queue.claim("fresh", DEFAULT, NOW).unwrap().unwrap();
+        let mut current = job.record().clone();
+        current.progress = Some(json!({ "run": 2 }));
+        queue.checkpoint("fresh", &current).unwrap();
+
+        stale.progress = Some(json!({ "run": 1 }));
+        queue.checkpoint("slow", &stale).unwrap();
+        assert_eq!(progress(&queue, &id), Some(json!({ "run": 2 })), "{name}");
+
+        // Nor can its holder save once the job is done.
+        queue.complete("fresh", job, json!(null)).unwrap();
+        let completed = progress(&queue, &id);
+        current.progress = Some(json!({ "run": 3 }));
+        queue.checkpoint("fresh", &current).unwrap();
+        assert_eq!(progress(&queue, &id), completed, "{name}");
+        assert_eq!(queue.state(&id), Some(JobState::Done), "{name}");
+    }
+}
+
+#[test]
 fn stats_listing_retry_and_discard_for_a_dashboard() {
     for (queue, _) in backends("monitor") {
         let name = queue.describe();

@@ -30,3 +30,16 @@ updates:
     groups:
       cargo-minor-patch:
         update-types: [minor, patch]
+
+  # The dashboard's browser tests pin Playwright exactly; keep it current.
+  - package-ecosystem: npm
+    directory: /e2e
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+    groups:
+      playwright:
+        patterns: ["*"]

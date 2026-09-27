@@ -2,7 +2,7 @@ import { expect, test } from "../fixtures";
 
 test("live counts and the live chart update over server-sent events", async ({ page, startServer }) => {
   const server = await startServer();
-  await page.goto(server.url + "/");
+  await page.goto(server.home);
   await expect(page.locator("[data-live-label]")).toHaveText("live");
   await expect(page.locator("#live-chart canvas")).toBeVisible();
 
@@ -27,7 +27,7 @@ test("live counts and the live chart update over server-sent events", async ({ p
 
 test("the live stream reconnects after the server restarts", async ({ page, startServer }) => {
   const server = await startServer();
-  await page.goto(server.url + "/");
+  await page.goto(server.home);
   const label = page.locator("[data-live-label]");
   await expect(label).toHaveText("live");
 

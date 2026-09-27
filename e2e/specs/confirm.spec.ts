@@ -23,7 +23,7 @@ test("discard all asks first, and does nothing when dismissed", async ({ page, s
 
 test("pausing a queue asks first, resuming doesn't", async ({ page, startServer }) => {
   const server = await startServer();
-  await page.goto(server.url + "/");
+  await page.goto(server.home);
   const row = page.locator("tr", { has: page.getByRole("link", { name: "mailers", exact: true }) }).first();
 
   page.once("dialog", (dialog) => dialog.dismiss());

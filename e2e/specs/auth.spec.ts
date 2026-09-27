@@ -4,7 +4,7 @@ test("without credentials every page asks for them", async ({ browser, startServ
   const server = await startServer({ auth: "admin:s3cret" });
   const context = await browser.newContext();
   const page = await context.newPage();
-  const response = await page.goto(server.url + "/");
+  const response = await page.goto(server.home);
   expect(response!.status()).toBe(401);
   expect(response!.headers()["www-authenticate"]).toContain("Basic");
   for (const path of ["/assets/app.css", "/events", "/api/stats"]) {
@@ -14,7 +14,7 @@ test("without credentials every page asks for them", async ({ browser, startServ
   await context.close();
 
   const wrong = await browser.newContext({ httpCredentials: { username: "admin", password: "nope" } });
-  const denied = await (await wrong.newPage()).goto(server.url + "/");
+  const denied = await (await wrong.newPage()).goto(server.home);
   expect(denied!.status()).toBe(401);
   await wrong.close();
 });
@@ -27,7 +27,7 @@ for (const base of ["", "/admin/jobs"]) {
     const server = await startServer({ auth: "admin:s3cret", base });
     const context = await browser.newContext({ httpCredentials: { username: "admin", password: "s3cret" } });
     const page = await context.newPage();
-    const response = await page.goto(server.url + "/");
+    const response = await page.goto(server.home);
     expect(response!.status()).toBe(200);
     // Styles, script and SSE all went through the same credentials.
     await expect(page.locator("[data-live-label]")).toHaveText("live");

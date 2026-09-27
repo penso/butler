@@ -4,7 +4,7 @@ test.use({ colorScheme: "dark" });
 
 test("the theme toggle switches, redraws the charts, and is remembered", async ({ page, startServer }) => {
   const server = await startServer();
-  await page.goto(server.url + "/");
+  await page.goto(server.home);
   const html = page.locator("html");
   await expect(html).toHaveAttribute("data-theme", "dark");
   const background = () => page.evaluate(() => getComputedStyle(document.body).backgroundColor);
@@ -31,7 +31,7 @@ test.describe("with a light system theme", () => {
 
   test("follows the system until toggled", async ({ page, startServer }) => {
     const server = await startServer();
-    await page.goto(server.url + "/");
+    await page.goto(server.home);
     await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
   });
 });

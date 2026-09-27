@@ -1846,6 +1846,7 @@ crates/butler/                   the library (published as `butler`)
   examples/no_tokio.rs           the same flow without tokio
 crates/butler-macros/            #[job] attribute macro (published as `butler-macros`)
 crates/butler-web/               web dashboard: axum + Askama + Tailwind + uPlot (published as `butler-web`)
+e2e/                             dashboard browser tests (Playwright) and their seeded server (not published)
 examples/demo/                   injector + worker binaries, and bench (not published)
 justfile                 format, lint, test, audit and demo tasks
 deny.toml, taplo.toml    dependency policy, TOML formatting
@@ -1862,6 +1863,7 @@ just ci            # format check, feature-matrix clippy, workspace and no-defau
 just audit-deps    # cargo deny: advisories, bans, sources
 just web           # the web dashboard on http://127.0.0.1:9090
 just web-css       # rebuild its stylesheet after changing templates
+just e2e           # the dashboard in a real browser (Playwright, needs Node)
 just redis         # throwaway Redis for the demo and the Redis test
 just worker        # demo worker
 just injector      # demo injector

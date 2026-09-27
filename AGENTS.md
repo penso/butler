@@ -33,6 +33,7 @@ after crashes. Reliability and correct job lifecycle semantics come first.
 | `crates/butler/src/lib.rs` | Public API, the global queue, the `#[job]` enqueue helpers |
 | `crates/butler-macros/` | The `#[job]` attribute macro |
 | `crates/butler-web/` | Dashboard: axum routes, Askama templates, Tailwind CSS, uPlot charts, SSE |
+| `e2e/` | Browser tests for the dashboard (Playwright) and `butler-e2e-server`, the seeded server they run against; not published |
 | `examples/demo/` | `injector` and `worker` binaries sharing one job crate, and `bench`; not published |
 
 - `butler`, `butler-macros` and `butler-web` are published together with the
@@ -200,8 +201,11 @@ cargo test --locked -p butler-web --test dashboard
   concurrency tests. Fix flaky tests rather than hiding them with retries.
 - Dashboard route tests live in `crates/butler-web/tests/dashboard.rs`. Check
   escaping, action validation, redirects, and nested base paths when relevant.
-  For visual/live-update changes, also check the running dashboard; route tests
-  alone do not prove browser behavior.
+  For visual/live-update changes, run `just e2e` (Playwright in Chromium:
+  live chart, SSE reconnect, theme, confirm dialogs, bulk actions, basic auth,
+  nested base path) and add a spec in `e2e/specs/` for new browser behavior;
+  also check the running dashboard. Route tests alone do not prove browser
+  behavior.
 - Documentation-only changes need command/path/link review and
   `git diff --check`; do not claim code tests ran when they did not.
 

@@ -24,6 +24,12 @@ export class Server {
 
   constructor(private options: ServerOptions) {}
 
+  /// The dashboard's own page: the bare base when nested (axum doesn't serve
+  /// "/admin/jobs/"), "/" at the root.
+  get home(): string {
+    return this.options.base ? this.url : this.url + "/";
+  }
+
   async start(): Promise<void> {
     const args: string[] = ["--port", String(this.port || this.options.port || 0)];
     if (this.options.base) args.push("--base", this.options.base);

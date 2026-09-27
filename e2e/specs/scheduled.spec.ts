@@ -55,7 +55,7 @@ test("queue and job pages draw their own charts and live counts", async ({ page,
       return processed.reduce((a, b) => a + b, 0);
     })
     .toBeGreaterThan(0);
-  await page.goto(server.url + "/");
+  await page.goto(server.home);
   await page.getByRole("link", { name: "live", exact: true }).first().click();
   await expect(page).toHaveURL(server.url + "/queues/live");
   await expect(page.locator("[data-live-label]")).toHaveText("live");

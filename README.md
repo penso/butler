@@ -224,9 +224,10 @@ each. See [Concurrency and cores](#concurrency-and-cores) for tuning.
 ## Web dashboard
 
 `butler-web` shows live counts streamed over server-sent events, throughput and
-duration charts, queues with their pending and running jobs, workers, and job
-details. Retry or discard failed
-jobs, cancel pending work, run scheduled jobs now, pause and resume queues,
+duration charts (overall, per queue, and per job), queues with their pending
+and running jobs, workers, and job details. Retry or discard failed
+jobs, cancel pending work, run scheduled jobs now (one or all), pause and
+resume queues,
 see each recurring schedule's next and last run, and inspect arguments,
 results, errors, and saved progress from one place.
 
@@ -242,9 +243,12 @@ just web        # or: cargo run -p butler-web   ->  http://127.0.0.1:9090
 
 It reads the same `butler.toml` as the workers, so it sees whichever backend
 they use. To embed it in your own axum app, behind your own authentication:
-`butler_web::Dashboard::new(queue).base_path("/admin/jobs").router()`. It has
-a light theme too, and history for Redis, SQLite and memory (the file backend
-keeps none). See [crates/butler-web](crates/butler-web/README.md) for pages,
+`butler_web::Dashboard::new(queue).base_path("/admin/jobs").router()`. Run on
+its own without a proxy, it can ask for a username and password
+(`Dashboard::basic_auth`, or `BUTLER_WEB_USERNAME` and `BUTLER_WEB_PASSWORD`
+for the binary): a convenience, not a replacement for real authentication.
+It has a light theme too, and history for Redis, SQLite and memory (the file
+backend keeps none). See [crates/butler-web](crates/butler-web/README.md) for pages,
 security, and how it's built.
 
 ## Two kinds of `.await`
@@ -1842,6 +1846,7 @@ crates/butler/                   the library (published as `butler`)
   examples/no_tokio.rs           the same flow without tokio
 crates/butler-macros/            #[job] attribute macro (published as `butler-macros`)
 crates/butler-web/               web dashboard: axum + Askama + Tailwind + uPlot (published as `butler-web`)
+e2e/                             dashboard browser tests (Playwright) and their seeded server (not published)
 examples/demo/                   injector + worker binaries, and bench (not published)
 justfile                 format, lint, test, audit and demo tasks
 deny.toml, taplo.toml    dependency policy, TOML formatting
@@ -1858,6 +1863,7 @@ just ci            # format check, feature-matrix clippy, workspace and no-defau
 just audit-deps    # cargo deny: advisories, bans, sources
 just web           # the web dashboard on http://127.0.0.1:9090
 just web-css       # rebuild its stylesheet after changing templates
+just e2e           # the dashboard in a real browser (Playwright, needs Node)
 just redis         # throwaway Redis for the demo and the Redis test
 just worker        # demo worker
 just injector      # demo injector

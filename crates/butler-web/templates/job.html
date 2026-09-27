@@ -8,7 +8,7 @@
       <h1 class="text-xl font-semibold tracking-tight mono">{{ name }}</h1>
       <span class="badge badge-{{ state }}">{{ label }}</span>
     </div>
-    <p class="mt-1 text-xs text-[var(--muted)] mono">{{ id }}</p>
+    <p class="mt-1 text-xs text-[var(--muted)] mono">{{ id }} · <a class="link" href="{{ base }}/metrics/{{ name|urlencode_strict }}">charts for {{ name }}</a></p>
   </div>
   <div class="flex gap-2">
     {% if can_retry %}
@@ -27,7 +27,7 @@
 </div>
 
 <section class="grid grid-cols-2 gap-3 {% if run_at.is_some() %}md:grid-cols-5{% else %}md:grid-cols-4{% endif %}">
-  <div class="stat"><span class="card-title">Queue</span><span class="mono">{{ queue }}</span></div>
+  <a class="stat transition-colors hover:border-[var(--accent)]" href="{{ base }}/queues/{{ queue|urlencode_strict }}"><span class="card-title">Queue</span><span class="mono">{{ queue }} &rarr;</span></a>
   <div class="stat"><span class="card-title">State</span><span>{{ label }}</span></div>
   <div class="stat"><span class="card-title">Failed attempts</span><span class="tabular-nums">{{ attempts }}</span></div>
   <div class="stat"><span class="card-title">Enqueued</span><span data-ms="{{ enqueued_ms }}">{{ enqueued_ago }}</span></div>

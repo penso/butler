@@ -55,6 +55,11 @@ release:
 check-diagrams:
     bash scripts/check-mermaid.sh README.md
 
+# The dashboard in a real browser (Playwright, Chromium), as CI runs it.
+# Needs Node; builds and starts its own seeded server for each test.
+e2e:
+    cd e2e && npm ci --no-audit --no-fund && npx playwright install chromium && npm test
+
 # Rebuild the dashboard's stylesheet after changing templates or ui/input.css.
 # Needs the standalone Tailwind CSS v4 CLI (`tailwindcss`).
 web-css:

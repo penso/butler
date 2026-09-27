@@ -1,9 +1,9 @@
 //! A web dashboard for [butler](https://crates.io/crates/butler), like
 //! Sidekiq's Web UI or Rails' Mission Control: live counts over server-sent
-//! events, throughput and duration charts, and the jobs themselves, with
-//! retry and discard for failed ones, run now or cancel for scheduled ones,
-//! pause or resume for queues, and the recurring schedules with their next and
-//! last run.
+//! events, throughput and duration charts (overall, per queue, and per job),
+//! and the jobs themselves, with retry and discard for failed ones, run now or
+//! cancel for scheduled ones (one or all), pause or resume for queues, and the
+//! recurring schedules with their next and last run.
 //!
 //! Mount it in your own axum app, behind your own authentication:
 //!
@@ -15,13 +15,15 @@
 //!
 //! or run the `butler-web` binary, which reads `butler.toml` like a worker.
 //!
-//! The dashboard has no authentication of its own. Actions (retry, discard,
-//! cancel, run now, pause and resume a queue, remove a schedule) are POSTs, and
-//! cross-site POSTs are rejected, so another site
-//! can't trigger them through a logged-in browser.
+//! The dashboard has no authentication of its own unless you turn on
+//! [`Dashboard::basic_auth`], a convenience for running it without a proxy.
+//! Actions (retry, discard, cancel, run now, pause and resume a queue, remove a
+//! schedule, and their bulk forms) are POSTs, and cross-site POSTs are
+//! rejected, so another site can't trigger them through a logged-in browser.
 
 mod actions;
 mod assets;
+mod auth;
 mod error;
 mod events;
 mod pages;
@@ -46,6 +48,7 @@ pub use error::WebError;
 pub struct Dashboard {
     queue: Queue,
     base: String,
+    auth: Option<auth::BasicAuth>,
 }
 
 /// Shared by every request.
@@ -62,6 +65,7 @@ impl Dashboard {
         Self {
             queue: queue.into(),
             base: String::new(),
+            auth: None,
         }
     }
 
@@ -72,13 +76,26 @@ impl Dashboard {
         self
     }
 
+    /// Asks for this username and password (HTTP basic auth) on every page,
+    /// asset, action and the live stream. Off by default.
+    ///
+    /// A convenience for running the dashboard on its own, not a replacement
+    /// for your application's authentication or an authenticating proxy: there
+    /// is one shared account, no logout, no rate limiting, and the
+    /// credentials cross the network with every request, so serve it over
+    /// HTTPS (or keep it on localhost). The comparison takes constant time.
+    pub fn basic_auth(mut self, user: &str, password: &str) -> Self {
+        self.auth = Some(auth::BasicAuth::new(user, password));
+        self
+    }
+
     pub fn router(self) -> Router {
         let state = Arc::new(AppState {
             queue: self.queue,
             base: self.base,
             live: OnceLock::new(),
         });
-        Router::new()
+        let router = Router::new()
             .route("/", get(pages::dashboard))
             .route("/jobs", get(pages::jobs))
             .route("/jobs/{id}", get(pages::job))
@@ -88,17 +105,45 @@ impl Dashboard {
             .route("/jobs/{id}/run-now", post(actions::run_now))
             .route("/jobs/retry-all", post(actions::retry_all))
             .route("/jobs/discard-all", post(actions::discard_all))
+            .route("/jobs/run-now-all", post(actions::run_now_all))
+            .route("/jobs/cancel-all", post(actions::cancel_all))
             .route("/workers", get(pages::workers))
+            .route("/queues/{queue}", get(pages::queue))
             .route("/queues/{queue}/pause", post(actions::pause_queue))
             .route("/queues/{queue}/resume", post(actions::resume_queue))
+            .route("/metrics/{job}", get(pages::job_metrics))
             .route("/recurring", get(pages::recurring))
             .route("/recurring/{key}/remove", post(actions::remove_recurring))
             .route("/events", get(events::stream))
             .route("/api/stats", get(events::stats_json))
             .route("/api/metrics", get(pages::metrics_json))
             .route("/assets/{file}", get(assets::serve))
+            .fallback(error::not_found)
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                error::with_base_path,
+            ))
             .layer(middleware::from_fn(same_origin_posts))
-            .with_state(state)
+            .with_state(state);
+        match self.auth {
+            // Outermost, so nothing (errors, assets, the stream) answers first.
+            Some(auth) => router.layer(middleware::from_fn_with_state(
+                Arc::new(auth),
+                auth::require,
+            )),
+            None => router,
+        }
+    }
+}
+
+/// The dashboard's own page. axum serves a nested router's root at the bare
+/// prefix (`/admin/jobs`), not with a trailing slash, so only a dashboard at
+/// the root links to `/`.
+pub(crate) fn home(base: &str) -> String {
+    if base.is_empty() {
+        "/".to_owned()
+    } else {
+        base.to_owned()
     }
 }
 

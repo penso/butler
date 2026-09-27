@@ -242,7 +242,122 @@ async fn a_base_path_prefixes_every_link() {
         "",
     )
     .await;
-    assert_eq!(location.as_deref(), Some("/admin/jobs/"));
+    assert_eq!(location.as_deref(), Some("/admin/jobs"));
+}
+
+#[tokio::test]
+async fn error_pages_keep_the_base_path() {
+    let f = fixture("/admin/jobs");
+    let app = Router::new().nest("/admin/jobs", f.app.clone());
+    let pages = [
+        (
+            "/admin/jobs/jobs/nope",
+            StatusCode::NOT_FOUND,
+            "job nope not found",
+        ),
+        (
+            "/admin/jobs/no-such-page",
+            StatusCode::NOT_FOUND,
+            "page not found",
+        ),
+    ];
+    for (uri, expected, message) in pages {
+        let (status, html) = get(&app, uri).await;
+        assert_eq!(status, expected, "{uri}");
+        assert!(html.contains(message), "{uri}");
+        assert!(
+            html.contains(r#"href="/admin/jobs/assets/app.css""#),
+            "{uri}"
+        );
+        assert!(html.contains(r#"data-base="/admin/jobs""#), "{uri}");
+        assert!(
+            html.contains(r#"href="/admin/jobs/jobs?state=dead""#),
+            "{uri}"
+        );
+        assert!(!html.contains(r#"href="/""#), "{uri}: a link to the root");
+    }
+
+    // Errors from actions, too.
+    let (status, html) = post_page(&app, "/admin/jobs/queues/bad%20queue/pause").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        html.contains(r#"href="/admin/jobs""#),
+        "back to the dashboard"
+    );
+    assert!(!html.contains(r#"href="/""#));
+}
+
+/// Every `href="…"` in `html`.
+fn links(html: &str) -> Vec<String> {
+    html.split(r#"href=""#)
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+async fn links_home_resolve_under_a_nested_base_path() {
+    let f = fixture("/admin/jobs");
+    let app = Router::new().nest("/admin/jobs", f.app.clone());
+    // axum serves a nested router's root at the bare prefix only:
+    // "/admin/jobs/" is not found.
+    let (status, _) = get(&app, "/admin/jobs/").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    for page in ["/admin/jobs/workers", "/admin/jobs/jobs/nope"] {
+        let (_, html) = get(&app, page).await;
+        let links = links(&html);
+        assert!(
+            links.iter().any(|link| link == "/admin/jobs"),
+            "{page}: {links:?}"
+        );
+        for link in links.iter().filter(|link| !link.contains("/assets/")) {
+            let (status, _) = get(&app, link).await;
+            assert_eq!(status, StatusCode::OK, "{page} links to {link}");
+        }
+    }
+
+    // After an action with no page to return to, back to the dashboard.
+    let (_, location) = post(
+        &app,
+        &format!("/admin/jobs/jobs/{}/retry", f.dead),
+        "same-origin",
+        "",
+    )
+    .await;
+    assert_eq!(location.as_deref(), Some("/admin/jobs"));
+    let (status, _) = get(&app, location.as_deref().unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn error_pages_at_the_root_link_to_the_root() {
+    let f = fixture("");
+    for uri in ["/jobs/nope", "/no-such-page"] {
+        let (status, html) = get(&f.app, uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert!(html.contains(r#"href="/assets/app.css""#), "{uri}");
+        assert!(html.contains(r#"href="/""#), "{uri}");
+    }
+}
+
+/// A same-origin POST, returning the page it answers with.
+async fn post_page(app: &Router, uri: &str) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(uri)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
 }
 
 #[tokio::test]
@@ -489,7 +604,7 @@ async fn queues_can_be_paused_and_resumed_from_the_dashboard() {
     let (_, html) = get(&f.app, "/").await;
     assert!(html.contains(">paused<"));
     assert!(html.contains(r#"action="/queues/mailers/resume""#));
-    assert!(html.contains(r#"href="/jobs?state=pending&queue=imports""#));
+    assert!(html.contains(r#"href="/queues/imports""#));
 
     let (_, location) = post(
         &f.app,
@@ -691,4 +806,448 @@ async fn removing_recurring_rejects_encoded_path_separators_and_preserves_files(
         }
     }
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Schedules `send_reminder` on each queue, an hour from now.
+fn schedule_on(queue: &Queue, queues: &[&str]) -> Vec<String> {
+    queues
+        .iter()
+        .map(|name| {
+            queue
+                .schedule(
+                    "send_reminder",
+                    name,
+                    vec![],
+                    SystemTime::now() + Duration::from_secs(3600),
+                )
+                .unwrap()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_scheduled_tab_runs_or_cancels_every_scheduled_job() {
+    let f = fixture("");
+    let (_, html) = get(&f.app, "/jobs?state=scheduled").await;
+    assert!(html.contains(r#"action="/jobs/run-now-all""#));
+    assert!(html.contains(r#"action="/jobs/cancel-all""#));
+    assert!(
+        html.contains(r#"data-confirm="Run every scheduled job now?""#),
+        "asks first"
+    );
+    assert!(html.contains(r#"data-confirm="Cancel every scheduled job? They won't run.""#));
+    for other in ["pending", "dead", "done"] {
+        let (_, html) = get(&f.app, &format!("/jobs?state={other}")).await;
+        assert!(!html.contains("run-now-all"), "{other}");
+        assert!(!html.contains("cancel-all"), "{other}");
+    }
+    let (_, html) = get(&f.app, "/jobs?state=scheduled&queue=mailers").await;
+    assert!(
+        html.contains(r#"data-confirm="Cancel every scheduled job on mailers? They won't run.""#)
+    );
+    assert!(html.contains(r#"<input type="hidden" name="queue" value="mailers">"#));
+
+    let mailers = schedule_on(&f.queue, &["mailers", "mailers"]);
+    let default = schedule_on(&f.queue, &["default", "default"]);
+
+    // Cross-site: refused, nothing changes.
+    for action in ["/jobs/run-now-all", "/jobs/cancel-all"] {
+        let (status, _) = post(&f.app, action, "cross-site", "").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{action}");
+    }
+    assert_eq!(f.queue.state(&mailers[0]), Some(JobState::Scheduled));
+
+    // Cancel all on one queue: only its scheduled jobs, never pending ones.
+    let (status, location) = post(
+        &f.app,
+        "/jobs/cancel-all",
+        "same-origin",
+        "queue=mailers&return_to=%2Fjobs%3Fstate%3Dscheduled%26queue%3Dmailers",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        location.as_deref(),
+        Some("/jobs?state=scheduled&queue=mailers")
+    );
+    for id in mailers.iter().chain([&f.scheduled]) {
+        assert_eq!(f.queue.state(id), Some(JobState::Cancelled), "{id}");
+    }
+    for id in &default {
+        assert_eq!(f.queue.state(id), Some(JobState::Scheduled), "{id}");
+    }
+    assert_eq!(f.queue.state(&f.pending), Some(JobState::Pending));
+
+    // Run all now, on every queue, and never an open redirect.
+    let (_, location) = post(
+        &f.app,
+        "/jobs/run-now-all",
+        "same-origin",
+        "queue=&return_to=https%3A%2F%2Fevil.example%2F",
+    )
+    .await;
+    assert_eq!(location.as_deref(), Some("/"));
+    for id in &default {
+        assert_eq!(f.queue.state(id), Some(JobState::Pending), "{id}");
+    }
+    assert_eq!(f.queue.state(&mailers[0]), Some(JobState::Cancelled));
+}
+
+#[tokio::test]
+async fn scheduled_bulk_actions_keep_the_base_path() {
+    let f = fixture("/admin/jobs");
+    let app = Router::new().nest("/admin/jobs", f.app.clone());
+    let (_, html) = get(&app, "/admin/jobs/jobs?state=scheduled").await;
+    assert!(html.contains(r#"action="/admin/jobs/jobs/run-now-all""#));
+    assert!(html.contains(r#"action="/admin/jobs/jobs/cancel-all""#));
+    assert!(html.contains(r#"name="return_to" value="/admin/jobs/jobs?state=scheduled""#));
+    let (_, location) = post(
+        &app,
+        "/admin/jobs/jobs/run-now-all",
+        "same-origin",
+        "return_to=%2Fadmin%2Fjobs%2Fjobs%3Fstate%3Dscheduled",
+    )
+    .await;
+    assert_eq!(
+        location.as_deref(),
+        Some("/admin/jobs/jobs?state=scheduled")
+    );
+    assert_eq!(f.queue.state(&f.scheduled), Some(JobState::Pending));
+}
+
+/// Sums a JSON series' column.
+fn total(series: &Value, column: &str) -> u64 {
+    series[column]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_u64().unwrap())
+        .sum()
+}
+
+#[tokio::test]
+async fn metrics_narrow_to_a_queue_or_a_job() {
+    let f = fixture("");
+    for (job, queue) in [("send_email", "mailers"), ("charge_card", "mailers")] {
+        f.queue
+            .record_metric(&JobMetric::now(job, queue, false, 10))
+            .unwrap();
+    }
+    let series = |query: &'static str| {
+        let app = f.app.clone();
+        async move {
+            let (status, body) = get(&app, &format!("/api/metrics?minutes=5{query}")).await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+            serde_json::from_str::<Value>(&body).unwrap()
+        }
+    };
+    assert_eq!(total(&series("").await, "processed"), 4);
+    assert_eq!(total(&series("&queue=default").await, "processed"), 2);
+    assert_eq!(total(&series("&queue=default").await, "failed"), 1);
+    assert_eq!(total(&series("&queue=mailers").await, "processed"), 2);
+    assert_eq!(total(&series("&job=charge_card").await, "processed"), 3);
+    assert_eq!(
+        total(&series("&job=charge_card&queue=mailers").await, "processed"),
+        1
+    );
+    assert_eq!(total(&series("&job=nothing").await, "processed"), 0);
+    assert_eq!(
+        total(&series("&queue=&job=").await, "processed"),
+        4,
+        "empty filters"
+    );
+}
+
+#[tokio::test]
+async fn a_queue_has_its_own_page_with_live_counts_charts_and_jobs() {
+    let f = fixture("");
+    let (status, html) = get(&f.app, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(r#"href="/queues/default""#),
+        "linked from the dashboard"
+    );
+    assert!(
+        html.contains(r#"href="/metrics/charge_card""#),
+        "busiest jobs link"
+    );
+
+    let (status, html) = get(&f.app, "/queues/default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(r#"data-queue-pending="default">1<"#),
+        "live pending"
+    );
+    assert!(
+        html.contains(r#"data-queue-running="default">"#),
+        "live running"
+    );
+    assert!(html.contains(r#"id="history-chart" data-queue="default" data-job="""#));
+    assert!(html.contains(r#"id="duration-chart""#));
+    assert!(html.contains(r#"href="/metrics/charge_card?queue=default""#));
+    assert!(html.contains("50.0%"), "its failure rate");
+    assert!(html.contains(r#"action="/queues/default/pause""#));
+    assert!(html.contains(r#"name="return_to" value="/queues/default""#));
+    assert!(html.contains("data-confirm=\"Pause default?"));
+
+    // Pausing from its page comes back to it, showing Resume.
+    let (_, location) = post(
+        &f.app,
+        "/queues/default/pause",
+        "same-origin",
+        "return_to=%2Fqueues%2Fdefault",
+    )
+    .await;
+    assert_eq!(location.as_deref(), Some("/queues/default"));
+    let (_, html) = get(&f.app, "/queues/default").await;
+    assert!(html.contains(r#"action="/queues/default/resume""#));
+    assert!(html.contains("badge-scheduled\">paused"));
+
+    // A queue with no jobs yet still has a page; a bad name doesn't.
+    let (status, html) = get(&f.app, "/queues/empty").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("No job finished on empty"));
+    let (status, _) = get(&f.app, "/queues/..bad").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_job_has_its_own_charts_across_queues() {
+    let f = fixture("");
+    f.queue
+        .record_metric(&JobMetric::now("charge_card", "mailers", false, 10))
+        .unwrap();
+    let (status, html) = get(&f.app, "/metrics/charge_card").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(r#"id="history-chart" data-queue="" data-job="charge_card""#));
+    assert!(
+        html.contains(r#"href="/metrics/charge_card?queue=mailers""#),
+        "queue filter"
+    );
+    assert!(html.contains(r#"href="/queues/default""#), "by-queue table");
+    assert!(html.contains(">3<"), "processed on every queue");
+
+    let (status, html) = get(&f.app, "/metrics/charge_card?queue=default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(r#"data-queue="default" data-job="charge_card""#));
+    assert!(html.contains(">2<"), "processed on default");
+
+    // From a job's own page.
+    let (_, html) = get(&f.app, &format!("/jobs/{}", f.dead)).await;
+    assert!(html.contains(r#"href="/metrics/charge_card""#));
+    assert!(html.contains(r#"href="/queues/default""#));
+}
+
+#[tokio::test]
+async fn job_names_are_encoded_in_links_and_escaped_on_their_page() {
+    let f = fixture("");
+    let name = "billing/charge <b>&";
+    f.queue
+        .record_metric(&JobMetric::now(name, "default", false, 10))
+        .unwrap();
+    let (_, html) = get(&f.app, "/").await;
+    let link = "/metrics/billing%2Fcharge%20%3Cb%3E%26";
+    assert!(html.contains(&format!(r#"href="{link}""#)), "encoded link");
+    assert!(!html.contains("<b>&"), "escaped");
+
+    let (status, html) = get(&f.app, link).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("billing/charge &#60;b&#62;&#38;"),
+        "escaped name"
+    );
+    assert!(!html.contains("<b>"));
+}
+
+#[tokio::test]
+async fn queue_and_job_pages_keep_the_base_path() {
+    let f = fixture("/admin/jobs");
+    let app = Router::new().nest("/admin/jobs", f.app.clone());
+    let (_, html) = get(&app, "/admin/jobs").await;
+    assert!(html.contains(r#"href="/admin/jobs/queues/default""#));
+    assert!(html.contains(r#"href="/admin/jobs/metrics/charge_card""#));
+
+    let (status, html) = get(&app, "/admin/jobs/queues/default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(r#"data-base="/admin/jobs""#),
+        "live updates and charts"
+    );
+    assert!(html.contains(r#"src="/admin/jobs/assets/app.js""#));
+    assert!(html.contains(r#"action="/admin/jobs/queues/default/pause""#));
+    assert!(html.contains(r#"name="return_to" value="/admin/jobs/queues/default""#));
+    assert!(html.contains(r#"href="/admin/jobs/metrics/charge_card?queue=default""#));
+    assert!(html.contains(r#"href="/admin/jobs/jobs?state=pending&queue=default""#));
+    let (_, location) = post(
+        &app,
+        "/admin/jobs/queues/default/pause",
+        "same-origin",
+        "return_to=%2Fadmin%2Fjobs%2Fqueues%2Fdefault",
+    )
+    .await;
+    assert_eq!(location.as_deref(), Some("/admin/jobs/queues/default"));
+
+    // Back to the dashboard: axum serves a nested router's root at the bare
+    // prefix only, not "/admin/jobs/".
+    assert!(html.contains(r#"<a href="/admin/jobs" class="text-sm"#));
+
+    let (status, html) = get(&app, "/admin/jobs/metrics/charge_card").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(r#"data-base="/admin/jobs""#));
+    assert!(html.contains(r#"<a href="/admin/jobs" class="text-sm"#));
+    assert!(html.contains(r#"href="/admin/jobs/queues/default""#));
+}
+
+/// `Basic base64("admin:s3cret")`.
+const GOOD_CREDENTIALS: &str = "Basic YWRtaW46czNjcmV0";
+/// `Basic base64("admin:wrong!")`.
+const BAD_CREDENTIALS: &str = "Basic YWRtaW46d3Jvbmch";
+
+/// A request, with an `Authorization` header if given, returning the
+/// response itself (the live stream never ends).
+async fn send(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    authorization: Option<&str>,
+) -> axum::response::Response {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("sec-fetch-site", "same-origin");
+    if let Some(value) = authorization {
+        request = request.header(header::AUTHORIZATION, value);
+    }
+    app.clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+fn with_basic_auth(base: &str) -> (Fixture, Router) {
+    let f = fixture(base);
+    let app = butler_web::Dashboard::new(f.queue.clone())
+        .base_path(base)
+        .basic_auth("admin", "s3cret")
+        .router();
+    let app = if base.is_empty() {
+        app
+    } else {
+        Router::new().nest(base, app)
+    };
+    (f, app)
+}
+
+#[tokio::test]
+async fn basic_auth_guards_every_route_until_the_right_credentials() {
+    let (f, app) = with_basic_auth("");
+    let routes = [
+        ("GET", "/".to_owned()),
+        ("GET", "/jobs?state=dead".to_owned()),
+        ("GET", format!("/jobs/{}", f.dead)),
+        ("GET", "/assets/app.css".to_owned()),
+        ("GET", "/api/stats".to_owned()),
+        ("GET", "/api/metrics".to_owned()),
+        ("GET", "/events".to_owned()),
+        ("GET", "/no-such-page".to_owned()),
+        ("POST", format!("/jobs/{}/retry", f.dead)),
+        ("POST", "/queues/default/pause".to_owned()),
+    ];
+    for (method, uri) in &routes {
+        for authorization in [None, Some(BAD_CREDENTIALS), Some("Bearer YWRtaW46czNjcmV0")] {
+            let response = send(&app, method, uri, authorization).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} with {authorization:?}"
+            );
+            assert_eq!(
+                response.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+                r#"Basic realm="butler", charset="UTF-8""#,
+                "the browser asks"
+            );
+        }
+    }
+    assert_eq!(
+        f.queue.state(&f.dead),
+        Some(JobState::Dead),
+        "no action ran"
+    );
+    assert!(f.queue.paused_queues().unwrap().is_empty());
+
+    for (uri, expected) in [
+        ("/", StatusCode::OK),
+        ("/assets/app.css", StatusCode::OK),
+        ("/api/stats", StatusCode::OK),
+        ("/no-such-page", StatusCode::NOT_FOUND),
+    ] {
+        let response = send(&app, "GET", uri, Some(GOOD_CREDENTIALS)).await;
+        assert_eq!(response.status(), expected, "{uri}");
+    }
+    let response = send(&app, "GET", "/events", Some(GOOD_CREDENTIALS)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+
+    let retry = format!("/jobs/{}/retry", f.dead);
+    let response = send(&app, "POST", &retry, Some(GOOD_CREDENTIALS)).await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(f.queue.state(&f.dead), Some(JobState::Pending));
+}
+
+#[tokio::test]
+async fn basic_auth_keeps_the_cross_site_check() {
+    let (f, app) = with_basic_auth("");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/jobs/{}/retry", f.dead))
+                .header(header::AUTHORIZATION, GOOD_CREDENTIALS)
+                .header("sec-fetch-site", "cross-site")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(f.queue.state(&f.dead), Some(JobState::Dead));
+}
+
+#[tokio::test]
+async fn basic_auth_works_under_a_base_path() {
+    let (f, app) = with_basic_auth("/admin/jobs");
+    for uri in [
+        "/admin/jobs",
+        "/admin/jobs/assets/app.js",
+        "/admin/jobs/events",
+    ] {
+        let response = send(&app, "GET", uri, None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        let response = send(&app, "GET", uri, Some(GOOD_CREDENTIALS)).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    }
+    let response = send(
+        &app,
+        "POST",
+        &format!("/admin/jobs/jobs/{}/retry", f.dead),
+        Some(GOOD_CREDENTIALS),
+    )
+    .await;
+    let location = response.headers().get(header::LOCATION).unwrap();
+    assert!(
+        location.to_str().unwrap().starts_with("/admin/jobs"),
+        "back into the dashboard: {location:?}"
+    );
+    assert_eq!(f.queue.state(&f.dead), Some(JobState::Pending));
+}
+
+#[tokio::test]
+async fn without_basic_auth_nothing_asks_for_credentials() {
+    let f = fixture("");
+    let response = send(&f.app, "GET", "/", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
 }

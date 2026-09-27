@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}{{ name }} queue{% endblock %}
+{% block content %}
+<a href="{{ base }}{% if base.is_empty() %}/{% endif %}" class="text-sm text-[var(--muted)] hover:text-[var(--text)]">&larr; Dashboard</a>
+<div class="mt-3 mb-6 flex flex-wrap items-start justify-between gap-4">
+  <div>
+    <div class="flex items-center gap-3">
+      <h1 class="text-xl font-semibold tracking-tight mono">{{ name }}</h1>
+      {% if paused %}<span class="badge badge-scheduled">paused</span>{% endif %}
+    </div>
+    <p class="mt-1 text-sm text-[var(--muted)]">A queue's jobs, live counts, and charts. A paused queue keeps taking jobs; workers don't run them until it is resumed.</p>
+  </div>
+  <div class="flex gap-2">
+    <a class="btn" href="{{ base }}/jobs?state=pending&queue={{ name|urlencode_strict }}">Jobs &rarr;</a>
+    {% if paused %}
+    <form method="post" action="{{ base }}/queues/{{ name|urlencode_strict }}/resume"><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn btn-accent">Resume</button></form>
+    {% else %}
+    <form method="post" action="{{ base }}/queues/{{ name|urlencode_strict }}/pause" data-confirm="Pause {{ name }}? Workers stop taking its jobs; running ones finish."><input type="hidden" name="return_to" value="{{ return_to }}"><button class="btn">Pause</button></form>
+    {% endif %}
+  </div>
+</div>
+
+<section class="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-6">
+  <a class="stat transition-colors hover:border-[var(--info)]" href="{{ base }}/jobs?state=pending&queue={{ name|urlencode_strict }}">
+    <span class="card-title">Pending</span>
+    <span class="stat-value text-[var(--info)]" data-queue-pending="{{ name }}">{{ pending }}</span>
+    <span class="text-xs text-[var(--muted)]">waiting, live &rarr;</span>
+  </a>
+  <a class="stat transition-colors hover:border-[var(--warn)]" href="{{ base }}/jobs?state=processing&queue={{ name|urlencode_strict }}">
+    <span class="card-title">Running</span>
+    <span class="stat-value text-[var(--warn)]" data-queue-running="{{ name }}">{{ running }}</span>
+    <span class="text-xs text-[var(--muted)]">in flight, live &rarr;</span>
+  </a>
+  <div class="stat">
+    <span class="card-title">Processed</span>
+    <span class="stat-value">{{ totals.processed }}</span>
+    <span class="text-xs text-[var(--muted)]">last 24 hours</span>
+  </div>
+  <div class="stat">
+    <span class="card-title">Failed</span>
+    <span class="stat-value text-[var(--error)]">{{ totals.failed }}</span>
+    <span class="text-xs text-[var(--muted)]">{{ totals.failure_rate }} of runs</span>
+  </div>
+  <div class="stat">
+    <span class="card-title">Average</span>
+    <span class="stat-value">{{ totals.avg }}</span>
+    <span class="text-xs text-[var(--muted)]">per run</span>
+  </div>
+  <div class="stat">
+    <span class="card-title">Slowest</span>
+    <span class="stat-value">{{ totals.max }}</span>
+    <span class="text-xs text-[var(--muted)]">one run</span>
+  </div>
+</section>
+
+{% include "charts.html" %}
+
+<section class="card mt-6 overflow-hidden">
+  <div class="px-5 pt-5 pb-2">
+    <h2 class="text-sm font-semibold">Jobs on {{ name }}</h2>
+    <p class="text-xs text-[var(--muted)]">Last 24 hours</p>
+  </div>
+  <table class="table">
+    <thead>
+      <tr><th>Job</th><th class="text-right">Processed</th><th class="text-right">Failed</th><th class="text-right">Avg</th><th class="text-right">Max</th></tr>
+    </thead>
+    <tbody>
+      {% for job in jobs %}
+      <tr>
+        <td><a class="link mono" href="{{ base }}/metrics/{{ job.job|urlencode_strict }}?queue={{ name|urlencode_strict }}">{{ job.job }}</a></td>
+        <td class="text-right tabular-nums">{{ job.processed }}</td>
+        <td class="text-right tabular-nums {% if job.failed > 0 %}text-[var(--error)]{% endif %}">{{ job.failure_rate }}</td>
+        <td class="text-right tabular-nums">{{ job.avg }}</td>
+        <td class="text-right tabular-nums">{{ job.max }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="text-[var(--muted)]">No job finished on {{ name }} in the last 24 hours.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

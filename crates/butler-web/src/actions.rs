@@ -1,5 +1,6 @@
 //! What the dashboard changes: retry and discard failed jobs, cancel pending
-//! and scheduled ones, run scheduled ones now, pause and resume queues, and
+//! and scheduled ones, run scheduled ones now (one or all), pause and resume
+//! queues, and
 //! forget recurring schedules no worker runs anymore. Every action is a POST and
 //! redirects back to the page it came from.
 
@@ -27,13 +28,20 @@ pub(crate) struct Bulk {
     return_to: Option<String>,
 }
 
+/// Every scheduled job, or every one on a queue.
+#[derive(Deserialize)]
+pub(crate) struct ScheduledBulk {
+    queue: Option<String>,
+    return_to: Option<String>,
+}
+
 /// Only paths inside the dashboard: never an open redirect.
 fn back(state: &AppState, return_to: Option<&str>) -> Redirect {
     let target = return_to
         .filter(|path| {
             path.starts_with('/') && !path.starts_with("//") && path.starts_with(&state.base)
         })
-        .map_or_else(|| format!("{}/", state.base), str::to_owned);
+        .map_or_else(|| crate::home(&state.base), str::to_owned);
     Redirect::to(&target)
 }
 
@@ -132,17 +140,20 @@ pub(crate) async fn remove_recurring(
     Ok(back(&state, form.return_to.as_deref()))
 }
 
-/// Applies `each` to every job in `bulk.state` (and queue), page by page,
-/// until none is left or nothing changes.
+/// Applies `each` to every job in `job_state` (on `queue_name`, if given),
+/// page by page, until none is left or nothing changes.
 async fn for_all(
     state: &AppState,
-    bulk: &Bulk,
+    job_state: Option<JobState>,
+    queue_name: Option<&str>,
     each: fn(&butler::Queue, &str) -> butler::Result<bool>,
 ) -> Result<u64, WebError> {
-    let Some(job_state) = JobState::parse(&bulk.state) else {
+    let Some(job_state) = job_state else {
         return Ok(0);
     };
-    let queue_name = bulk.queue.clone().filter(|queue| !queue.is_empty());
+    let queue_name = queue_name
+        .filter(|queue| !queue.is_empty())
+        .map(str::to_owned);
     let queue = state.queue.clone();
     Ok(tokio::task::spawn_blocking(move || -> butler::Result<u64> {
         let mut done = 0;
@@ -170,7 +181,13 @@ pub(crate) async fn retry_all(
     State(state): State<Arc<AppState>>,
     Form(bulk): Form<Bulk>,
 ) -> Result<Redirect, WebError> {
-    let retried = for_all(&state, &bulk, |queue, id| queue.retry(id)).await?;
+    let retried = for_all(
+        &state,
+        JobState::parse(&bulk.state),
+        bulk.queue.as_deref(),
+        |queue, id| queue.retry(id),
+    )
+    .await?;
     tracing::info!(
         retried,
         state = bulk.state,
@@ -183,11 +200,59 @@ pub(crate) async fn discard_all(
     State(state): State<Arc<AppState>>,
     Form(bulk): Form<Bulk>,
 ) -> Result<Redirect, WebError> {
-    let discarded = for_all(&state, &bulk, |queue, id| queue.discard(id)).await?;
+    let discarded = for_all(
+        &state,
+        JobState::parse(&bulk.state),
+        bulk.queue.as_deref(),
+        |queue, id| queue.discard(id),
+    )
+    .await?;
     tracing::info!(
         discarded,
         state = bulk.state,
         "discarded jobs from the dashboard"
+    );
+    Ok(back(&state, bulk.return_to.as_deref()))
+}
+
+/// Runs every scheduled job (on a queue, if given) now. Only scheduled ones:
+/// the Scheduled tab is the only place that offers it.
+pub(crate) async fn run_now_all(
+    State(state): State<Arc<AppState>>,
+    Form(bulk): Form<ScheduledBulk>,
+) -> Result<Redirect, WebError> {
+    let started = for_all(
+        &state,
+        Some(JobState::Scheduled),
+        bulk.queue.as_deref(),
+        |queue, id| queue.run_now(id),
+    )
+    .await?;
+    tracing::info!(
+        started,
+        queue = bulk.queue,
+        "ran scheduled jobs now from the dashboard"
+    );
+    Ok(back(&state, bulk.return_to.as_deref()))
+}
+
+/// Cancels every scheduled job (on a queue, if given). Pending jobs are left
+/// alone.
+pub(crate) async fn cancel_all(
+    State(state): State<Arc<AppState>>,
+    Form(bulk): Form<ScheduledBulk>,
+) -> Result<Redirect, WebError> {
+    let cancelled = for_all(
+        &state,
+        Some(JobState::Scheduled),
+        bulk.queue.as_deref(),
+        |queue, id| queue.cancel(id),
+    )
+    .await?;
+    tracing::info!(
+        cancelled,
+        queue = bulk.queue,
+        "cancelled scheduled jobs from the dashboard"
     );
     Ok(back(&state, bulk.return_to.as_deref()))
 }
